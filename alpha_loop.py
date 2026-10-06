@@ -1,45 +1,3 @@
-"""
-alpha_loop.py — autonomous generate -> test -> learn -> repeat loop for WorldQuant BRAIN,
-now with optional autonomous submission of alphas that clear a quality bar.
-
-Setup (once), same folder as brain_engine.py:
-    pip install requests python-dotenv google-genai pydantic
-    .env needs three lines:
-        WQ_EMAIL=you@example.com
-        WQ_PASSWORD=your-password
-        GEMINI_API_KEY=...
-
-Run:
-    python alpha_loop.py
-
-NOTE on the LLM library: this uses google-genai (import as `from google import genai`),
-NOT google-generativeai (`import google.generativeai as genai`) - that package was
-deprecated in August 2025 and is now archived/legacy. If you see import errors or silent
-generation failures with the old package, that's why. Model defaults to gemini-3.8-flash
-(current as of Sept 2026) - Google ships new Flash versions every few weeks, so this is
-overridable via GEMINI_MODEL without touching code.
-
-READ BEFORE YOU RUN THIS:
-- It spends real BRAIN simulation quota and real Gemini API cost, unattended, up to the
-  caps below (defaults: 5 rounds x 8 ideas = 40 simulations max per run). Raise
-  IDEAS_PER_ROUND / MAX_ROUNDS via env vars once you trust it, not before.
-- This version can AUTONOMOUSLY SUBMIT alphas to BRAIN (not just simulate them) when one
-  clears the qualification bar below. That's a bigger commitment than testing - submission
-  is rate-limited to MAX_SUBMISSIONS_PER_DAY (default 1, matching what BRAIN itself appears
-  to expect) regardless of how many alphas qualify in a run. The qualification thresholds
-  (checks all pass, sharpe >= 1.25, fitness >= 1.0) are what was in the version you sent me -
-  I haven't independently verified those are the right bar for a real submission decision,
-  that's a domain call for you to make, not something I'm endorsing by leaving it as-is.
-- operators.json ships with a 5-operator starter set. BRAIN has hundreds. Until you
-  replace it with your real export from platform.worldquantbrain.com/learn/operators,
-  the generator can only reshuffle those 5 - swap the file's contents, no code changes
-  needed.
-- "Unattended" has a real ceiling: BRAIN sessions expire (roughly 4 hours) and can
-  require a one-time identity check to renew. This script saves its session to disk
-  so a re-run doesn't need to log in again unnecessarily, but if BRAIN asks for
-  verification mid-run with nobody there to click the link, it STOPS CLEANLY and
-  logs why. It does not hang waiting for input that will never come.
-"""
 import csv
 import json
 import logging
@@ -66,6 +24,18 @@ MAX_RUNTIME_SECONDS = int(os.environ.get("MAX_RUNTIME_SECONDS", 4 * 60 * 60))  #
 MAX_SUBMISSIONS_PER_DAY = int(os.environ.get("MAX_SUBMISSIONS_PER_DAY", 1))  # BRAIN's own submitter tools cap at 1/day
 
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
+# Google's own Gemini 3.8 Flash docs name 3.7 Flash as the fully supported alternative.
+# Set GEMINI_FALLBACK_MODEL to an empty value in .env to turn the fallback off.
+GEMINI_FALLBACK_MODEL = os.environ.get("GEMINI_FALLBACK_MODEL", "gemini-3.7-flash")
+RETRY_DELAYS_SECONDS = (10, 20, 40, 80)  # backoff when the main model is busy or rate-limited
+TRANSIENT_STATUS_CODES = {429, 500, 502, 503, 504}  # worth waiting out; anything else won't fix itself
+MAX_GENERATION_FAILURES = int(os.environ.get("MAX_GENERATION_FAILURES", 3))  # in a row, then stop the run
+GENERATION_COOLDOWN_SECONDS = int(os.environ.get("GENERATION_COOLDOWN_SECONDS", 60))  # pause between failed attempts
+
+# Submission bar - unchanged values, just named once so dashboard.py reads the same numbers.
+SUBMIT_MIN_SHARPE = 1.25
+SUBMIT_MIN_FITNESS = 1.0
+
 OPERATORS_FILE = "operators.json"
 RESULTS_FILE = "alpha_loop_results.csv"  # separate from brain_engine.py's own results.csv
 SESSION_FILE = "session_cookies.json"
@@ -79,6 +49,11 @@ RESULTS_HEADER = [
 
 class StopLoop(Exception):
     """Raised to unwind out of a round immediately - e.g. session can't be renewed unattended."""
+
+
+class GenerationFailed(Exception):
+    """Raised when no ideas could be generated this attempt (main model and fallback both
+    failed). The main loop catches it and does NOT count the attempt as a round."""
 
 
 # ---- Gemini structured-output schema (Pydantic - this is what the current SDK's docs use;
@@ -187,7 +162,7 @@ def summarize_round(rows: list) -> str:
     return "\n".join(lines)
 
 
-def generate_ideas(client: genai.Client, operators, fields, settings, feedback_text, avoid: set, n: int):
+def generate_ideas(client: genai.Client, model: str, operators, fields, settings, feedback_text, avoid: set, n: int):
     op_list = "\n".join(f"- {o['name']}: {o['usage']}" for o in operators)
     field_list = "\n".join(f"- {f['name']}: {f['description']}" for f in fields)
     avoid_list = "\n".join(f"- {e}" for e in list(avoid)[:50]) or "(none yet)"
@@ -205,11 +180,14 @@ def generate_ideas(client: genai.Client, operators, fields, settings, feedback_t
     )
 
     resp = client.models.generate_content(
-        model=GEMINI_MODEL,
+        model=model,
         contents=prompt,
         config=types.GenerateContentConfig(
             response_mime_type="application/json",
             response_schema=AlphaIdeas,
+            # We give the model no tools, so the SDK's automatic function calling has nothing
+            # to do - turning it off just removes the "AFC is enabled" log noise.
+            automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
         ),
     )
 
@@ -218,6 +196,45 @@ def generate_ideas(client: genai.Client, operators, fields, settings, feedback_t
 
     data = json.loads(resp.text)
     return [(idea["expression"], idea["rationale"]) for idea in data["ideas"]]
+
+
+def is_transient(exc: Exception) -> bool:
+    """A busy (503) or rate-limited (429) answer can clear up on its own; a bad key or a
+    malformed request can't. google-genai errors carry the HTTP status as `.code`."""
+    return getattr(exc, "code", None) in TRANSIENT_STATUS_CODES
+
+
+def short_error(exc: Exception) -> str:
+    code, status = getattr(exc, "code", None), getattr(exc, "status", None)
+    return f"{code} {status}" if code else f"{type(exc).__name__}: {str(exc)[:150]}"
+
+
+def generate_with_fallback(client: genai.Client, operators, fields, settings, feedback_text, avoid: set, n: int):
+    """Main model first, retried with backoff while it's busy or rate-limited. Then the
+    fallback model once. Raises the last error only if both fail."""
+    last_exc = None
+    attempts = len(RETRY_DELAYS_SECONDS) + 1
+    for attempt in range(1, attempts + 1):
+        try:
+            return generate_ideas(client, GEMINI_MODEL, operators, fields, settings, feedback_text, avoid, n)
+        except Exception as exc:
+            last_exc = exc
+            if not is_transient(exc) or attempt == attempts:
+                break  # a non-transient error won't fix itself by waiting
+            delay = RETRY_DELAYS_SECONDS[attempt - 1]
+            logger.warning("%s unavailable (%s) - waiting %ds, then retry %d of %d.",
+                           GEMINI_MODEL, short_error(exc), delay, attempt, len(RETRY_DELAYS_SECONDS))
+            time.sleep(delay)
+
+    if GEMINI_FALLBACK_MODEL and GEMINI_FALLBACK_MODEL != GEMINI_MODEL:
+        logger.warning("%s still failing (%s) - trying %s once.",
+                       GEMINI_MODEL, short_error(last_exc), GEMINI_FALLBACK_MODEL)
+        try:
+            return generate_ideas(client, GEMINI_FALLBACK_MODEL, operators, fields, settings, feedback_text, avoid, n)
+        except Exception as exc:
+            last_exc = exc
+
+    raise last_exc
 
 
 def submit_alpha(session, alpha_id: str):
@@ -246,10 +263,9 @@ def append_result(row: dict):
 def run_round(session, client, operators, fields, settings, email, password, round_num, feedback_text, avoid):
     logger.info("=== Round %d: generating %d ideas ===", round_num, IDEAS_PER_ROUND)
     try:
-        ideas = generate_ideas(client, operators, fields, settings, feedback_text, avoid, IDEAS_PER_ROUND)
+        ideas = generate_with_fallback(client, operators, fields, settings, feedback_text, avoid, IDEAS_PER_ROUND)
     except Exception as e:
-        logger.error("Idea generation failed this round: %s", e)
-        return []
+        raise GenerationFailed(short_error(e)) from e
 
     round_rows = []
     for expression, rationale in ideas:
@@ -295,7 +311,8 @@ def run_round(session, client, operators, fields, settings, email, password, rou
         checks_total = safe_float(metrics.get("checks_total"))
         sharpe = safe_float(metrics.get("sharpe"))
         fitness = safe_float(metrics.get("fitness"))
-        qualifies = checks_total > 0 and checks_passed == checks_total and sharpe >= 1.25 and fitness >= 1.0
+        qualifies = (checks_total > 0 and checks_passed == checks_total
+                     and sharpe >= SUBMIT_MIN_SHARPE and fitness >= SUBMIT_MIN_FITNESS)
 
         if not qualifies:
             row["submitted"] = "NO"
@@ -356,20 +373,38 @@ def main():
                 MAX_ROUNDS * IDEAS_PER_ROUND, MAX_RUNTIME_SECONDS, MAX_SUBMISSIONS_PER_DAY)
 
     started = time.time()
-    for round_num in range(1, MAX_ROUNDS + 1):
+    rounds_done = 0
+    failures_in_a_row = 0
+    while rounds_done < MAX_ROUNDS:
         if time.time() - started > MAX_RUNTIME_SECONDS:
             logger.info("Hit MAX_RUNTIME_SECONDS - stopping cleanly.")
             break
+        round_num = rounds_done + 1
         try:
             round_rows = run_round(session, client, operators, fields, settings, email, password,
                                     round_num, feedback_text, avoid)
+        except GenerationFailed as e:
+            failures_in_a_row += 1
+            if failures_in_a_row >= MAX_GENERATION_FAILURES:
+                logger.error(
+                    "Idea generation failed %d times in a row (last: %s). Stopping - nothing was "
+                    "simulated, so no BRAIN quota was used. Gemini is likely overloaded; try again later.",
+                    failures_in_a_row, e)
+                break
+            logger.warning(
+                "Round %d didn't start - idea generation failed (%s). Waiting %ds and trying again; "
+                "this does not use up a round.", round_num, e, GENERATION_COOLDOWN_SECONDS)
+            time.sleep(GENERATION_COOLDOWN_SECONDS)
+            continue
         except StopLoop as e:
             logger.error("Stopping: %s", e)
             break
+        failures_in_a_row = 0
+        rounds_done += 1
         feedback_text = summarize_round(round_rows)
         time.sleep(5)
 
-    logger.info("Done. Full history (every round, every attempt) is in %s.", RESULTS_FILE)
+    logger.info("Done: %d round(s) of ideas tested. Full history is in %s.", rounds_done, RESULTS_FILE)
 
 
 if __name__ == "__main__":

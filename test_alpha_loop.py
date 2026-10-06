@@ -12,6 +12,7 @@ os.environ.setdefault("GEMINI_API_KEY", "fake-test-key")
 
 import alpha_loop as al
 import brain_engine as be
+from google.genai import errors as genai_errors
 
 
 def fake_response(status_code=200, json_data=None, headers=None, text=""):
@@ -130,10 +131,13 @@ def test_generate_ideas_parses_structured_output():
     ])
     operators = [{"name": "rank", "usage": "u"}]
     fields = [{"name": "close", "description": "d"}]
-    ideas = al.generate_ideas(client, operators, fields, {"region": "USA", "universe": "TOP3000", "delay": 1},
-                               "round 1", set(), 2)
+    ideas = al.generate_ideas(client, "some-model", operators, fields,
+                               {"region": "USA", "universe": "TOP3000", "delay": 1}, "round 1", set(), 2)
     assert ideas[0][0] == "rank(ts_delta(close, 5))"
     assert ideas[1][1] == "fundamental strength vs peers"
+    kwargs = client.models.generate_content.call_args.kwargs
+    assert kwargs["model"] == "some-model"  # the model passed in is the one actually called
+    assert kwargs["config"].automatic_function_calling.disable is True  # AFC off -> no AFC log noise
 
 
 def test_generate_ideas_raises_on_empty_response():
@@ -142,7 +146,7 @@ def test_generate_ideas_raises_on_empty_response():
     resp.text = None
     client.models.generate_content.return_value = resp
     try:
-        al.generate_ideas(client, [], [], {"region": "USA", "universe": "TOP3000", "delay": 1}, "", set(), 1)
+        al.generate_ideas(client, "some-model", [], [], {"region": "USA", "universe": "TOP3000", "delay": 1}, "", set(), 1)
         assert False, "should have raised"
     except ValueError as e:
         assert "empty response" in str(e)
@@ -297,6 +301,146 @@ def test_append_result_handles_llm_style_unicode(tmp_path):
             rows = list(csv.DictReader(f))
         assert "\u2011" in rows[0]["rationale"]
         assert "\u201cclassic\u201d" in rows[0]["rationale"]
+    in_tmp(tmp_path, run)
+
+
+# ---- Retry / fallback / round accounting (the fix for the all-503 run) ----
+
+SETTINGS = {"region": "USA", "universe": "TOP3000", "delay": 1}
+ONE_IDEA = [{"expression": "rank(close)", "rationale": "r1"}]
+
+
+def busy():
+    # The exact error the real run hit: 503 UNAVAILABLE, "high demand".
+    return genai_errors.ServerError(503, {"error": {"code": 503, "message": "high demand", "status": "UNAVAILABLE"}})
+
+
+def bad_request():
+    return genai_errors.ClientError(400, {"error": {"code": 400, "message": "invalid", "status": "INVALID_ARGUMENT"}})
+
+
+def models_called(client):
+    return [c.kwargs["model"] for c in client.models.generate_content.call_args_list]
+
+
+def test_generation_retries_busy_model_then_succeeds():
+    client = MagicMock()
+    client.models.generate_content.side_effect = [busy(), busy(), fake_gemini_response(ONE_IDEA)]
+    with patch("time.sleep") as sleep:
+        ideas = al.generate_with_fallback(client, [], [], SETTINGS, "", set(), 1)
+    assert ideas == [("rank(close)", "r1")]
+    assert [c.args[0] for c in sleep.call_args_list] == [10, 20]  # backoff, in order
+    assert models_called(client) == [al.GEMINI_MODEL] * 3          # never needed the fallback
+
+
+def test_generation_falls_back_after_retries_run_out():
+    client = MagicMock()
+    client.models.generate_content.side_effect = [busy()] * 5 + [fake_gemini_response(ONE_IDEA)]
+    with patch("time.sleep") as sleep:
+        ideas = al.generate_with_fallback(client, [], [], SETTINGS, "", set(), 1)
+    assert ideas == [("rank(close)", "r1")]
+    assert [c.args[0] for c in sleep.call_args_list] == [10, 20, 40, 80]
+    assert models_called(client) == [al.GEMINI_MODEL] * 5 + [al.GEMINI_FALLBACK_MODEL]
+
+
+def test_generation_does_not_wait_out_a_non_transient_error():
+    client = MagicMock()
+    client.models.generate_content.side_effect = [bad_request(), fake_gemini_response(ONE_IDEA)]
+    with patch("time.sleep") as sleep:
+        ideas = al.generate_with_fallback(client, [], [], SETTINGS, "", set(), 1)
+    assert ideas == [("rank(close)", "r1")]
+    sleep.assert_not_called()  # waiting won't fix a bad request - straight to the fallback
+    assert models_called(client) == [al.GEMINI_MODEL, al.GEMINI_FALLBACK_MODEL]
+
+
+def test_generation_raises_when_both_models_fail():
+    client = MagicMock()
+    client.models.generate_content.side_effect = [busy()] * 6
+    with patch("time.sleep"):
+        try:
+            al.generate_with_fallback(client, [], [], SETTINGS, "", set(), 1)
+            assert False, "should have raised"
+        except genai_errors.ServerError as e:
+            assert e.code == 503
+    assert client.models.generate_content.call_count == 6  # 1 try + 4 retries + 1 fallback
+
+
+def test_generation_with_fallback_turned_off():
+    client = MagicMock()
+    client.models.generate_content.side_effect = [busy()] * 5
+    with patch.object(al, "GEMINI_FALLBACK_MODEL", ""), patch("time.sleep"):
+        try:
+            al.generate_with_fallback(client, [], [], SETTINGS, "", set(), 1)
+            assert False, "should have raised"
+        except genai_errors.ServerError:
+            pass
+    assert models_called(client) == [al.GEMINI_MODEL] * 5
+
+
+def test_run_round_raises_generation_failed_and_touches_nothing(tmp_path):
+    def run():
+        client = MagicMock()
+        client.models.generate_content.side_effect = [busy()] * 6
+        session = MagicMock()
+        with patch("time.sleep"):
+            try:
+                al.run_round(session, client, [], [], SETTINGS, "e@x.com", "pw", 1, "round 1", set())
+                assert False, "should have raised"
+            except al.GenerationFailed as e:
+                assert "503" in str(e)
+        session.post.assert_not_called()             # nothing reached BRAIN
+        assert not Path(al.RESULTS_FILE).exists()    # and nothing was logged as a result
+    in_tmp(tmp_path, run)
+
+
+def _write_operators():
+    Path(al.OPERATORS_FILE).write_text(json.dumps({
+        "operators": [{"name": "rank", "usage": "u"}],
+        "fields": [{"name": "close", "description": "d"}],
+    }))
+
+
+def test_main_failed_generation_does_not_use_up_rounds(tmp_path):
+    def run():
+        _write_operators()
+        outcomes = iter(["busy", "busy", "ok", "ok", "ok"])
+        calls = {"n": 0}
+
+        def fake_generate(*a, **kw):
+            calls["n"] += 1
+            if next(outcomes) == "busy":
+                raise busy()
+            return [(f"rank(close)_{calls['n']}", "r")]
+
+        with patch.object(al, "IDEAS_PER_ROUND", 1), \
+             patch.object(al, "MAX_ROUNDS", 3), \
+             patch.object(al, "generate_with_fallback", side_effect=fake_generate), \
+             patch.object(al, "get_authenticated_session", return_value=MagicMock()), \
+             patch.object(be, "submit_simulation", return_value=(None, "submit failed (500): boom")), \
+             patch("google.genai.Client"), \
+             patch("time.sleep"):
+            al.main()
+
+        assert calls["n"] == 5  # 2 failed attempts + 3 real rounds
+        with open(al.RESULTS_FILE, encoding="utf-8") as f:
+            rounds = [row["round"] for row in csv.DictReader(f)]
+        assert rounds == ["1", "2", "3"]  # the failed attempts didn't consume round numbers
+    in_tmp(tmp_path, run)
+
+
+def test_main_stops_after_repeated_generation_failures(tmp_path):
+    def run():
+        _write_operators()
+        submit = MagicMock()
+        with patch.object(al, "MAX_GENERATION_FAILURES", 3), \
+             patch.object(al, "generate_with_fallback", side_effect=busy()) as gen, \
+             patch.object(al, "get_authenticated_session", return_value=MagicMock()), \
+             patch.object(be, "submit_simulation", submit), \
+             patch("google.genai.Client"), \
+             patch("time.sleep"):
+            al.main()
+        assert gen.call_count == 3   # stopped after 3 in a row instead of looping for 4 hours
+        submit.assert_not_called()   # no BRAIN quota spent
     in_tmp(tmp_path, run)
 
 
