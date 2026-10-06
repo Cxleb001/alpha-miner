@@ -3,7 +3,8 @@ import json
 import logging
 import os
 import time
-from datetime import date
+from collections import deque
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import requests
@@ -35,6 +36,17 @@ GENERATION_COOLDOWN_SECONDS = int(os.environ.get("GENERATION_COOLDOWN_SECONDS", 
 # Submission bar - unchanged values, just named once so dashboard.py reads the same numbers.
 SUBMIT_MIN_SHARPE = 1.25
 SUBMIT_MIN_FITNESS = 1.0
+# BRAIN's accepted turnover range: 1% to 70% of the book traded per day (reported as 0.01 to 0.70).
+TURNOVER_MIN, TURNOVER_MAX = 0.01, 0.70
+MAX_SELF_CORRELATION = 0.7  # BRAIN rejects a submission this correlated with your already-submitted alphas
+CORR_POLL_MAX_SECONDS = int(os.environ.get("CORR_POLL_MAX_SECONDS", 300))
+SUBMIT_POLL_MAX_SECONDS = int(os.environ.get("SUBMIT_POLL_MAX_SECONDS", 600))
+CORRELATION_URL = "https://api.worldquantbrain.com/alphas/{alpha_id}/correlations/self"
+SUBMIT_URL = "https://api.worldquantbrain.com/alphas/{alpha_id}/submit"
+
+# Auto-flip: a strongly negative Sharpe is a real signal pointing the wrong way, so test its reverse.
+FLIP_SHARPE_AT_OR_BELOW = float(os.environ.get("FLIP_SHARPE_AT_OR_BELOW", -1.0))
+MAX_FLIPS_PER_ROUND = int(os.environ.get("MAX_FLIPS_PER_ROUND", 3))  # caps the extra simulations flips add
 
 OPERATORS_FILE = "operators.json"
 RESULTS_FILE = "alpha_loop_results.csv"  # separate from brain_engine.py's own results.csv
@@ -120,6 +132,21 @@ def safe_float(val, default=0.0):
         return default
 
 
+def brain_day(now_utc=None) -> date:
+    """BRAIN's day starts at 3 AM US Eastern, not at your local midnight. Worked out from the US
+    daylight-saving rules directly, so it needs no time-zone database (Windows doesn't ship one)."""
+    now_utc = now_utc or datetime.now(timezone.utc)
+
+    def nth_sunday(month, n):
+        first_weekday = date(now_utc.year, month, 1).weekday()  # Monday=0 ... Sunday=6
+        return 1 + (6 - first_weekday) % 7 + 7 * (n - 1)
+
+    dst_start = datetime(now_utc.year, 3, nth_sunday(3, 2), 7, tzinfo=timezone.utc)   # 2 AM EST
+    dst_end = datetime(now_utc.year, 11, nth_sunday(11, 1), 6, tzinfo=timezone.utc)   # 2 AM EDT
+    eastern = timedelta(hours=-4) if dst_start <= now_utc < dst_end else timedelta(hours=-5)
+    return (now_utc + eastern - timedelta(hours=3)).date()
+
+
 def submissions_today() -> int:
     if not Path(SUBMISSION_LOG_FILE).exists():
         return 0
@@ -127,7 +154,7 @@ def submissions_today() -> int:
         data = json.loads(Path(SUBMISSION_LOG_FILE).read_text(encoding="utf-8"))
     except Exception:
         return 0
-    return data.get(str(date.today()), 0)
+    return data.get(str(brain_day()), 0)
 
 
 def record_submission():
@@ -137,9 +164,27 @@ def record_submission():
             data = json.loads(Path(SUBMISSION_LOG_FILE).read_text(encoding="utf-8"))
         except Exception:
             data = {}
-    key = str(date.today())
+    key = str(brain_day())
     data[key] = data.get(key, 0) + 1
     Path(SUBMISSION_LOG_FILE).write_text(json.dumps(data), encoding="utf-8")
+
+
+def as_float(val):
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return None
+
+
+def turnover_note(row) -> str:
+    turnover = as_float(row.get("turnover"))
+    if turnover is None:
+        return ""
+    if turnover > TURNOVER_MAX:
+        return f" TURNOVER TOO HIGH (max {TURNOVER_MAX})"
+    if turnover < TURNOVER_MIN:
+        return f" TURNOVER TOO LOW (min {TURNOVER_MIN})"
+    return ""
 
 
 def summarize_round(rows: list) -> str:
@@ -154,7 +199,9 @@ def summarize_round(rows: list) -> str:
     for r in ranked:
         lines.append(
             f"- {r['expression']} -> sharpe={r['sharpe']} fitness={r['fitness']} "
-            f"turnover={r['turnover']} checks={r['checks_passed']}/{r['checks_total']} submitted={r.get('submitted', 'NO')}"
+            f"turnover={r['turnover']}{turnover_note(r)} checks={r['checks_passed']}/{r['checks_total']} "
+            f"submitted={r.get('submitted', 'NO')}"
+            + (f" not_passing=[{r['failing_checks']}]" if r.get("failing_checks") else "")
         )
     failed = [r for r in rows if r["status"] != "COMPLETE"]
     if failed:
@@ -172,6 +219,11 @@ def generate_ideas(client: genai.Client, model: str, operators, fields, settings
         f"region={settings['region']} universe={settings['universe']} delay={settings['delay']}.\n\n"
         f"ONLY use these operators, exactly as named (do not invent others):\n{op_list}\n\n"
         f"ONLY use these data fields, exactly as named (do not invent others):\n{field_list}\n\n"
+        f"BRAIN only accepts an alpha with Sharpe >= {SUBMIT_MIN_SHARPE}, fitness >= {SUBMIT_MIN_FITNESS} "
+        f"and turnover between {TURNOVER_MIN} and {TURNOVER_MAX} (1% to 70% of the book traded per day). "
+        f"High turnover also drags fitness down, so favour smoother signals: longer lookback windows, "
+        f"ts_decay_linear, or hump. Ideas that scored a strongly negative Sharpe are re-tested reversed "
+        f"automatically, so don't spend ideas on negating past results.\n\n"
         f"{feedback_text}\n\n"
         f"Propose {n} NEW candidate expressions, genuinely different in shape from each "
         f"other (not the same template with one field swapped). Each needs a one-sentence "
@@ -237,27 +289,206 @@ def generate_with_fallback(client: genai.Client, operators, fields, settings, fe
     raise last_exc
 
 
-def submit_alpha(session, alpha_id: str):
-    """Triggers official alpha submission on WorldQuant BRAIN.
-    NOTE: this endpoint hasn't been independently verified the way the others in
-    brain_engine.py have been - treat the first real call as a test, not a certainty."""
-    url = f"https://api.worldquantbrain.com/alphas/{alpha_id}/submit"
-    resp = session.post(url)
+def wait_seconds(resp, default=2.0) -> float:
+    """BRAIN sends Retry-After as a float string ("5.0"); keep the wait between 0.5 and 30 seconds."""
+    try:
+        return min(max(float(resp.headers.get("Retry-After")), 0.5), 30.0)
+    except (TypeError, ValueError):
+        return default
 
-    if resp.status_code in (200, 201):
+
+def still_working(resp) -> bool:
+    """BRAIN's 'not done yet' signals: a 303 back to the same address, or a Retry-After header."""
+    return resp.status_code == 303 or resp.headers.get("Retry-After") is not None
+
+
+def failing_reason(resp) -> str:
+    """Names of the checks BRAIN marked FAIL in a reply, or "" if none are listed."""
+    try:
+        data = resp.json()
+    except ValueError:
+        return ""
+    checks = []
+    if isinstance(data, dict):
+        checks = (data.get("is") or {}).get("checks") or data.get("checks") or []
+    failed = [str(c.get("name")) for c in checks if isinstance(c, dict) and c.get("result") == "FAIL"]
+    return ("failed " + ", ".join(failed)) if failed else ""
+
+
+def self_correlation_max(session, alpha_id: str):
+    """BRAIN's free pre-submit check: the highest correlation between this alpha and the ones you
+    already submitted. Returns None if BRAIN didn't give a usable number in time."""
+    url = CORRELATION_URL.format(alpha_id=alpha_id)
+    deadline = time.time() + CORR_POLL_MAX_SECONDS
+    while time.time() < deadline:
+        try:
+            resp = session.get(url, timeout=30)
+        except requests.RequestException:
+            return None
+        if still_working(resp) and (resp.status_code == 503 or not resp.text.strip()):
+            time.sleep(wait_seconds(resp))
+            continue
+        if resp.status_code != 200:
+            return None
+        try:
+            value = resp.json().get("max")
+            return float(value) if value is not None else None
+        except (ValueError, TypeError, AttributeError):
+            return None
+    return None
+
+
+def submit_alpha(session, alpha_id: str):
+    """Submit, then poll until BRAIN gives its verdict. Returns (state, detail), state being one of
+    YES, REJECTED, VERDICT_PENDING or FAILED. Following community clients that recorded BRAIN's
+    live traffic: 503 or 303 means queued / still processing, Retry-After means poll again, and
+    a 403 lists the failed checks. Anything ambiguous is reported as VERDICT_PENDING, never YES."""
+    url = SUBMIT_URL.format(alpha_id=alpha_id)
+    try:
+        resp = session.post(url, timeout=30, allow_redirects=False)
+    except requests.RequestException as exc:
+        return "FAILED", f"couldn't reach BRAIN ({type(exc).__name__})"
+    if resp.status_code == 403:
+        return "REJECTED", failing_reason(resp) or f"403 {resp.text[:150]}"
+    if resp.status_code == 429:
+        return "FAILED", f"BRAIN is throttling submissions right now ({resp.text[:100]})"
+    if resp.status_code not in (200, 201, 202, 303, 503):
+        return "FAILED", f"{resp.status_code} {resp.text[:150]}"
+
+    logger.info("BRAIN accepted the submission of %s - waiting for its verdict...", alpha_id)
+    deadline = time.time() + SUBMIT_POLL_MAX_SECONDS
+    while time.time() < deadline:
+        time.sleep(wait_seconds(resp))
+        try:
+            resp = session.get(url, timeout=30, allow_redirects=False)
+        except requests.RequestException:
+            continue
+        if still_working(resp) or resp.status_code == 429:
+            continue
+        if resp.status_code == 403:
+            return "REJECTED", failing_reason(resp) or f"403 {resp.text[:150]}"
+        if resp.status_code == 200 and resp.text.strip():
+            reason = failing_reason(resp)
+            return ("REJECTED", reason) if reason else ("YES", None)
+        if resp.status_code == 200:
+            return "VERDICT_PENDING", None  # empty answer with no 'wait' signal: can't tell either way
+        return "FAILED", f"{resp.status_code} {resp.text[:150]}"
+    return "VERDICT_PENDING", None
+
+
+def is_active_on_brain(session, alpha_id: str) -> bool:
+    """Submitted alphas are listed by BRAIN with status ACTIVE (unsubmitted ones: UNSUBMITTED)."""
+    return be.fetch_alpha(session, alpha_id).get("status") == "ACTIVE"
+
+
+def try_submit(session, alpha_id: str) -> str:
+    """Pre-check self-correlation, submit, wait for the verdict. Returns the CSV 'submitted' value."""
+    corr = self_correlation_max(session, alpha_id)
+    if corr is not None and corr >= MAX_SELF_CORRELATION:
+        logger.info("Alpha %s clears the bar, but its self-correlation is %.2f (limit %.1f) - "
+                    "not spending today's submission on it.", alpha_id, corr, MAX_SELF_CORRELATION)
+        return f"TOO_CORRELATED (max {corr:.2f})"
+    if corr is None:
+        logger.warning("Couldn't read %s's self-correlation in advance - submitting anyway; "
+                       "BRAIN runs the same check during submission.", alpha_id)
+    else:
+        logger.info("Self-correlation %.2f - under the %.1f limit.", corr, MAX_SELF_CORRELATION)
+
+    logger.info("Alpha %s qualifies - submitting.", alpha_id)
+    state, detail = submit_alpha(session, alpha_id)
+    if state in ("YES", "REJECTED", "VERDICT_PENDING"):
+        record_submission()  # BRAIN processed it, so it counts against today's limit
+    if state == "YES" and not is_active_on_brain(session, alpha_id):
+        state = "VERDICT_PENDING"  # only claim success once BRAIN itself lists it as submitted
+    if state == "YES":
         logger.info("SUCCESSFULLY SUBMITTED Alpha ID: %s", alpha_id)
-        return True, None
-    logger.error("Failed to submit Alpha ID %s: %d - %s", alpha_id, resp.status_code, resp.text)
-    return False, resp.text
+        return "YES"
+    if state == "REJECTED":
+        logger.warning("BRAIN rejected the submission of %s: %s", alpha_id, detail)
+        return f"REJECTED: {detail}"
+    if state == "VERDICT_PENDING":
+        logger.warning("BRAIN took %s but hasn't confirmed it as submitted yet - press Check with "
+                       "BRAIN in the dashboard later.", alpha_id)
+        return "VERDICT_PENDING (check with BRAIN in the dashboard)"
+    logger.error("Couldn't submit %s: %s", alpha_id, detail)
+    return f"FAILED: {detail}"
+
+
+def qualifies(metrics: dict, checks: list) -> bool:
+    """Every check must pass, except SELF_CORRELATION while it reads PENDING: BRAIN only works
+    that one out during submission, so it shows PENDING on every unsubmitted alpha."""
+    if not checks:
+        return False
+    if (safe_float(metrics.get("sharpe")) < SUBMIT_MIN_SHARPE
+            or safe_float(metrics.get("fitness")) < SUBMIT_MIN_FITNESS):
+        return False
+    for c in checks:
+        if c.get("result") == "PASS":
+            continue
+        if c.get("name") == "SELF_CORRELATION" and c.get("result") == "PENDING":
+            continue
+        return False
+    return True
 
 
 def append_result(row: dict):
     is_new = not Path(RESULTS_FILE).exists()
     with open(RESULTS_FILE, "a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=RESULTS_HEADER)
+        # extrasaction="ignore": rows carry in-memory extras (failing_checks) the CSV doesn't store
+        writer = csv.DictWriter(f, fieldnames=RESULTS_HEADER, extrasaction="ignore")
         if is_new:
             writer.writeheader()
         writer.writerow(row)
+
+
+def evaluate_idea(session, expression, rationale, settings, email, password, round_num) -> dict:
+    """Simulate one expression, log it, and submit it if it qualifies. Returns its row."""
+    row = {k: "" for k in RESULTS_HEADER}
+    row.update(round=round_num, timestamp=time.strftime("%Y-%m-%d %H:%M:%S"),
+               expression=expression, rationale=rationale, submitted="NO")
+
+    location, err = be.submit_simulation(session, expression, settings)
+    if err == "EXPIRED_SESSION":
+        logger.warning("Session expired mid-run - attempting one re-auth...")
+        session.cookies.clear()
+        if not be.authenticate(session, email, password):
+            row["status"], row["error"] = "STOPPED", "session expired and could not renew unattended"
+            append_result(row)
+            raise StopLoop("BRAIN needs re-authentication (likely identity verification) and no one is here to complete it.")
+        save_session(session)
+        location, err = be.submit_simulation(session, expression, settings)
+
+    if err:
+        row["status"], row["error"] = "FAILED", str(err)[:300]
+        append_result(row)
+        return row
+
+    alpha_id, err = be.poll_simulation(session, location)
+    if err:
+        row["status"], row["error"] = "FAILED", str(err)[:300]
+        append_result(row)
+        return row
+
+    alpha = be.fetch_alpha(session, alpha_id)
+    metrics = be.metrics_from_alpha(alpha_id, alpha)
+    checks = (alpha.get("is") or {}).get("checks") or []
+    row.update(status="COMPLETE", alpha_id=alpha_id, **metrics)
+    # Kept in memory for the next round's feedback; the CSV doesn't store it.
+    row["failing_checks"] = ", ".join(f"{c.get('name')}:{c.get('result')}" for c in checks if c.get("result") != "PASS")
+
+    if qualifies(metrics, checks):
+        if submissions_today() >= MAX_SUBMISSIONS_PER_DAY:
+            logger.warning("Alpha %s qualifies but today's submission limit (%d) is used - logging it, "
+                           "not submitting.", alpha_id, MAX_SUBMISSIONS_PER_DAY)
+            row["submitted"] = "QUALIFIED_NOT_SUBMITTED (daily cap reached)"
+        else:
+            row["submitted"] = try_submit(session, alpha_id)
+
+    append_result(row)
+    logger.info("  %s -> sharpe=%s fitness=%s turnover=%s checks=%s/%s submitted=%s", expression,
+                metrics.get("sharpe"), metrics.get("fitness"), metrics.get("turnover"),
+                metrics.get("checks_passed"), metrics.get("checks_total"), row["submitted"])
+    return row
 
 
 def run_round(session, client, operators, fields, settings, email, password, round_num, feedback_text, avoid):
@@ -267,75 +498,27 @@ def run_round(session, client, operators, fields, settings, email, password, rou
     except Exception as e:
         raise GenerationFailed(short_error(e)) from e
 
-    round_rows = []
-    for expression, rationale in ideas:
+    queue = deque(ideas)
+    round_rows, flips = [], 0
+    while queue:
+        expression, rationale = queue.popleft()
         if expression in avoid:
             logger.info("Skipping duplicate: %s", expression)
             continue
         avoid.add(expression)
-
-        row = {k: "" for k in RESULTS_HEADER}
-        row.update(round=round_num, timestamp=time.strftime("%Y-%m-%d %H:%M:%S"),
-                   expression=expression, rationale=rationale)
-
-        location, err = be.submit_simulation(session, expression, settings)
-        if err == "EXPIRED_SESSION":
-            logger.warning("Session expired mid-run - attempting one re-auth...")
-            session.cookies.clear()
-            if not be.authenticate(session, email, password):
-                row["status"], row["error"], row["submitted"] = "STOPPED", "session expired and could not renew unattended", "NO"
-                append_result(row)
-                round_rows.append(row)
-                raise StopLoop("BRAIN needs re-authentication (likely identity verification) and no one is here to complete it.")
-            save_session(session)
-            location, err = be.submit_simulation(session, expression, settings)
-
-        if err:
-            row["status"], row["error"], row["submitted"] = "FAILED", str(err)[:300], "NO"
-            append_result(row)
-            round_rows.append(row)
-            continue
-
-        alpha_id, err = be.poll_simulation(session, location)
-        if err:
-            row["status"], row["error"], row["submitted"] = "FAILED", str(err)[:300], "NO"
-            append_result(row)
-            round_rows.append(row)
-            continue
-
-        metrics = be.fetch_alpha_metrics(session, alpha_id)
-        row.update(status="COMPLETE", alpha_id=alpha_id, **metrics)
-
-        # --- Autonomous submission, rate-limited ---
-        checks_passed = safe_float(metrics.get("checks_passed"))
-        checks_total = safe_float(metrics.get("checks_total"))
-        sharpe = safe_float(metrics.get("sharpe"))
-        fitness = safe_float(metrics.get("fitness"))
-        qualifies = (checks_total > 0 and checks_passed == checks_total
-                     and sharpe >= SUBMIT_MIN_SHARPE and fitness >= SUBMIT_MIN_FITNESS)
-
-        if not qualifies:
-            row["submitted"] = "NO"
-        elif submissions_today() >= MAX_SUBMISSIONS_PER_DAY:
-            logger.warning(
-                "Alpha %s qualifies but the daily submission cap (%d) is already reached - "
-                "logging as qualified, NOT auto-submitting.", alpha_id, MAX_SUBMISSIONS_PER_DAY,
-            )
-            row["submitted"] = "QUALIFIED_NOT_SUBMITTED (daily cap reached)"
-        else:
-            logger.info("Alpha %s qualified for submission! Submitting...", alpha_id)
-            submitted, sub_err = submit_alpha(session, alpha_id)
-            if submitted:
-                record_submission()
-                row["submitted"] = "YES"
-            else:
-                row["submitted"] = f"FAILED: {sub_err}"
-
-        append_result(row)
+        row = evaluate_idea(session, expression, rationale, settings, email, password, round_num)
         round_rows.append(row)
-        logger.info("  %s -> sharpe=%s fitness=%s checks=%s/%s submitted=%s", expression,
-                    metrics.get("sharpe"), metrics.get("fitness"),
-                    metrics.get("checks_passed"), metrics.get("checks_total"), row["submitted"])
+
+        # Auto-flip: a strongly negative Sharpe means a real signal pointing the wrong way.
+        sharpe = as_float(row.get("sharpe"))
+        if (row["status"] == "COMPLETE" and sharpe is not None and sharpe <= FLIP_SHARPE_AT_OR_BELOW
+                and flips < MAX_FLIPS_PER_ROUND and not expression.startswith("reverse(")):
+            flipped = f"reverse({expression})"
+            if flipped not in avoid:
+                flips += 1
+                logger.info("  Sharpe %.2f points the wrong way - queueing the flipped version.", sharpe)
+                queue.append((flipped, f"Auto-flip of {expression}, which scored Sharpe {sharpe:.2f}; "
+                                       f"reversed, it should score about {-sharpe:.2f}."))
         time.sleep(3)
 
     return round_rows

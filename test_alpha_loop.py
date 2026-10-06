@@ -173,30 +173,6 @@ def test_run_round_full_success_flow_no_submit(tmp_path):
     in_tmp(tmp_path, run)
 
 
-def test_run_round_auto_submits_qualifying_alpha(tmp_path):
-    def run():
-        client = MagicMock()
-        client.models.generate_content.return_value = fake_gemini_response([
-            {"expression": "rank(close)", "rationale": "r1"},
-        ])
-        session = MagicMock()
-        session.post.side_effect = [
-            fake_response(201, headers={"Location": "loc1"}),  # submit_simulation
-            fake_response(201, {}),                             # submit_alpha
-        ]
-        session.get.side_effect = [
-            fake_response(200, {"status": "COMPLETE", "alpha": "aid1"}),
-            fake_response(200, {"is": {"sharpe": 2.0, "fitness": 1.5, "turnover": 0.1,
-                                        "checks": [{"name": "X", "result": "PASS"}]}}),
-        ]
-        with patch("time.sleep", return_value=None):
-            rows = al.run_round(session, client, [], [], {"region": "USA", "universe": "TOP3000", "delay": 1},
-                                 "e@x.com", "pw", 1, "round 1", set())
-        assert rows[0]["submitted"] == "YES"
-        assert al.submissions_today() == 1
-    in_tmp(tmp_path, run)
-
-
 def test_run_round_respects_daily_submission_cap(tmp_path):
     def run():
         al.record_submission()  # simulate the day's cap (default 1) already used
@@ -441,6 +417,224 @@ def test_main_stops_after_repeated_generation_failures(tmp_path):
             al.main()
         assert gen.call_count == 3   # stopped after 3 in a row instead of looping for 4 hours
         submit.assert_not_called()   # no BRAIN quota spent
+    in_tmp(tmp_path, run)
+
+
+
+# ---- Submit path, auto-flip, turnover feedback ----
+
+from datetime import date as _date, datetime as _dt, timezone as _tz
+
+QUALIFYING_CHECKS = [{"name": "LOW_SHARPE", "result": "PASS"}, {"name": "LOW_FITNESS", "result": "PASS"},
+                     {"name": "HIGH_TURNOVER", "result": "PASS"}, {"name": "SELF_CORRELATION", "result": "PENDING"}]
+
+
+def alpha_json(sharpe=1.6, fitness=1.2, turnover=0.3, checks=None, status="UNSUBMITTED"):
+    return {"status": status, "is": {"sharpe": sharpe, "fitness": fitness, "turnover": turnover,
+                                     "checks": QUALIFYING_CHECKS if checks is None else checks}}
+
+
+class FakeBrain:
+    """Answers by URL, the way community clients recorded BRAIN behaving."""
+    def __init__(self, alphas, corr=0.3, submit_post=503, verdict=None):
+        self.alphas = alphas                # {alpha_id: alpha json}; simulations hand them out in order
+        self.order = list(alphas)
+        self.corr = corr
+        self.submit_post = submit_post
+        self.verdict = verdict if verdict is not None else {"is": {"checks": [{"name": "SELF_CORRELATION", "result": "PASS"}]}}
+        self.submitted = set()
+        self.session = MagicMock()
+        self.session.get.side_effect = self.get
+        self.session.post.side_effect = self.post
+        self.submit_polls = 0
+
+    def post(self, url, **kw):
+        if url.endswith("/simulations"):
+            return fake_response(201, headers={"Location": f"sim-{self.order.pop(0)}"})
+        if url.endswith("/submit"):
+            if self.submit_post in (200, 201, 202, 503):
+                return fake_response(self.submit_post, {}, headers={"Retry-After": "1.0"})
+            return fake_response(self.submit_post, {"is": {"checks": [{"name": "LOW_SHARPE", "result": "FAIL"}]}})
+        raise AssertionError(f"unexpected POST {url}")
+
+    def get(self, url, **kw):
+        if url.startswith("sim-"):
+            return fake_response(200, {"status": "COMPLETE", "alpha": url[4:]})
+        if url.endswith("/correlations/self"):
+            return fake_response(200, {"max": self.corr})
+        if url.endswith("/submit"):
+            self.submit_polls += 1
+            if self.submit_polls == 1:  # first poll: still working
+                return fake_response(200, None, headers={"Retry-After": "2.5"}, text="")
+            alpha_id = url.split("/")[-2]
+            if not failing_names(self.verdict):
+                self.submitted.add(alpha_id)
+            return fake_response(200, self.verdict, text=json.dumps(self.verdict))
+        alpha_id = url.rsplit("/", 1)[-1]
+        data = dict(self.alphas[alpha_id])
+        if alpha_id in self.submitted:
+            data["status"] = "ACTIVE"
+        return fake_response(200, data)
+
+
+def failing_names(verdict):
+    return [c for c in (verdict.get("is") or {}).get("checks", []) if c.get("result") == "FAIL"]
+
+
+def run_one_idea(brain, expression="rank(close)"):
+    client = MagicMock()
+    client.models.generate_content.return_value = fake_gemini_response([{"expression": expression, "rationale": "r"}])
+    with patch("time.sleep"):
+        return al.run_round(brain.session, client, [], [], SETTINGS, "e@x.com", "pw", 1, "round 1", set())
+
+
+def test_brain_day_rolls_at_3am_us_eastern():
+    # Summer (EDT, UTC-4): 3 AM Eastern = 07:00 UTC
+    assert al.brain_day(_dt(2026, 10, 7, 6, 59, tzinfo=_tz.utc)) == _date(2026, 10, 6)
+    assert al.brain_day(_dt(2026, 10, 7, 7, 0, tzinfo=_tz.utc)) == _date(2026, 10, 7)
+    # Winter (EST, UTC-5): 3 AM Eastern = 08:00 UTC
+    assert al.brain_day(_dt(2026, 12, 1, 7, 59, tzinfo=_tz.utc)) == _date(2026, 11, 30)
+    assert al.brain_day(_dt(2026, 12, 1, 8, 0, tzinfo=_tz.utc)) == _date(2026, 12, 1)
+
+
+def test_qualifies_ignores_only_a_pending_self_correlation():
+    good = {"sharpe": 1.6, "fitness": 1.2}
+    assert al.qualifies(good, QUALIFYING_CHECKS) is True
+    failed_turnover = QUALIFYING_CHECKS[:2] + [{"name": "HIGH_TURNOVER", "result": "FAIL"}] + QUALIFYING_CHECKS[3:]
+    assert al.qualifies(good, failed_turnover) is False
+    failed_corr = QUALIFYING_CHECKS[:3] + [{"name": "SELF_CORRELATION", "result": "FAIL"}]
+    assert al.qualifies(good, failed_corr) is False
+    assert al.qualifies({"sharpe": 1.2, "fitness": 1.2}, QUALIFYING_CHECKS) is False
+    assert al.qualifies(good, []) is False
+
+
+def test_self_correlation_waits_while_brain_computes():
+    session = MagicMock()
+    session.get.side_effect = [
+        fake_response(503, {}, headers={"Retry-After": "1.5"}),
+        fake_response(200, None, headers={"Retry-After": "2.0"}, text=""),
+        fake_response(200, {"max": 0.42}, text='{"max": 0.42}'),
+    ]
+    with patch("time.sleep") as sleep:
+        assert al.self_correlation_max(session, "a1") == 0.42
+    assert [c.args[0] for c in sleep.call_args_list] == [1.5, 2.0]
+
+
+def test_full_submit_path_ends_in_yes_only_when_brain_lists_it_active(tmp_path):
+    def run():
+        brain = FakeBrain({"a1": alpha_json()})
+        rows = run_one_idea(brain)
+        assert rows[0]["submitted"] == "YES"
+        assert al.submissions_today() == 1
+        assert brain.submit_polls == 2  # waited through the 'still working' reply
+    in_tmp(tmp_path, run)
+
+
+def test_rejected_verdict_is_recorded_and_still_uses_the_slot(tmp_path):
+    def run():
+        verdict = {"is": {"checks": [{"name": "SELF_CORRELATION", "result": "FAIL"}]}}
+        brain = FakeBrain({"a1": alpha_json()}, verdict=verdict)
+        rows = run_one_idea(brain)
+        assert rows[0]["submitted"] == "REJECTED: failed SELF_CORRELATION"
+        assert al.submissions_today() == 1
+    in_tmp(tmp_path, run)
+
+
+def test_immediate_403_is_a_rejection(tmp_path):
+    def run():
+        brain = FakeBrain({"a1": alpha_json()}, submit_post=403)
+        rows = run_one_idea(brain)
+        assert rows[0]["submitted"] == "REJECTED: failed LOW_SHARPE"
+    in_tmp(tmp_path, run)
+
+
+def test_too_correlated_is_skipped_without_using_the_slot(tmp_path):
+    def run():
+        brain = FakeBrain({"a1": alpha_json()}, corr=0.83)
+        rows = run_one_idea(brain)
+        assert rows[0]["submitted"] == "TOO_CORRELATED (max 0.83)"
+        assert al.submissions_today() == 0
+        assert not any(c.args[0].endswith("/submit") for c in brain.session.post.call_args_list)
+    in_tmp(tmp_path, run)
+
+
+def test_unconfirmed_success_is_reported_as_pending_not_yes(tmp_path):
+    def run():
+        brain = FakeBrain({"a1": alpha_json()})
+        brain.submitted = set()
+        original_get = brain.get
+        def get(url, **kw):  # verdict looks fine, but BRAIN never lists the alpha as ACTIVE
+            r = original_get(url, **kw)
+            brain.submitted.clear()
+            return r
+        brain.session.get.side_effect = get
+        rows = run_one_idea(brain)
+        assert rows[0]["submitted"].startswith("VERDICT_PENDING")
+    in_tmp(tmp_path, run)
+
+
+def test_strongly_negative_sharpe_gets_flipped_once(tmp_path):
+    def run():
+        brain = FakeBrain({"neg": alpha_json(sharpe=-1.76, fitness=-0.92, checks=[]),
+                           "pos": alpha_json(sharpe=1.76, fitness=0.92, checks=[])})
+        rows = run_one_idea(brain, "rank(ts_av_diff(close, 10))")
+        assert [r["expression"] for r in rows] == ["rank(ts_av_diff(close, 10))",
+                                                   "reverse(rank(ts_av_diff(close, 10)))"]
+        assert rows[1]["rationale"].startswith("Auto-flip of rank(ts_av_diff(close, 10))")
+        assert "1.76" in rows[1]["rationale"]
+    in_tmp(tmp_path, run)
+
+
+def test_flips_are_capped_per_round(tmp_path):
+    def run():
+        ideas = [{"expression": f"rank(f{i})", "rationale": "r"} for i in range(5)]
+        alphas = {f"n{i}": alpha_json(sharpe=-1.5, checks=[]) for i in range(5)}
+        alphas.update({f"p{i}": alpha_json(sharpe=1.5, checks=[]) for i in range(5)})
+        brain = FakeBrain(alphas)
+        brain.order = [f"n{i}" for i in range(5)] + [f"p{i}" for i in range(5)]
+        client = MagicMock()
+        client.models.generate_content.return_value = fake_gemini_response(ideas)
+        with patch.object(al, "MAX_FLIPS_PER_ROUND", 3), patch("time.sleep"):
+            rows = al.run_round(brain.session, client, [], [], SETTINGS, "e@x.com", "pw", 1, "round 1", set())
+        flipped = [r for r in rows if r["expression"].startswith("reverse(")]
+        assert len(flipped) == 3 and len(rows) == 8
+    in_tmp(tmp_path, run)
+
+
+def test_mild_negative_sharpe_is_not_flipped(tmp_path):
+    def run():
+        brain = FakeBrain({"a1": alpha_json(sharpe=-0.5, checks=[])})
+        rows = run_one_idea(brain)
+        assert len(rows) == 1
+    in_tmp(tmp_path, run)
+
+
+def test_prompt_tells_the_generator_the_turnover_range():
+    client = MagicMock()
+    client.models.generate_content.return_value = fake_gemini_response(ONE_IDEA)
+    al.generate_ideas(client, "m", [], [], SETTINGS, "", set(), 1)
+    prompt = client.models.generate_content.call_args.kwargs["contents"]
+    assert "turnover between 0.01 and 0.7" in prompt
+    assert "re-tested reversed" in prompt
+
+
+def test_feedback_flags_turnover_and_failing_checks():
+    rows = [{"status": "COMPLETE", "expression": "fast", "sharpe": "1.59", "fitness": "0.49", "turnover": "0.7264",
+             "checks_passed": "4", "checks_total": "8", "submitted": "NO", "failing_checks": "HIGH_TURNOVER:FAIL"},
+            {"status": "COMPLETE", "expression": "slow", "sharpe": "0.2", "fitness": "0.1", "turnover": "0.004",
+             "checks_passed": "4", "checks_total": "8", "submitted": "NO"}]
+    text = al.summarize_round(rows)
+    assert "TURNOVER TOO HIGH" in text and "not_passing=[HIGH_TURNOVER:FAIL]" in text
+    assert "TURNOVER TOO LOW" in text
+
+
+def test_in_memory_extras_never_break_the_csv(tmp_path):
+    def run():
+        row = {k: "" for k in al.RESULTS_HEADER}
+        row.update(expression="x", failing_checks="A:FAIL")
+        al.append_result(row)  # must not raise on the extra key
+        with open(al.RESULTS_FILE, encoding="utf-8") as f:
+            assert next(csv.reader(f)) == al.RESULTS_HEADER
     in_tmp(tmp_path, run)
 
 

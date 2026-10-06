@@ -1,19 +1,3 @@
-"""
-brain_engine.py — batch alpha-testing harness for WorldQuant BRAIN.
-
-Setup (once):
-    pip install requests python-dotenv
-    Create a .env file in this same folder containing:
-        WQ_EMAIL=you@example.com
-        WQ_PASSWORD=your-password
-
-Then just run:
-    python brain_engine.py
-
-Credentials are never hardcoded in source - they're loaded from .env at startup.
-Results stream to results.csv as each simulation finishes (not just printed),
-so nothing is lost if the run is interrupted partway through.
-"""
 import csv
 import logging
 import os
@@ -160,11 +144,22 @@ def poll_simulation(session: requests.Session, location: str):
     return None, f"timed out after {MAX_POLL_SECONDS}s"
 
 
-def fetch_alpha_metrics(session: requests.Session, alpha_id: str) -> dict:
+def fetch_alpha(session: requests.Session, alpha_id: str) -> dict:
+    """BRAIN's full record of one alpha, or {} if the reply wasn't readable."""
     resp = session.get(ALPHA_URL.format(alpha_id=alpha_id))
     try:
         alpha = resp.json()
     except ValueError:
+        return {}
+    return alpha if isinstance(alpha, dict) else {}
+
+
+def fetch_alpha_metrics(session: requests.Session, alpha_id: str) -> dict:
+    return metrics_from_alpha(alpha_id, fetch_alpha(session, alpha_id))
+
+
+def metrics_from_alpha(alpha_id: str, alpha: dict) -> dict:
+    if not alpha:
         return {}
     is_stats = alpha.get("is", {})
     checks = is_stats.get("checks", [])

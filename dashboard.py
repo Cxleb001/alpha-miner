@@ -17,7 +17,7 @@ import csv
 import json
 import os
 import time
-from datetime import date
+
 from pathlib import Path
 
 import pandas as pd
@@ -33,6 +33,9 @@ SUBMISSION_LOG_PATH = DATA_DIR / al.SUBMISSION_LOG_FILE
 SESSION_PATH = DATA_DIR / al.SESSION_FILE
 
 SUBMITTED = "Submitted"
+AWAITING = "Submitted, waiting for BRAIN's verdict"
+REJECTED = "Submitted, BRAIN rejected it"
+TOO_SIMILAR = "Cleared the bar, too similar to your submitted alphas"
 HELD = "Cleared the bar, held by the daily limit"
 SUBMIT_FAILED = "Cleared the bar, submit request failed"
 NEAR_MISS = "Strong numbers, didn't pass every check"
@@ -41,7 +44,10 @@ SIM_FAILED = "Simulation failed"
 STOPPED = "Run stopped here"
 
 # Worth asking BRAIN about: anything that cleared the bar or came close to it.
-WORTH_CHECKING = (SUBMITTED, HELD, SUBMIT_FAILED, NEAR_MISS)
+WORTH_CHECKING = (SUBMITTED, AWAITING, REJECTED, TOO_SIMILAR, HELD, SUBMIT_FAILED, NEAR_MISS)
+CLEARED = (SUBMITTED, AWAITING, REJECTED, TOO_SIMILAR, HELD, SUBMIT_FAILED)
+ALL_OUTCOMES = (SUBMITTED, AWAITING, REJECTED, TOO_SIMILAR, HELD, SUBMIT_FAILED, NEAR_MISS,
+                BELOW_BAR, SIM_FAILED, STOPPED)
 
 
 # ---- Reading the local log ----
@@ -66,6 +72,12 @@ def outcome(row):
     status = (row.get("status") or "").strip()
     if submitted == "YES":
         return SUBMITTED
+    if submitted.startswith("VERDICT_PENDING"):
+        return AWAITING
+    if submitted.startswith("REJECTED"):
+        return REJECTED
+    if submitted.startswith("TOO_CORRELATED"):
+        return TOO_SIMILAR
     if submitted.startswith("QUALIFIED_NOT_SUBMITTED"):
         return HELD
     if submitted.startswith("FAILED"):
@@ -108,7 +120,7 @@ def headline(rows, today_count):
 def summary(rows, today_count, cap):
     outcomes = [outcome(r) for r in rows]
     simulated = sum(1 for o in outcomes if o not in (SIM_FAILED, STOPPED))
-    cleared = sum(1 for o in outcomes if o in (SUBMITTED, HELD, SUBMIT_FAILED))
+    cleared = sum(1 for o in outcomes if o in CLEARED)
     last = max((r.get("timestamp") or "" for r in rows), default="")
     return (f"{plural(len(rows), 'idea')} tried, {simulated} simulated, {cleared} cleared the bar. "
             f"{today_count} of {cap} daily submissions used. Last activity {last or 'unknown'}.")
@@ -266,7 +278,7 @@ LINK = {"BRAIN page": st.column_config.LinkColumn("BRAIN page", display_text="Op
 def render():
     st.set_page_config(page_title="Alpha Miner", layout="wide")
     rows = load_rows()
-    today_count = submissions_on(date.today())
+    today_count = submissions_on(al.brain_day())
 
     st.title(headline(rows, today_count))
     if not rows:
@@ -312,8 +324,7 @@ def render():
                          column_config=LINK)
 
     st.subheader("Every attempt")
-    present = [o for o in (SUBMITTED, HELD, SUBMIT_FAILED, NEAR_MISS, BELOW_BAR, SIM_FAILED, STOPPED)
-               if any(outcome(r) == o for r in rows)]
+    present = [o for o in ALL_OUTCOMES if any(outcome(r) == o for r in rows)]
     choice = st.selectbox("Show", ["All outcomes", *present])
     shown = rows if choice == "All outcomes" else [r for r in rows if outcome(r) == choice]
     st.dataframe(table(shown, with_rationale=True), hide_index=True, column_config=LINK)

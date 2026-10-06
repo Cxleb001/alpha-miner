@@ -51,7 +51,7 @@ def write_data(folder, rows=SAMPLE, today_count=1):
         writer = csv.DictWriter(f, fieldnames=al.RESULTS_HEADER)
         writer.writeheader()
         writer.writerows(rows)
-    (folder / al.SUBMISSION_LOG_FILE).write_text(json.dumps({str(date.today()): today_count}))
+    (folder / al.SUBMISSION_LOG_FILE).write_text(json.dumps({str(al.brain_day()): today_count}))
 
 
 def response(status, payload=None, url=""):
@@ -143,6 +143,15 @@ def test_log_in_never_prompts():
     session.post.return_value = response(401, {"detail": "bad"})
     state, message = db.log_in(session, "e", "p")
     assert state == "error" and "WQ_PASSWORD" in message
+
+
+def test_new_submit_outcomes_are_recognised_and_counted_as_cleared():
+    rows = [row(status="COMPLETE", sharpe="1.6", fitness="1.2", submitted="VERDICT_PENDING (check with BRAIN in the dashboard)"),
+            row(status="COMPLETE", sharpe="1.6", fitness="1.2", submitted="REJECTED: failed SELF_CORRELATION"),
+            row(status="COMPLETE", sharpe="1.6", fitness="1.2", submitted="TOO_CORRELATED (max 0.83)")]
+    assert [db.outcome(r) for r in rows] == [db.AWAITING, db.REJECTED, db.TOO_SIMILAR]
+    assert all(db.outcome(r) in db.WORTH_CHECKING for r in rows)
+    assert "3 cleared the bar" in db.summary(rows, 0, 1)
 
 
 # ---- The page itself (rendered by Streamlit's own test harness) ----
