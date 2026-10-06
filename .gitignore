@@ -12,4 +12,5 @@ results.csv
 __pycache__/
 *.pyc
 *.pyo
-.pytest_cache/
+.pytest_cache/data_fields_cache.json
+operators.json.bak

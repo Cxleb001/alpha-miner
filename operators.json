@@ -1,87 +1,632 @@
 {
-  "_comment": "Operators below were transcribed directly from the user's own screen recordings of platform.worldquantbrain.com/learn/operators (two recordings: one covering Logical through Group, a second confirmed to start at the true top of the page and end at the same last entry, group_zscore, as the first). Combined, this is now the COMPLETE 'base' tier operator list - 66 operators across Arithmetic, Logical, Time Series, Cross Sectional, Vector, Transformational, and Group. KNOWN GAP: the page itself states more operators unlock at Expert/Master/Grandmaster tiers - those are not captured here since neither recording showed them (may require a higher account tier to even view). 'fields' below is still the original small starter set - separate task, untouched by this update.",
+  "_comment": "Operators below were transcribed directly from the user's own screen recordings of platform.worldquantbrain.com/learn/operators (two recordings: one covering Logical through Group, a second confirmed to start at the true top of the page and end at the same last entry, group_zscore, as the first). Combined, this is now the COMPLETE 'base' tier operator list - 66 operators across Arithmetic, Logical, Time Series, Cross Sectional, Vector, Transformational, and Group. KNOWN GAP: the page itself states more operators unlock at Expert/Master/Grandmaster tiers - those are not captured here since neither recording showed them (may require a higher account tier to even view).",
   "operators": [
-    {"name": "abs", "usage": "abs(x) - absolute value of x, removing any negative sign"},
-    {"name": "add", "usage": "add(x, y, filter=false), or x + y - adds two or more inputs element-wise"},
-    {"name": "densify", "usage": "densify(x) - collapses a grouping field's many buckets down to only the buckets actually in use"},
-    {"name": "divide", "usage": "divide(x, y), or x / y - x divided by y; guard against div-by-zero with divide(x, add(y, 0.0001))"},
-    {"name": "inverse", "usage": "inverse(x) - reciprocal of x (1/x); guard against x=0 with inverse(add(x, 0.0001))"},
-    {"name": "log", "usage": "log(x) - natural logarithm of x; x should be positive"},
-    {"name": "max", "usage": "max(x, y, ...) - maximum value across 2+ inputs"},
-    {"name": "min", "usage": "min(x, y, ...) - minimum value across 2+ inputs"},
-    {"name": "multiply", "usage": "multiply(x, y, ..., filter=false), or x * y - multiplies two or more inputs element-wise"},
-    {"name": "power", "usage": "power(x, y) - x raised to power y (x^y); can drop the sign of x if y is non-integer, use signed_power to preserve it"},
-    {"name": "reverse", "usage": "reverse(x) - returns -x"},
-    {"name": "sign", "usage": "sign(x) - +1 for positive, -1 for negative, 0 for zero, NaN stays NaN"},
-    {"name": "signed_power", "usage": "signed_power(x, y) - x raised to power y, result keeps the sign of x"},
-    {"name": "sqrt", "usage": "sqrt(x) - non-negative square root; equivalent to power(x, 0.5)"},
-    {"name": "subtract", "usage": "subtract(x, y, filter=false), or x - y - subtracts left to right, 2+ inputs supported"},
-
-    {"name": "and", "usage": "and(input1, input2) - 1 if both inputs are 1 ('true'), else 0"},
-    {"name": "if_else", "usage": "if_else(input1, input2, input3) - if input1 is true returns input2, else input3"},
-    {"name": "lt", "usage": "input1 < input2 - 1 if input1 smaller than input2, else 0"},
-    {"name": "le", "usage": "input1 <= input2 - 1 if input1 smaller or equal to input2, else 0"},
-    {"name": "eq", "usage": "input1 == input2 - 1 if equal, else 0"},
-    {"name": "gt", "usage": "input1 > input2 - 1 if input1 larger than input2, else 0"},
-    {"name": "ge", "usage": "input1 >= input2 - 1 if input1 larger or equal to input2, else 0"},
-    {"name": "ne", "usage": "input1 != input2 - 1 if different, else 0"},
-    {"name": "is_nan", "usage": "is_nan(input) - 1 if input is NaN, else 0"},
-    {"name": "not", "usage": "not(x) - logical negation: 0 if x is 1, 1 if x is 0"},
-    {"name": "or", "usage": "or(input1, input2) - 1 if either input is 1 ('true'), else 0"},
-
-    {"name": "days_from_last_change", "usage": "days_from_last_change(x) - number of days since x's value last changed"},
-    {"name": "hump", "usage": "hump(x, hump=0.01) - limits the magnitude of changes in x, reducing turnover"},
-    {"name": "kth_element", "usage": "kth_element(x, d, k, ignore='NaN') - k-th value from x's last d days; used for backfilling"},
-    {"name": "last_diff_value", "usage": "last_diff_value(x, d) - most recent value of x in the past d days that differs from today's"},
-    {"name": "ts_arg_max", "usage": "ts_arg_max(x, d) - days since the max value of x occurred within the last d days (0 = today)"},
-    {"name": "ts_arg_min", "usage": "ts_arg_min(x, d) - days since the min value of x occurred within the last d days (0 = today)"},
-    {"name": "ts_av_diff", "usage": "ts_av_diff(x, d) - x minus ts_mean(x, d), with NaNs ignored in the mean"},
-    {"name": "ts_backfill", "usage": "ts_backfill(x, lookback=d, k=1) - replaces NaNs with the most recent valid value in the lookback window"},
-    {"name": "ts_corr", "usage": "ts_corr(x, y, d) - Pearson correlation between x and y over the past d days"},
-    {"name": "ts_count_nans", "usage": "ts_count_nans(x, d) - count of NaN values in x over the past d days"},
-    {"name": "ts_covariance", "usage": "ts_covariance(y, x, d) - covariance between y and x over the past d days"},
-    {"name": "ts_decay_linear", "usage": "ts_decay_linear(x, d, dense=false) - linear decay/smoothing of x over d days, weighting recent values more"},
-    {"name": "ts_delay", "usage": "ts_delay(x, d) - value of x from d days ago"},
-    {"name": "ts_delta", "usage": "ts_delta(x, d) - x minus its value d days ago (momentum/change)"},
-    {"name": "ts_mean", "usage": "ts_mean(x, d) - simple average of x over the past d days"},
-    {"name": "ts_product", "usage": "ts_product(x, d) - product of x's values over the past d days"},
-    {"name": "ts_quantile", "usage": "ts_quantile(x, d, driver='gaussian') - ts_rank of x transformed via a distribution's inverse CDF"},
-    {"name": "ts_rank", "usage": "ts_rank(x, d, constant=0) - rank of today's value of x within its own trailing d-day history"},
-    {"name": "ts_regression", "usage": "ts_regression(y, x, d, lag=0, rettype=0) - regression of y on x over d days, returns chosen parameter"},
-    {"name": "ts_scale", "usage": "ts_scale(x, d, constant=0) - scales x to a 0-1 range based on its min/max over the past d days"},
-    {"name": "ts_std_dev", "usage": "ts_std_dev(x, d) - standard deviation of x over the past d days"},
-    {"name": "ts_step", "usage": "ts_step(1) - counter of days, increments by 1 each day"},
-    {"name": "ts_sum", "usage": "ts_sum(x, d) - sum of x's values over the past d days"},
-    {"name": "ts_zscore", "usage": "ts_zscore(x, d) - how many standard deviations today's x is from its own trailing d-day average"},
-
-    {"name": "normalize", "usage": "normalize(x, useStd=false, limit=0.0) - centers x by subtracting the daily cross-sectional mean, optionally divides by std and clamps to [-limit, +limit]"},
-    {"name": "quantile", "usage": "quantile(x, driver='gaussian', sigma=1.0) - ranks then reshapes x's cross-sectional distribution (gaussian/cauchy/uniform)"},
-    {"name": "rank", "usage": "rank(x, rate=2) - cross-sectional rank of x among all instruments, spread evenly between 0.0 and 1.0"},
-    {"name": "scale", "usage": "scale(x, scale=1, longscale=1, shortscale=1) - rescales x so absolute values across instruments sum to a target book size"},
-    {"name": "winsorize", "usage": "winsorize(x, std=4) - caps x within std standard deviations of the mean, reducing outlier impact"},
-    {"name": "zscore", "usage": "zscore(x) - x's distance from the cross-sectional mean, measured in standard deviations"},
-
-    {"name": "vec_avg", "usage": "vec_avg(x) - mean of all elements in a vector field, per instrument/date, collapsing it to a single value"},
-    {"name": "vec_sum", "usage": "vec_sum(x) - sum of all elements in a vector field"},
-
-    {"name": "bucket", "usage": "bucket(rank(x), range='0, 1, 0.1') or bucket(rank(x), buckets='2,5,6,7,10') - sorts ranked data into custom groups for use with group_* operators"},
-    {"name": "trade_when", "usage": "trade_when(x, y, z) - only updates the alpha's value when condition x is met, holds otherwise, exits (NaN) when condition z is met"},
-
-    {"name": "group_backfill", "usage": "group_backfill(x, group, d, std=4.0) - fills NaNs using a winsorized mean of same-group instruments over the past d days"},
-    {"name": "group_mean", "usage": "group_mean(x, weight, group) - harmonic mean of x within each group"},
-    {"name": "group_neutralize", "usage": "group_neutralize(x, group) - subtracts the group (e.g. industry) mean from x, removing group-level bias"},
-    {"name": "group_rank", "usage": "group_rank(x, group) - rank of x within its own group only, between 0.0 and 1.0"},
-    {"name": "group_scale", "usage": "group_scale(x, group) - normalizes x to a 0-1 range within each group"},
-    {"name": "group_zscore", "usage": "group_zscore(x, group) - x's distance from its group's mean, measured in standard deviations"}
+    {
+      "name": "abs",
+      "usage": "abs(x) - absolute value of x, removing any negative sign"
+    },
+    {
+      "name": "add",
+      "usage": "add(x, y, filter=false), or x + y - adds two or more inputs element-wise"
+    },
+    {
+      "name": "densify",
+      "usage": "densify(x) - collapses a grouping field's many buckets down to only the buckets actually in use"
+    },
+    {
+      "name": "divide",
+      "usage": "divide(x, y), or x / y - x divided by y; guard against div-by-zero with divide(x, add(y, 0.0001))"
+    },
+    {
+      "name": "inverse",
+      "usage": "inverse(x) - reciprocal of x (1/x); guard against x=0 with inverse(add(x, 0.0001))"
+    },
+    {
+      "name": "log",
+      "usage": "log(x) - natural logarithm of x; x should be positive"
+    },
+    {
+      "name": "max",
+      "usage": "max(x, y, ...) - maximum value across 2+ inputs"
+    },
+    {
+      "name": "min",
+      "usage": "min(x, y, ...) - minimum value across 2+ inputs"
+    },
+    {
+      "name": "multiply",
+      "usage": "multiply(x, y, ..., filter=false), or x * y - multiplies two or more inputs element-wise"
+    },
+    {
+      "name": "power",
+      "usage": "power(x, y) - x raised to power y (x^y); can drop the sign of x if y is non-integer, use signed_power to preserve it"
+    },
+    {
+      "name": "reverse",
+      "usage": "reverse(x) - returns -x"
+    },
+    {
+      "name": "sign",
+      "usage": "sign(x) - +1 for positive, -1 for negative, 0 for zero, NaN stays NaN"
+    },
+    {
+      "name": "signed_power",
+      "usage": "signed_power(x, y) - x raised to power y, result keeps the sign of x"
+    },
+    {
+      "name": "sqrt",
+      "usage": "sqrt(x) - non-negative square root; equivalent to power(x, 0.5)"
+    },
+    {
+      "name": "subtract",
+      "usage": "subtract(x, y, filter=false), or x - y - subtracts left to right, 2+ inputs supported"
+    },
+    {
+      "name": "and",
+      "usage": "and(input1, input2) - 1 if both inputs are 1 ('true'), else 0"
+    },
+    {
+      "name": "if_else",
+      "usage": "if_else(input1, input2, input3) - if input1 is true returns input2, else input3"
+    },
+    {
+      "name": "lt",
+      "usage": "input1 < input2 - 1 if input1 smaller than input2, else 0"
+    },
+    {
+      "name": "le",
+      "usage": "input1 <= input2 - 1 if input1 smaller or equal to input2, else 0"
+    },
+    {
+      "name": "eq",
+      "usage": "input1 == input2 - 1 if equal, else 0"
+    },
+    {
+      "name": "gt",
+      "usage": "input1 > input2 - 1 if input1 larger than input2, else 0"
+    },
+    {
+      "name": "ge",
+      "usage": "input1 >= input2 - 1 if input1 larger or equal to input2, else 0"
+    },
+    {
+      "name": "ne",
+      "usage": "input1 != input2 - 1 if different, else 0"
+    },
+    {
+      "name": "is_nan",
+      "usage": "is_nan(input) - 1 if input is NaN, else 0"
+    },
+    {
+      "name": "not",
+      "usage": "not(x) - logical negation: 0 if x is 1, 1 if x is 0"
+    },
+    {
+      "name": "or",
+      "usage": "or(input1, input2) - 1 if either input is 1 ('true'), else 0"
+    },
+    {
+      "name": "days_from_last_change",
+      "usage": "days_from_last_change(x) - number of days since x's value last changed"
+    },
+    {
+      "name": "hump",
+      "usage": "hump(x, hump=0.01) - limits the magnitude of changes in x, reducing turnover"
+    },
+    {
+      "name": "kth_element",
+      "usage": "kth_element(x, d, k, ignore='NaN') - k-th value from x's last d days; used for backfilling"
+    },
+    {
+      "name": "last_diff_value",
+      "usage": "last_diff_value(x, d) - most recent value of x in the past d days that differs from today's"
+    },
+    {
+      "name": "ts_arg_max",
+      "usage": "ts_arg_max(x, d) - days since the max value of x occurred within the last d days (0 = today)"
+    },
+    {
+      "name": "ts_arg_min",
+      "usage": "ts_arg_min(x, d) - days since the min value of x occurred within the last d days (0 = today)"
+    },
+    {
+      "name": "ts_av_diff",
+      "usage": "ts_av_diff(x, d) - x minus ts_mean(x, d), with NaNs ignored in the mean"
+    },
+    {
+      "name": "ts_backfill",
+      "usage": "ts_backfill(x, lookback=d, k=1) - replaces NaNs with the most recent valid value in the lookback window"
+    },
+    {
+      "name": "ts_corr",
+      "usage": "ts_corr(x, y, d) - Pearson correlation between x and y over the past d days"
+    },
+    {
+      "name": "ts_count_nans",
+      "usage": "ts_count_nans(x, d) - count of NaN values in x over the past d days"
+    },
+    {
+      "name": "ts_covariance",
+      "usage": "ts_covariance(y, x, d) - covariance between y and x over the past d days"
+    },
+    {
+      "name": "ts_decay_linear",
+      "usage": "ts_decay_linear(x, d, dense=false) - linear decay/smoothing of x over d days, weighting recent values more"
+    },
+    {
+      "name": "ts_delay",
+      "usage": "ts_delay(x, d) - value of x from d days ago"
+    },
+    {
+      "name": "ts_delta",
+      "usage": "ts_delta(x, d) - x minus its value d days ago (momentum/change)"
+    },
+    {
+      "name": "ts_mean",
+      "usage": "ts_mean(x, d) - simple average of x over the past d days"
+    },
+    {
+      "name": "ts_product",
+      "usage": "ts_product(x, d) - product of x's values over the past d days"
+    },
+    {
+      "name": "ts_quantile",
+      "usage": "ts_quantile(x, d, driver='gaussian') - ts_rank of x transformed via a distribution's inverse CDF"
+    },
+    {
+      "name": "ts_rank",
+      "usage": "ts_rank(x, d, constant=0) - rank of today's value of x within its own trailing d-day history"
+    },
+    {
+      "name": "ts_regression",
+      "usage": "ts_regression(y, x, d, lag=0, rettype=0) - regression of y on x over d days, returns chosen parameter"
+    },
+    {
+      "name": "ts_scale",
+      "usage": "ts_scale(x, d, constant=0) - scales x to a 0-1 range based on its min/max over the past d days"
+    },
+    {
+      "name": "ts_std_dev",
+      "usage": "ts_std_dev(x, d) - standard deviation of x over the past d days"
+    },
+    {
+      "name": "ts_step",
+      "usage": "ts_step(1) - counter of days, increments by 1 each day"
+    },
+    {
+      "name": "ts_sum",
+      "usage": "ts_sum(x, d) - sum of x's values over the past d days"
+    },
+    {
+      "name": "ts_zscore",
+      "usage": "ts_zscore(x, d) - how many standard deviations today's x is from its own trailing d-day average"
+    },
+    {
+      "name": "normalize",
+      "usage": "normalize(x, useStd=false, limit=0.0) - centers x by subtracting the daily cross-sectional mean, optionally divides by std and clamps to [-limit, +limit]"
+    },
+    {
+      "name": "quantile",
+      "usage": "quantile(x, driver='gaussian', sigma=1.0) - ranks then reshapes x's cross-sectional distribution (gaussian/cauchy/uniform)"
+    },
+    {
+      "name": "rank",
+      "usage": "rank(x, rate=2) - cross-sectional rank of x among all instruments, spread evenly between 0.0 and 1.0"
+    },
+    {
+      "name": "scale",
+      "usage": "scale(x, scale=1, longscale=1, shortscale=1) - rescales x so absolute values across instruments sum to a target book size"
+    },
+    {
+      "name": "winsorize",
+      "usage": "winsorize(x, std=4) - caps x within std standard deviations of the mean, reducing outlier impact"
+    },
+    {
+      "name": "zscore",
+      "usage": "zscore(x) - x's distance from the cross-sectional mean, measured in standard deviations"
+    },
+    {
+      "name": "vec_avg",
+      "usage": "vec_avg(x) - mean of all elements in a vector field, per instrument/date, collapsing it to a single value"
+    },
+    {
+      "name": "vec_sum",
+      "usage": "vec_sum(x) - sum of all elements in a vector field"
+    },
+    {
+      "name": "bucket",
+      "usage": "bucket(rank(x), range='0, 1, 0.1') or bucket(rank(x), buckets='2,5,6,7,10') - sorts ranked data into custom groups for use with group_* operators"
+    },
+    {
+      "name": "trade_when",
+      "usage": "trade_when(x, y, z) - only updates the alpha's value when condition x is met, holds otherwise, exits (NaN) when condition z is met"
+    },
+    {
+      "name": "group_backfill",
+      "usage": "group_backfill(x, group, d, std=4.0) - fills NaNs using a winsorized mean of same-group instruments over the past d days"
+    },
+    {
+      "name": "group_mean",
+      "usage": "group_mean(x, weight, group) - harmonic mean of x within each group"
+    },
+    {
+      "name": "group_neutralize",
+      "usage": "group_neutralize(x, group) - subtracts the group (e.g. industry) mean from x, removing group-level bias"
+    },
+    {
+      "name": "group_rank",
+      "usage": "group_rank(x, group) - rank of x within its own group only, between 0.0 and 1.0"
+    },
+    {
+      "name": "group_scale",
+      "usage": "group_scale(x, group) - normalizes x to a 0-1 range within each group"
+    },
+    {
+      "name": "group_zscore",
+      "usage": "group_zscore(x, group) - x's distance from its group's mean, measured in standard deviations"
+    }
   ],
+  "_fields_note": "Fetched from BRAIN on 2026-10-06 23:32 by fetch_fields.py for USA / TOP3000 / delay 1: the 80 most-used fields with coverage >= 0.8, plus the basics and up to 10 group fields. Every name here is one BRAIN itself listed. Full list in data_fields_cache.json.",
   "fields": [
-    {"name": "close", "description": "daily closing price"},
-    {"name": "volume", "description": "daily trading volume"},
-    {"name": "operating_income", "description": "fundamental: operating income"},
-    {"name": "sales", "description": "fundamental: sales/revenue"},
-    {"name": "assets", "description": "fundamental: total assets"},
-    {"name": "free_cash_flow", "description": "fundamental: free cash flow"},
-    {"name": "retained_earnings", "description": "fundamental: retained earnings"},
-    {"name": "net_income", "description": "fundamental: net income"}
+    {
+      "name": "close",
+      "description": "Daily close price [Price Volume Data for Equity]"
+    },
+    {
+      "name": "volume",
+      "description": "Daily volume [Price Volume Data for Equity]"
+    },
+    {
+      "name": "returns",
+      "description": "Daily returns [Price Volume Data for Equity]"
+    },
+    {
+      "name": "cap",
+      "description": "Daily market capitalization (in millions) [Price Volume Data for Equity]"
+    },
+    {
+      "name": "anl4_adjusted_netincome_ft",
+      "description": "Adjusted net income - forecast type (revision/new/...) [Analyst Estimate Data for Equity]"
+    },
+    {
+      "name": "adv20",
+      "description": "Average daily volume in past 20 days [Price Volume Data for Equity]"
+    },
+    {
+      "name": "vwap",
+      "description": "Daily volume weighted average price [Price Volume Data for Equity]"
+    },
+    {
+      "name": "high",
+      "description": "Daily high price [Price Volume Data for Equity]"
+    },
+    {
+      "name": "open",
+      "description": "Daily open price [Price Volume Data for Equity]"
+    },
+    {
+      "name": "low",
+      "description": "Daily low price [Price Volume Data for Equity]"
+    },
+    {
+      "name": "scl12_buzz",
+      "description": "relative sentiment volume [Sentiment Data for Equity]"
+    },
+    {
+      "name": "implied_volatility_call_270",
+      "description": "Implied volatility of the at-the-money call for the stock with an expiration 270 calendar days from the measurement date [Volatility Data]"
+    },
+    {
+      "name": "implied_volatility_put_270",
+      "description": "Implied volatility of the at-the-money put for the stock with an expiration 270 calendar days from the measurement date [Volatility Data]"
+    },
+    {
+      "name": "pcr_oi_270",
+      "description": "Ratio of put open interest to call open interest for options expiring in 270 days, indicating longer-term position skew [Options Analytics]"
+    },
+    {
+      "name": "anl4_ptp_flag",
+      "description": "Pretax income - forecast type (revision/new/...) [Analyst Estimate Data for Equity]"
+    },
+    {
+      "name": "implied_volatility_call_120",
+      "description": "Implied volatility of the at-the-money call for the stock with an expiration 120 calendar days from the measurement date [Volatility Data]"
+    },
+    {
+      "name": "anl4_bvps_flag",
+      "description": "Book value per share - forecast type (revision/new/...) [Analyst Estimate Data for Equity]"
+    },
+    {
+      "name": "sharesout",
+      "description": "Daily outstanding shares (in millions) [Price Volume Data for Equity]"
+    },
+    {
+      "name": "anl4_epsr_flag",
+      "description": "GAAP Earnings - estimation type (revision/new/...), per share [Analyst Estimate Data for Equity]"
+    },
+    {
+      "name": "anl4_flag_erbfintax",
+      "description": "Earnings before interest and taxes - forecast type (revision/new/...) [Analyst Estimate Data for Equity]"
+    },
+    {
+      "name": "anl4_cff_flag",
+      "description": "Cash Flow From Financing Activities - forecast type (revision/new/...) [Analyst Estimate Data for Equity]"
+    },
+    {
+      "name": "anl4_netprofit_flag",
+      "description": "Net profit - forecast type (revision/new/...) [Analyst Estimate Data for Equity]"
+    },
+    {
+      "name": "anl4_netdebt_flag",
+      "description": "Net debt - forecast type (revision/new/...) [Analyst Estimate Data for Equity]"
+    },
+    {
+      "name": "anl4_tbve_ft",
+      "description": "Tangible Book Value per Share - forecast type (revision/new/...) [Analyst Estimate Data for Equity]"
+    },
+    {
+      "name": "implied_volatility_call_180",
+      "description": "Implied volatility of the at-the-money call for the stock with an expiration 180 calendar days from the measurement date [Volatility Data]"
+    },
+    {
+      "name": "implied_volatility_put_120",
+      "description": "At-the-money implied volatility of put options with 120 calendar days to expiration, annualized decimal [Volatility Data]"
+    },
+    {
+      "name": "anl4_gric_flag",
+      "description": "Gross income - forecast type (revision/new/...) [Analyst Estimate Data for Equity]"
+    },
+    {
+      "name": "anl4_totassets_flag",
+      "description": "Total Assets - forecast type (revision/new/...) [Analyst Estimate Data for Equity]"
+    },
+    {
+      "name": "implied_volatility_call_60",
+      "description": "Implied volatility of the at-the-money call for the stock with an expiration 60 calendar days from the measurement date [Volatility Data]"
+    },
+    {
+      "name": "anl4_ptpr_flag",
+      "description": "Reported Pretax income - forecast type (revision/new/...) [Analyst Estimate Data for Equity]"
+    },
+    {
+      "name": "dividend",
+      "description": "Dividend [Price Volume Data for Equity]"
+    },
+    {
+      "name": "implied_volatility_put_180",
+      "description": "At-the-money implied volatility of put options with 180 calendar days to expiration, annualized decimal [Volatility Data]"
+    },
+    {
+      "name": "unsystematic_risk_last_360_days",
+      "description": "The portion of return variance not explained by SPY (idiosyncratic risk), calculated as 1 minus R² over the last 360 calendar days [Systematic Risk Metrics]"
+    },
+    {
+      "name": "anl4_cfi_flag",
+      "description": "Cash Flow From Investing - forecast type (revision/new/...) [Analyst Estimate Data for Equity]"
+    },
+    {
+      "name": "implied_volatility_call_1080",
+      "description": "Implied volatility of the at-the-money call for the stock with an expiration 1080 calendar days from the measurement date [Volatility Data]"
+    },
+    {
+      "name": "implied_volatility_put_60",
+      "description": "Implied volatility of the at-the-money put for the stock with an expiration 60 calendar days from the measurement date [Volatility Data]"
+    },
+    {
+      "name": "anl4_cfo_flag",
+      "description": "Cash Flow From Operations - forecast type (revision/new/...) [Analyst Estimate Data for Equity]"
+    },
+    {
+      "name": "anl4_capex_flag",
+      "description": "Capital Expenditures - forecast type (revision/new/...) [Analyst Estimate Data for Equity]"
+    },
+    {
+      "name": "split",
+      "description": "Stock split ratio [Price Volume Data for Equity]"
+    },
+    {
+      "name": "implied_volatility_call_150",
+      "description": "Implied volatility of the at-the-money call for the stock with an expiration 150 calendar days from the measurement date [Volatility Data]"
+    },
+    {
+      "name": "implied_volatility_call_30",
+      "description": "Implied volatility of the at-the-money call for the stock with an expiration 30 calendar days from the measurement date [Volatility Data]"
+    },
+    {
+      "name": "anl4_ebit_value",
+      "description": "Earnings before interest and taxes - announced financial value [Analyst Estimate Data for Equity]"
+    },
+    {
+      "name": "actuals_value_currency_code",
+      "description": "Pricing Currency where the security trades [Analyst Estimate Data for Equity]"
+    },
+    {
+      "name": "snt_buzz",
+      "description": "Negative relative sentiment volume measure for current day, with missing values filled as 0 [Sentiment Data for Equity]"
+    },
+    {
+      "name": "implied_volatility_put_150",
+      "description": "At-the-money implied volatility of put options with 150 calendar days to expiration, annualized decimal [Volatility Data]"
+    },
+    {
+      "name": "implied_volatility_put_90",
+      "description": "Implied volatility of the at-the-money put for the stock with an expiration 90 calendar days from the measurement date [Volatility Data]"
+    },
+    {
+      "name": "implied_volatility_call_90",
+      "description": "Implied volatility of the at-the-money call for the stock with an expiration 90 calendar days from the measurement date [Volatility Data]"
+    },
+    {
+      "name": "parkinson_volatility_120",
+      "description": "Historical Parkinson volatility for approximately 120 calendar days [Volatility Data]"
+    },
+    {
+      "name": "snt_social_value",
+      "description": "Z-score of sentiment [Social Media Data for Equity]"
+    },
+    {
+      "name": "implied_volatility_put_30",
+      "description": "Implied volatility of the at-the-money put for the stock with an expiration 30 calendar days from the measurement date [Volatility Data]"
+    },
+    {
+      "name": "implied_volatility_mean_10",
+      "description": "The average of IvCall10 and IvPut10 [Volatility Data]"
+    },
+    {
+      "name": "snt_buzz_bfl",
+      "description": "Negative relative sentiment volume measure for current day, with missing values filled as 1 [Sentiment Data for Equity]"
+    },
+    {
+      "name": "snt_social_volume",
+      "description": "Normalized tweet volume [Social Media Data for Equity]"
+    },
+    {
+      "name": "rel_ret_comp",
+      "description": "Averaged one-day return of the competing companies [Relationship Data for Equity]"
+    },
+    {
+      "name": "anl4_fcf_flag",
+      "description": "Free cash flow - forecast type (revision/new/...) [Analyst Estimate Data for Equity]"
+    },
+    {
+      "name": "unsystematic_risk_last_90_days",
+      "description": "The portion of return variance not explained by SPY (idiosyncratic risk), calculated as 1 minus R² over the last 90 calendar days [Systematic Risk Metrics]"
+    },
+    {
+      "name": "implied_volatility_call_10",
+      "description": "Implied volatility of the at-the-money call for the stock with an expiration 10 calendar days from the measurement date [Volatility Data]"
+    },
+    {
+      "name": "min_adjusted_net_income_guidance",
+      "description": "Adjusted net income - minimum guidance value [Analyst Estimate Data for Equity]"
+    },
+    {
+      "name": "anl4_ebitda_flag",
+      "description": "Earnings before interest, taxes, depreciation and amortization - forecast type (revision/new/...) [Analyst Estimate Data for Equity]"
+    },
+    {
+      "name": "implied_volatility_call_360",
+      "description": "Implied volatility of the at-the-money call for the stock with an expiration 360 calendar days from the measurement date [Volatility Data]"
+    },
+    {
+      "name": "historical_volatility_120",
+      "description": "Historical close-to-close volatility for approximately 120 calendar days [Volatility Data]"
+    },
+    {
+      "name": "implied_volatility_mean_120",
+      "description": "The average of IvCall120 and IvPut120 [Volatility Data]"
+    },
+    {
+      "name": "implied_volatility_put_360",
+      "description": "Implied volatility of the at-the-money put for the stock with an expiration 360 calendar days from the measurement date [Volatility Data]"
+    },
+    {
+      "name": "pcr_oi_180",
+      "description": "Ratio of total put option open interest to call option open interest for options expiring in 180 days, representing longer-term positioning [Options Analytics]"
+    },
+    {
+      "name": "rel_num_all",
+      "description": "number of the companies whose product overlapped with the instrument [Relationship Data for Equity]"
+    },
+    {
+      "name": "rel_ret_all",
+      "description": "Averaged one-day return of the companies whose product overlapped with the instrument [Relationship Data for Equity]"
+    },
+    {
+      "name": "pv13_revere_key_sector_total",
+      "description": "Number of key focus sectors for the company [Relationship Data for Equity]"
+    },
+    {
+      "name": "implied_volatility_call_720",
+      "description": "Implied volatility of the at-the-money call for the stock with an expiration 720 calendar days from the measurement date [Volatility Data]"
+    },
+    {
+      "name": "anl4_ebitda_value",
+      "description": "Earnings before interest, taxes, depreciation and amortization - announced financial value [Analyst Estimate Data for Equity]"
+    },
+    {
+      "name": "implied_volatility_put_720",
+      "description": "Implied volatility of the at-the-money put for the stock with an expiration 720 calendar days from the measurement date [Volatility Data]"
+    },
+    {
+      "name": "anl4_rd_exp_flag",
+      "description": "Research and Development Expense - forecast type (revision/new/...) [Analyst Estimate Data for Equity]"
+    },
+    {
+      "name": "implied_volatility_mean_180",
+      "description": "The average of IvCall180 and IvPut180 [Volatility Data]"
+    },
+    {
+      "name": "historical_volatility_180",
+      "description": "Historical close-to-close volatility for approximately 180 calendar days [Volatility Data]"
+    },
+    {
+      "name": "news_max_up_ret",
+      "description": "Percent change from price at time of news to highest price after news [US News Data]"
+    },
+    {
+      "name": "implied_volatility_mean_60",
+      "description": "The average of IvCall60 and IvPut60 [Volatility Data]"
+    },
+    {
+      "name": "implied_volatility_mean_90",
+      "description": "The average of IvCall90 and IvPut90 [Volatility Data]"
+    },
+    {
+      "name": "pv13_custretsig_retsig",
+      "description": "Sign of customer return [Relationship Data for Equity]"
+    },
+    {
+      "name": "implied_volatility_put_10",
+      "description": "At-the-money implied volatility of put options with 10 calendar days to expiration, annualized decimal [Volatility Data]"
+    },
+    {
+      "name": "snt_buzz_ret",
+      "description": "negative return of relative sentiment volume [Sentiment Data for Equity]"
+    },
+    {
+      "name": "implied_volatility_put_1080",
+      "description": "At-the-money implied volatility of put options with 1080 calendar days to expiration, annualized decimal [Volatility Data]"
+    },
+    {
+      "name": "subindustry",
+      "description": "group field - use as the group argument of group_* operators. Subindustry grouping [Price Volume Data for Equity]"
+    },
+    {
+      "name": "industry",
+      "description": "group field - use as the group argument of group_* operators. Industry grouping [Price Volume Data for Equity]"
+    },
+    {
+      "name": "sector",
+      "description": "group field - use as the group argument of group_* operators. Sector grouping [Price Volume Data for Equity]"
+    },
+    {
+      "name": "market",
+      "description": "group field - use as the group argument of group_* operators. Market grouping [Price Volume Data for Equity]"
+    },
+    {
+      "name": "country",
+      "description": "group field - use as the group argument of group_* operators. Country grouping [Price Volume Data for Equity]"
+    },
+    {
+      "name": "pv13_h_min2_3000_sector",
+      "description": "group field - use as the group argument of group_* operators. grouping fields [Relationship Data for Equity]"
+    },
+    {
+      "name": "pv13_r2_min2_3000_sector",
+      "description": "group field - use as the group argument of group_* operators. grouping fields [Relationship Data for Equity]"
+    },
+    {
+      "name": "exchange",
+      "description": "group field - use as the group argument of group_* operators. Exchange grouping [Price Volume Data for Equity]"
+    },
+    {
+      "name": "pv13_r2_min20_3000_sector",
+      "description": "group field - use as the group argument of group_* operators. grouping fields [Relationship Data for Equity]"
+    },
+    {
+      "name": "pv13_h_min2_focused_pureplay_3000_sector",
+      "description": "group field - use as the group argument of group_* operators. grouping fields [Relationship Data for Equity]"
+    }
   ]
 }
