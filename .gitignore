@@ -1,0 +1,15 @@
+# Secrets - never commit these
+.env
+*.env
+session_cookies.json
+submissions_log.json
+
+# Runtime-generated research output, not source
+alpha_loop_results.csv
+results.csv
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
