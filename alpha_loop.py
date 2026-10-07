@@ -10,7 +10,10 @@ Setup (once), same folder as brain_engine.py:
         GEMINI_API_KEY=...
 
 Run:
-    python alpha_loop.py
+    python alpha_loop.py                      # Gemini writes the ideas
+    python alpha_loop.py --try "<expression>" "<another>"
+                                              # test your own expressions through the same
+                                              # pipeline: simulate, check, submit if they qualify
 
 NOTE on the LLM library: this uses google-genai (import as `from google import genai`),
 NOT google-generativeai (`import google.generativeai as genai`) - that package was
@@ -41,12 +44,16 @@ READ BEFORE YOU RUN THIS:
   dashboard's Check with BRAIN button. The submit and correlation endpoints follow community
   clients that recorded BRAIN's live traffic; BRAIN publishes no official API docs.
 - Auto-flip: when an alpha scores Sharpe -1.0 or worse, the loop also tests reverse(<expression>)
-  in the same round (up to MAX_FLIPS_PER_ROUND, default 3), since a strongly negative signal
+  right after it (up to MAX_FLIPS_PER_ROUND per round, default 3), since a strongly negative signal
   usually turns positive when flipped. Flips use extra simulations.
 - Auto-smooth: when an alpha has Sharpe >= 1.25 but fitness under 1.0 (or turnover over 70%) and
   turnover above SMOOTH_MIN_TURNOVER (default 0.2), the loop also tests
-  ts_decay_linear(<expression>, 10) in the same round (up to MAX_SMOOTHS_PER_ROUND, default 3).
+  ts_decay_linear(<expression>, 10) right after it (up to MAX_SMOOTHS_PER_ROUND per round, default 3).
   Fitness divides by turnover, so trading less can lift it over the bar.
+- Network resilience: every request to BRAIN has a 30-second timeout and is retried after a dropped
+  connection (waiting 5s, 15s, 45s). If an idea still can't get through, the loop logs it as
+  "Couldn't reach BRAIN" and moves on to the next one; after MAX_NETWORK_FAILURES (default 3) in a
+  row, it stops cleanly, keeping everything so far. Gemini connection drops are retried the same way.
 - Memory across runs: every round, the generator sees your best MEMORY_TOP_N (default 10) results
   from all runs so far (read from alpha_loop_results.csv), not just the last round.
 - operators.json holds the full base-tier operator list (66 operators) transcribed from
@@ -58,6 +65,7 @@ READ BEFORE YOU RUN THIS:
   verification mid-run with nobody there to click the link, it STOPS CLEANLY and
   logs why. It does not hang waiting for input that will never come.
 """
+import argparse
 import csv
 import json
 import logging
@@ -67,6 +75,7 @@ from collections import deque
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
+import httpx  # the HTTP library google-genai uses; its network errors are worth retrying
 import requests
 from google import genai
 from google.genai import types
@@ -113,8 +122,18 @@ SMOOTH_DECAY_DAYS = int(os.environ.get("SMOOTH_DECAY_DAYS", 10))
 SMOOTH_MIN_TURNOVER = float(os.environ.get("SMOOTH_MIN_TURNOVER", 0.2))  # below this, decay can barely help fitness
 MAX_SMOOTHS_PER_ROUND = int(os.environ.get("MAX_SMOOTHS_PER_ROUND", 3))  # caps the extra simulations smoothing adds
 
+# Network resilience: one dropped connection skips that idea; this many in a row stops the run cleanly.
+MAX_NETWORK_FAILURES = int(os.environ.get("MAX_NETWORK_FAILURES", 3))
+
 # Memory across runs: how many of your best past results the generator sees each round.
 MEMORY_TOP_N = int(os.environ.get("MEMORY_TOP_N", 10))
+
+SETTINGS = {
+    "instrumentType": "EQUITY", "region": "USA", "universe": "TOP3000",
+    "delay": 1, "decay": 0, "neutralization": "SUBINDUSTRY", "truncation": 0.08,
+    "pasteurization": "ON", "unitHandling": "VERIFY", "nanHandling": "ON",
+    "language": "FASTEXPR", "visualization": False,
+}
 
 OPERATORS_FILE = "operators.json"
 RESULTS_FILE = "alpha_loop_results.csv"  # separate from brain_engine.py's own results.csv
@@ -173,8 +192,11 @@ def load_session(session: requests.Session) -> bool:
 def get_authenticated_session(email: str, password: str) -> requests.Session:
     session = requests.Session()
     if load_session(session):
-        probe = session.get(be.ALPHA_URL.format(alpha_id="session_check"))
-        if not be.looks_like_expired_session(probe):
+        try:
+            probe = session.get(be.ALPHA_URL.format(alpha_id="session_check"), timeout=be.REQUEST_TIMEOUT)
+        except requests.RequestException:
+            probe = None
+        if probe is not None and not be.looks_like_expired_session(probe):
             logger.info("Reused saved session - skipped login.")
             return session
         logger.info("Saved session no longer valid, logging in fresh.")
@@ -350,6 +372,8 @@ def generate_ideas(client: genai.Client, model: str, operators, fields, settings
 def is_transient(exc: Exception) -> bool:
     """A busy (503) or rate-limited (429) answer can clear up on its own; a bad key or a
     malformed request can't. google-genai errors carry the HTTP status as `.code`."""
+    if isinstance(exc, (httpx.TransportError, requests.RequestException)):
+        return True  # dropped or timed-out connection
     return getattr(exc, "code", None) in TRANSIENT_STATUS_CODES
 
 
@@ -495,8 +519,12 @@ def try_submit(session, alpha_id: str) -> str:
     state, detail = submit_alpha(session, alpha_id)
     if state in ("YES", "REJECTED", "VERDICT_PENDING"):
         record_submission()  # BRAIN processed it, so it counts against today's limit
-    if state == "YES" and not is_active_on_brain(session, alpha_id):
-        state = "VERDICT_PENDING"  # only claim success once BRAIN itself lists it as submitted
+    if state == "YES":
+        try:
+            if not is_active_on_brain(session, alpha_id):
+                state = "VERDICT_PENDING"  # only claim success once BRAIN itself lists it as submitted
+        except requests.RequestException:
+            state = "VERDICT_PENDING"  # couldn't confirm - the dashboard can, later
     if state == "YES":
         logger.info("SUCCESSFULLY SUBMITTED Alpha ID: %s", alpha_id)
         return "YES"
@@ -605,15 +633,42 @@ def run_round(session, client, operators, fields, settings, email, password, rou
     except Exception as e:
         raise GenerationFailed(short_error(e)) from e
 
-    queue = deque((expression, rationale, "idea") for expression, rationale in ideas)
-    round_rows, flips, smooths = [], 0, 0
+    return process_queue(session, [(e, r, "idea") for e, r in ideas], settings, email, password, round_num, avoid)
+
+
+def process_queue(session, items, settings, email, password, round_num, avoid) -> list:
+    """Test each (expression, rationale, kind) in order. A flip or smooth goes to the FRONT of
+    the queue, so it runs right after the alpha that triggered it - even a short or interrupted
+    run tests its best leads first."""
+    queue = deque(items)
+    round_rows, flips, smooths, network_failures = [], 0, 0, 0
     while queue:
         expression, rationale, kind = queue.popleft()
         if expression in avoid:
             logger.info("Skipping duplicate: %s", expression)
             continue
         avoid.add(expression)
-        row = evaluate_idea(session, expression, rationale, settings, email, password, round_num)
+        try:
+            row = evaluate_idea(session, expression, rationale, settings, email, password, round_num)
+            network_failures = 0
+        except StopLoop:
+            raise
+        except requests.RequestException as exc:
+            network_failures += 1
+            logger.warning("Couldn't reach BRAIN while testing %s (%s), even after retrying - skipping it. "
+                           "Retry it later with --try.", expression, type(exc).__name__)
+            round_rows.append(failure_row(expression, rationale, round_num,
+                                          f"Couldn't reach BRAIN ({type(exc).__name__}) - not a verdict on the "
+                                          f"idea; retry it with --try"))
+            if network_failures >= MAX_NETWORK_FAILURES:
+                raise StopLoop(f"Couldn't reach BRAIN for {network_failures} ideas in a row - your connection "
+                               f"seems to be down. Stopped cleanly; everything so far is saved.")
+            continue
+        except Exception as exc:  # an unexpected reply shouldn't end the whole run
+            logger.exception("Unexpected error while testing %s - skipping it and carrying on.", expression)
+            round_rows.append(failure_row(expression, rationale, round_num,
+                                          f"Unexpected error: {type(exc).__name__}: {exc}"))
+            continue
         round_rows.append(row)
 
         if row["status"] == "COMPLETE":
@@ -625,9 +680,9 @@ def run_round(session, client, operators, fields, settings, email, password, rou
                 flipped = f"reverse({expression})"
                 if flipped not in avoid:
                     flips += 1
-                    logger.info("  Sharpe %.2f points the wrong way - queueing the flipped version.", sharpe)
-                    queue.append((flipped, f"Auto-flip of {expression}, which scored Sharpe {sharpe:.2f}; "
-                                           f"reversed, it should score about {-sharpe:.2f}.", "flip"))
+                    logger.info("  Sharpe %.2f points the wrong way - testing the flipped version next.", sharpe)
+                    queue.appendleft((flipped, f"Auto-flip of {expression}, which scored Sharpe {sharpe:.2f}; "
+                                               f"reversed, it should score about {-sharpe:.2f}.", "flip"))
 
             # Auto-smooth: the Sharpe is there, but trading too much is holding it back.
             if kind != "smooth" and smooths < MAX_SMOOTHS_PER_ROUND and needs_smoothing(sharpe, fitness, turnover):
@@ -635,17 +690,62 @@ def run_round(session, client, operators, fields, settings, email, password, rou
                 if smoothed not in avoid:
                     smooths += 1
                     logger.info("  Sharpe %.2f is there, but fitness %.2f at %.0f%% turnover isn't - "
-                                "queueing a smoothed version.", sharpe, fitness, turnover * 100)
-                    queue.append((smoothed, f"Auto-smooth of {expression}: Sharpe {sharpe:.2f} but fitness "
-                                            f"{fitness:.2f} at {turnover:.0%} turnover; decaying it over "
-                                            f"{SMOOTH_DECAY_DAYS} days should cut turnover.", "smooth"))
+                                "testing a smoothed version next.", sharpe, fitness, turnover * 100)
+                    queue.appendleft((smoothed, f"Auto-smooth of {expression}: Sharpe {sharpe:.2f} but fitness "
+                                                f"{fitness:.2f} at {turnover:.0%} turnover; decaying it over "
+                                                f"{SMOOTH_DECAY_DAYS} days should cut turnover.", "smooth"))
         time.sleep(3)
 
     return round_rows
 
 
-def main():
+def failure_row(expression, rationale, round_num, error) -> dict:
+    row = {k: "" for k in RESULTS_HEADER}
+    row.update(round=round_num, timestamp=time.strftime("%Y-%m-%d %H:%M:%S"), expression=expression,
+               rationale=rationale, status="FAILED", error=str(error)[:300], submitted="NO")
+    append_result(row)
+    return row
+
+
+def run_try(session, expressions, settings, email, password) -> list:
+    """--try: your own expressions through the full pipeline, flips and smooths included.
+    Skips anything already simulated successfully; retries ones that failed before."""
+    done = {r["expression"] for r in completed_history()}
+    items = []
+    for expression in (e.strip() for e in expressions):
+        if not expression:
+            continue
+        if expression in done:
+            logger.info("Skipping %s - it was already simulated; its result is in the dashboard.", expression)
+            continue
+        items.append((expression, "Requested with --try", "idea"))
+    if not items:
+        logger.info("Nothing new to try.")
+        return []
+    avoid = already_tried() - {e for e, _, _ in items}  # still avoid repeating everything else
+    logger.info("Trying %d expression(s) you gave.", len(items))
+    return process_queue(session, items, settings, email, password, "try", avoid)
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="Generate, test and submit WorldQuant BRAIN alphas.")
+    parser.add_argument("--try", dest="try_expressions", nargs="+", metavar="EXPRESSION",
+                        help="simulate these exact expressions (and submit any that qualify) instead of "
+                             "asking Gemini for ideas; wrap each one in double quotes")
+    args = parser.parse_args(argv)
+
     email, password = be.get_credentials()
+    if args.try_expressions:
+        session = get_authenticated_session(email, password)
+        try:
+            rows = run_try(session, args.try_expressions, SETTINGS, email, password)
+        except StopLoop as e:
+            logger.error("Stopping: %s", e)
+            return
+        logger.info("Done: %d simulation(s), including any automatic flips or smooths. Results are in %s.",
+                    len(rows), RESULTS_FILE)
+        return
+
     if not os.environ.get("GEMINI_API_KEY"):
         raise RuntimeError("Set GEMINI_API_KEY in your .env file too (same format as WQ_EMAIL/WQ_PASSWORD).")
 
@@ -660,13 +760,7 @@ def main():
             len(operators),
         )
 
-    settings = {
-        "instrumentType": "EQUITY", "region": "USA", "universe": "TOP3000",
-        "delay": 1, "decay": 0, "neutralization": "SUBINDUSTRY", "truncation": 0.08,
-        "pasteurization": "ON", "unitHandling": "VERIFY", "nanHandling": "ON",
-        "language": "FASTEXPR", "visualization": False,
-    }
-
+    settings = SETTINGS
     session = get_authenticated_session(email, password)
     avoid = already_tried()
     feedback_text = build_feedback()

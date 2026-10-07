@@ -751,6 +751,193 @@ def test_a_new_run_starts_from_past_results(tmp_path):
     in_tmp(tmp_path, run)
 
 
+
+# ---- Follow-ups first, and --try ----
+
+THREE = [
+    "ts_decay_linear(group_rank(ts_av_diff(unsystematic_risk_last_90_days, 60), industry), 10)",
+    "ts_decay_linear(group_rank(ts_av_diff(implied_volatility_call_60, 60), sector), 10)",
+    "ts_decay_linear(reverse(rank(ts_av_diff(close, 10))), 10)",
+]
+
+
+def calm(sharpe=0.5):
+    return alpha_json(sharpe=sharpe, fitness=0.2, turnover=0.1, checks=[])
+
+
+def test_followups_run_right_after_their_trigger(tmp_path):
+    def run():
+        ideas = [{"expression": e, "rationale": "r"} for e in ("rank(a)", "rank(b)", "rank(c)")]
+        brain = FakeBrain({"neg": alpha_json(sharpe=-1.5, checks=[]), "flip": calm(), "b": calm(), "c": calm()})
+        client = MagicMock()
+        client.models.generate_content.return_value = fake_gemini_response(ideas)
+        with patch("time.sleep"):
+            rows = al.run_round(brain.session, client, [], [], SETTINGS, "e@x.com", "pw", 1, "round 1", set())
+        assert [r["expression"] for r in rows] == ["rank(a)", "reverse(rank(a))", "rank(b)", "rank(c)"]
+    in_tmp(tmp_path, run)
+
+
+def run_main_try(brain, argv):
+    env = {k: v for k, v in os.environ.items() if k != "GEMINI_API_KEY"}  # --try must not need Gemini
+    with patch.dict(os.environ, env, clear=True), \
+         patch.object(al, "get_authenticated_session", return_value=brain.session), \
+         patch("google.genai.Client", side_effect=AssertionError("--try must not call Gemini")), \
+         patch("time.sleep"):
+        al.main(argv)
+    with open(al.RESULTS_FILE, encoding="utf-8") as f:
+        return list(csv.DictReader(f))
+
+
+def test_try_runs_your_exact_expressions_without_gemini(tmp_path):
+    def run():
+        brain = FakeBrain({"a": calm(), "b": calm(), "c": calm()})
+        rows = run_main_try(brain, ["--try", *THREE])
+        assert [r["expression"] for r in rows] == THREE          # commas and spaces arrive intact
+        assert all(r["round"] == "try" and r["rationale"] == "Requested with --try" for r in rows)
+        sent = [c.kwargs["json"]["regular"] for c in brain.session.post.call_args_list if c.args[0].endswith("/simulations")]
+        assert sent == THREE                                     # exactly what BRAIN received
+    in_tmp(tmp_path, run)
+
+
+def test_try_submits_a_qualifying_expression(tmp_path):
+    def run():
+        brain = FakeBrain({"a": alpha_json(sharpe=1.61, fitness=1.12, turnover=0.18)})
+        rows = run_main_try(brain, ["--try", THREE[0]])
+        assert rows[0]["submitted"] == "YES"
+        assert al.submissions_today() == 1
+    in_tmp(tmp_path, run)
+
+
+def test_try_followups_run_immediately(tmp_path):
+    def run():
+        brain = FakeBrain({"fast": alpha_json(sharpe=1.70, fitness=0.80, turnover=0.399, checks=[]),
+                           "smooth": calm(), "next": calm()})
+        expr = "group_rank(ts_av_diff(unsystematic_risk_last_90_days, 60), industry)"
+        rows = run_main_try(brain, ["--try", expr, "rank(close)"])
+        assert [r["expression"] for r in rows] == [expr, f"ts_decay_linear({expr}, 10)", "rank(close)"]
+    in_tmp(tmp_path, run)
+
+
+def test_try_skips_finished_expressions_but_retries_failed_ones(tmp_path):
+    def run():
+        al.append_result(_history_row("rank(done)", 1.0, 0.5, 0.3))
+        al.append_result(_history_row("rank(flaky)", "", "", "", status="FAILED"))
+        brain = FakeBrain({"x": calm()})
+        rows = run_main_try(brain, ["--try", "rank(done)", "rank(flaky)"])
+        new = [r for r in rows if r["round"] == "try"]
+        assert [r["expression"] for r in new] == ["rank(flaky)"]
+    in_tmp(tmp_path, run)
+
+
+
+# ---- Network resilience ----
+
+import requests as _requests
+import httpx as _httpx
+
+
+def flaky_sim_posts(brain, failing_ideas):
+    """Make the first `failing_ideas` simulation starts fail on every attempt, like a dropped connection."""
+    original_post = brain.post
+    state = {"sim_posts": 0}
+
+    def post(url, **kw):
+        if url.endswith("/simulations"):
+            state["sim_posts"] += 1
+            if state["sim_posts"] <= failing_ideas * 4:  # 1 try + 3 retries per idea
+                raise _requests.ConnectionError("connection dropped")
+        return original_post(url, **kw)
+
+    brain.session.post.side_effect = post
+
+
+def test_dropped_connection_skips_one_idea_and_carries_on(tmp_path):
+    def run():
+        ideas = [{"expression": "rank(a)", "rationale": "r"}, {"expression": "rank(b)", "rationale": "r"}]
+        brain = FakeBrain({"b": calm()})
+        flaky_sim_posts(brain, failing_ideas=1)
+        client = MagicMock()
+        client.models.generate_content.return_value = fake_gemini_response(ideas)
+        with patch("time.sleep"):
+            rows = al.run_round(brain.session, client, [], [], SETTINGS, "e@x.com", "pw", 1, "round 1", set())
+        assert [(r["expression"], r["status"]) for r in rows] == [("rank(a)", "FAILED"), ("rank(b)", "COMPLETE")]
+        assert "Couldn't reach BRAIN (ConnectionError)" in rows[0]["error"]
+        with open(al.RESULTS_FILE, encoding="utf-8") as f:
+            assert len(list(csv.DictReader(f))) == 2  # both recorded, nothing lost
+    in_tmp(tmp_path, run)
+
+
+def test_connection_down_stops_the_run_cleanly(tmp_path):
+    def run():
+        _write_operators()
+        brain = FakeBrain({})
+        brain.session.post.side_effect = _requests.ConnectionError("down")
+        gen = MagicMock(return_value=[(f"rank(x{i})", "r") for i in range(8)])
+        with patch.object(al, "generate_with_fallback", gen), \
+             patch.object(al, "get_authenticated_session", return_value=brain.session), \
+             patch("google.genai.Client"), patch("time.sleep"):
+            al.main([])  # must return normally, not crash with a traceback
+        with open(al.RESULTS_FILE, encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+        assert len(rows) == al.MAX_NETWORK_FAILURES and all(r["status"] == "FAILED" for r in rows)
+        assert gen.call_count == 1  # stopped instead of burning through more rounds
+    in_tmp(tmp_path, run)
+
+
+def test_unexpected_error_skips_only_that_idea(tmp_path):
+    def run():
+        ideas = [{"expression": "rank(a)", "rationale": "r"}, {"expression": "rank(b)", "rationale": "r"}]
+        brain = FakeBrain({"a": calm(), "b": calm()})
+        real_fetch = be.fetch_alpha
+        calls = {"n": 0}
+
+        def fetch(session, alpha_id):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise KeyError("a reply shape nobody expected")
+            return real_fetch(session, alpha_id)
+
+        client = MagicMock()
+        client.models.generate_content.return_value = fake_gemini_response(ideas)
+        with patch.object(be, "fetch_alpha", side_effect=fetch), patch("time.sleep"):
+            rows = al.run_round(brain.session, client, [], [], SETTINGS, "e@x.com", "pw", 1, "round 1", set())
+        assert [r["status"] for r in rows] == ["FAILED", "COMPLETE"]
+        assert rows[0]["error"].startswith("Unexpected error: KeyError")
+    in_tmp(tmp_path, run)
+
+
+def test_lost_connection_after_submitting_is_pending_not_lost(tmp_path):
+    def run():
+        brain = FakeBrain({"a1": alpha_json()})
+        with patch.object(al, "is_active_on_brain", side_effect=_requests.ConnectionError("dropped")):
+            rows = run_one_idea(brain)
+        assert rows[0]["submitted"].startswith("VERDICT_PENDING")
+        assert al.submissions_today() == 1  # BRAIN took it, so the slot still counts
+    in_tmp(tmp_path, run)
+
+
+def test_gemini_connection_drops_are_retried():
+    assert al.is_transient(_httpx.ConnectError("down")) and al.is_transient(_httpx.ReadTimeout("slow"))
+    client = MagicMock()
+    client.models.generate_content.side_effect = [_httpx.ConnectError("down"), _httpx.ConnectError("down"),
+                                                  fake_gemini_response(ONE_IDEA)]
+    with patch("time.sleep") as sleep:
+        assert al.generate_with_fallback(client, [], [], SETTINGS, "", set(), 1) == [("rank(close)", "r1")]
+    assert [c.args[0] for c in sleep.call_args_list] == [10, 20]
+
+
+def test_startup_survives_a_dropped_connection(tmp_path):
+    def run():
+        Path(al.SESSION_FILE).write_text('{"sid": "old"}', encoding="utf-8")
+        fresh = MagicMock()
+        fresh.get.side_effect = _requests.ConnectionError("dropped")
+        with patch.object(al.requests, "Session", return_value=fresh), \
+             patch.object(be, "authenticate", return_value=True) as auth:
+            assert al.get_authenticated_session("e@x.com", "pw") is fresh
+        auth.assert_called_once()  # couldn't check the old session, so it logged in fresh
+    in_tmp(tmp_path, run)
+
+
 if __name__ == "__main__":
     import inspect
     import tempfile

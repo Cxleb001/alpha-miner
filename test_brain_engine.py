@@ -163,6 +163,53 @@ def test_append_result_handles_non_ascii_text(tmp_path):
     assert "\u2011" in rows[0]["expression"]
 
 
+
+# ---- Network resilience ----
+
+import requests as _requests
+
+
+def test_dropped_connection_is_retried_when_starting_a_simulation():
+    session = MagicMock()
+    session.post.side_effect = [_requests.ConnectionError("dropped"),
+                                fake_response(201, headers={"Location": "https://api.worldquantbrain.com/simulations/1"})]
+    with patch("time.sleep") as sleep:
+        loc, err = be.submit_simulation(session, "close", {})
+    assert loc.endswith("/simulations/1") and err is None
+    sleep.assert_called_once_with(5)
+
+
+def test_polling_survives_a_dropped_connection():
+    session = MagicMock()
+    session.get.side_effect = [_requests.Timeout("stalled"), fake_response(200, {"status": "COMPLETE", "alpha": "a1"})]
+    with patch("time.sleep"):
+        assert be.poll_simulation(session, "loc") == ("a1", None)
+
+
+def test_gives_up_after_three_retries():
+    session = MagicMock()
+    session.post.side_effect = _requests.ConnectionError("down")
+    with patch("time.sleep") as sleep:
+        try:
+            be.submit_simulation(session, "close", {})
+            assert False, "should have raised"
+        except _requests.ConnectionError:
+            pass
+    assert [c.args[0] for c in sleep.call_args_list] == [5, 15, 45]
+    assert session.post.call_count == 4
+
+
+def test_every_brain_request_has_a_timeout():
+    session = MagicMock()
+    session.post.return_value = fake_response(201, headers={"Location": "loc"})
+    session.get.side_effect = [fake_response(200, {"status": "COMPLETE", "alpha": "a1"}), fake_response(200, {"is": {}})]
+    be.submit_simulation(session, "close", {})
+    be.poll_simulation(session, "loc")
+    be.fetch_alpha(session, "a1")
+    calls = session.post.call_args_list + session.get.call_args_list
+    assert calls and all(c.kwargs.get("timeout") == be.REQUEST_TIMEOUT for c in calls)
+
+
 if __name__ == "__main__":
     tests = [obj for name, obj in list(globals().items()) if name.startswith("test_")]
     import inspect

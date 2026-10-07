@@ -1,3 +1,19 @@
+"""
+brain_engine.py — batch alpha-testing harness for WorldQuant BRAIN.
+
+Setup (once):
+    pip install requests python-dotenv
+    Create a .env file in this same folder containing:
+        WQ_EMAIL=you@example.com
+        WQ_PASSWORD=your-password
+
+Then just run:
+    python brain_engine.py
+
+Credentials are never hardcoded in source - they're loaded from .env at startup.
+Results stream to results.csv as each simulation finishes (not just printed),
+so nothing is lost if the run is interrupted partway through.
+"""
 import csv
 import logging
 import os
@@ -24,6 +40,23 @@ RESULTS_HEADER = [
 ]
 
 POLL_INTERVAL_SECONDS = 5
+REQUEST_TIMEOUT = 30  # seconds per request; without one, a stalled connection hangs the run forever
+RETRY_WAITS = (5, 15, 45)  # seconds to wait between attempts when the connection drops
+
+
+def with_retries(call, what):
+    """Run call(); if the connection drops or times out, wait and try again a few times before
+    giving up. Retrying a simulation submit can rarely create a duplicate simulation on BRAIN
+    if the first one got through but its reply was lost - a wasted simulation, not a wrong result."""
+    for attempt, wait in enumerate((*RETRY_WAITS, None), start=1):
+        try:
+            return call()
+        except requests.RequestException as exc:
+            if wait is None:
+                raise
+            logger.warning("Connection problem while %s (%s) - retrying in %ds (%d of %d).",
+                           what, type(exc).__name__, wait, attempt, len(RETRY_WAITS))
+            time.sleep(wait)
 MAX_POLL_SECONDS = 20 * 60  # bail out rather than hang forever on a stuck sim - adjust once you know typical runtimes
 
 
@@ -48,7 +81,7 @@ def authenticate(session: requests.Session, email: str, password: str) -> bool:
     """
     session.auth = (email, password)
     try:
-        resp = session.post(AUTH_URL)
+        resp = session.post(AUTH_URL, timeout=REQUEST_TIMEOUT)
     except requests.RequestException as e:
         logger.error("Could not reach BRAIN's auth endpoint: %s", e)
         return False
@@ -73,7 +106,7 @@ def authenticate(session: requests.Session, email: str, password: str) -> bool:
             f"\nBRAIN wants identity verification for this login.\n"
             f"Open this URL, complete it, then press Enter here to continue:\n{verify_url}\n"
         )
-        follow_up = session.post(f"{resp.url}/persona", json=data)
+        follow_up = session.post(f"{resp.url}/persona", json=data, timeout=REQUEST_TIMEOUT)
         if follow_up.status_code in (200, 201):
             logger.info("Verification complete - authenticated as %s.", email)
             return True
@@ -96,7 +129,8 @@ def looks_like_expired_session(resp) -> bool:
 
 def submit_simulation(session: requests.Session, expression: str, settings: dict):
     payload = {"type": "REGULAR", "settings": settings, "regular": expression}
-    resp = session.post(SIM_URL, json=payload)
+    resp = with_retries(lambda: session.post(SIM_URL, json=payload, timeout=REQUEST_TIMEOUT),
+                        "starting a simulation")
 
     if resp.status_code == 201 and "Location" in resp.headers:
         return resp.headers["Location"], None
@@ -114,7 +148,7 @@ def poll_simulation(session: requests.Session, location: str):
     """
     started = time.time()
     while time.time() - started < MAX_POLL_SECONDS:
-        resp = session.get(location)
+        resp = with_retries(lambda: session.get(location, timeout=REQUEST_TIMEOUT), "checking on a simulation")
         if looks_like_expired_session(resp):
             return None, "EXPIRED_SESSION"
         try:
@@ -146,7 +180,8 @@ def poll_simulation(session: requests.Session, location: str):
 
 def fetch_alpha(session: requests.Session, alpha_id: str) -> dict:
     """BRAIN's full record of one alpha, or {} if the reply wasn't readable."""
-    resp = session.get(ALPHA_URL.format(alpha_id=alpha_id))
+    resp = with_retries(lambda: session.get(ALPHA_URL.format(alpha_id=alpha_id), timeout=REQUEST_TIMEOUT),
+                        "fetching an alpha's results")
     try:
         alpha = resp.json()
     except ValueError:
