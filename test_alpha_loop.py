@@ -576,7 +576,7 @@ def test_unconfirmed_success_is_reported_as_pending_not_yes(tmp_path):
 def test_strongly_negative_sharpe_gets_flipped_once(tmp_path):
     def run():
         brain = FakeBrain({"neg": alpha_json(sharpe=-1.76, fitness=-0.92, checks=[]),
-                           "pos": alpha_json(sharpe=1.76, fitness=0.92, checks=[])})
+                           "pos": alpha_json(sharpe=1.76, fitness=0.92, turnover=0.1, checks=[])})  # too calm to smooth
         rows = run_one_idea(brain, "rank(ts_av_diff(close, 10))")
         assert [r["expression"] for r in rows] == ["rank(ts_av_diff(close, 10))",
                                                    "reverse(rank(ts_av_diff(close, 10)))"]
@@ -635,6 +635,119 @@ def test_in_memory_extras_never_break_the_csv(tmp_path):
         al.append_result(row)  # must not raise on the extra key
         with open(al.RESULTS_FILE, encoding="utf-8") as f:
             assert next(csv.reader(f)) == al.RESULTS_HEADER
+    in_tmp(tmp_path, run)
+
+
+
+# ---- Auto-smooth and memory across runs ----
+
+def test_good_sharpe_low_fitness_high_turnover_gets_smoothed(tmp_path):
+    def run():
+        expr = "group_rank(ts_av_diff(implied_volatility_call_60, 60), sector)"  # your 1.67 / 0.64 / 60% alpha
+        brain = FakeBrain({"fast": alpha_json(sharpe=1.67, fitness=0.64, turnover=0.6033, checks=[]),
+                           "calm": alpha_json(sharpe=1.6, fitness=1.1, turnover=0.15, checks=[])})
+        rows = run_one_idea(brain, expr)
+        assert [r["expression"] for r in rows] == [expr, f"ts_decay_linear({expr}, 10)"]
+        assert rows[1]["rationale"].startswith(f"Auto-smooth of {expr}: Sharpe 1.67 but fitness 0.64")
+    in_tmp(tmp_path, run)
+
+
+def test_turnover_over_the_limit_gets_smoothed_even_with_good_fitness(tmp_path):
+    def run():
+        brain = FakeBrain({"a": alpha_json(sharpe=1.59, fitness=1.05, turnover=0.7264, checks=[]),
+                           "b": alpha_json(sharpe=1.5, fitness=1.0, turnover=0.2, checks=[])})
+        rows = run_one_idea(brain)
+        assert len(rows) == 2 and rows[1]["expression"].startswith("ts_decay_linear(")
+    in_tmp(tmp_path, run)
+
+
+def test_no_smoothing_when_it_cannot_help(tmp_path):
+    def run():
+        for sharpe, fitness, turnover in [(1.17, 0.81, 0.16),   # turnover already low
+                                          (1.0, 0.5, 0.6),     # Sharpe below the bar
+                                          (1.6, 1.2, 0.3)]:    # already clears fitness
+            brain = FakeBrain({"a": alpha_json(sharpe=sharpe, fitness=fitness, turnover=turnover, checks=[])})
+            assert len(run_one_idea(brain)) == 1, (sharpe, fitness, turnover)
+    in_tmp(tmp_path, run)
+
+
+def test_flip_then_smooth_chain_and_no_smoothing_twice(tmp_path):
+    def run():
+        brain = FakeBrain({"neg": alpha_json(sharpe=-1.76, fitness=-0.92, turnover=0.53, checks=[]),
+                           "flip": alpha_json(sharpe=1.76, fitness=0.92, turnover=0.53, checks=[]),
+                           "smooth": alpha_json(sharpe=1.7, fitness=0.95, turnover=0.4, checks=[])})
+        rows = run_one_idea(brain, "rank(ts_av_diff(close, 10))")
+        assert [r["expression"] for r in rows] == [
+            "rank(ts_av_diff(close, 10))",
+            "reverse(rank(ts_av_diff(close, 10)))",
+            "ts_decay_linear(reverse(rank(ts_av_diff(close, 10))), 10)",
+        ]  # the smoothed one still misses fitness, but is never smoothed again
+    in_tmp(tmp_path, run)
+
+
+def test_smooths_are_capped_per_round(tmp_path):
+    def run():
+        ideas = [{"expression": f"rank(f{i})", "rationale": "r"} for i in range(5)]
+        alphas = {f"n{i}": alpha_json(sharpe=1.5, fitness=0.5, turnover=0.6, checks=[]) for i in range(5)}
+        alphas.update({f"s{i}": alpha_json(sharpe=1.4, fitness=0.9, turnover=0.15, checks=[]) for i in range(5)})
+        brain = FakeBrain(alphas)
+        brain.order = [f"n{i}" for i in range(5)] + [f"s{i}" for i in range(5)]
+        client = MagicMock()
+        client.models.generate_content.return_value = fake_gemini_response(ideas)
+        with patch.object(al, "MAX_SMOOTHS_PER_ROUND", 3), patch("time.sleep"):
+            rows = al.run_round(brain.session, client, [], [], SETTINGS, "e@x.com", "pw", 1, "round 1", set())
+        assert sum(r["expression"].startswith("ts_decay_linear(") for r in rows) == 3 and len(rows) == 8
+    in_tmp(tmp_path, run)
+
+
+def _history_row(expression, sharpe, fitness, turnover, status="COMPLETE"):
+    row = {k: "" for k in al.RESULTS_HEADER}
+    row.update(expression=expression, sharpe=str(sharpe), fitness=str(fitness), turnover=str(turnover), status=status)
+    return row
+
+
+def test_feedback_remembers_best_results_across_runs(tmp_path):
+    def run():
+        assert al.build_feedback() == "This is round 1 - no prior results yet."
+        al.append_result(_history_row("rank(weak)", 0.2, 0.1, 0.3))
+        al.append_result(_history_row("rank(best)", 1.67, 0.64, 0.6033))
+        al.append_result(_history_row("rank(middle)", 1.17, 0.81, 0.16))
+        al.append_result(_history_row("rank(bad(", "", "", "", status="FAILED"))
+        text = al.build_feedback()
+        assert "out of 3 simulated alphas across all runs" in text
+        assert text.index("rank(middle)") < text.index("rank(best)") < text.index("rank(weak)")  # by fitness
+        assert "rank(bad(" not in text
+        with patch.object(al, "MEMORY_TOP_N", 1):
+            assert "rank(best)" not in al.build_feedback() and "rank(middle)" in al.build_feedback()
+    in_tmp(tmp_path, run)
+
+
+def test_feedback_after_a_round_keeps_memory_and_adds_last_round(tmp_path):
+    def run():
+        al.append_result(_history_row("rank(old_best)", 1.5, 0.9, 0.3))
+        last_round = [dict(_history_row("rank(new)", 0.5, 0.2, 0.75), checks_passed="4", checks_total="8")]
+        text = al.build_feedback(last_round)
+        assert "rank(old_best)" in text and "Last round's results" in text and "TURNOVER TOO HIGH" in text
+    in_tmp(tmp_path, run)
+
+
+def test_a_new_run_starts_from_past_results(tmp_path):
+    def run():
+        _write_operators()
+        al.append_result(_history_row("rank(implied_volatility_call_60)", 1.67, 0.64, 0.6))
+        seen = []
+
+        def fake_generate(client, operators, fields, settings, feedback_text, avoid, n):
+            seen.append(feedback_text)
+            return [("rank(close)", "r")]
+
+        with patch.object(al, "MAX_ROUNDS", 1), \
+             patch.object(al, "generate_with_fallback", side_effect=fake_generate), \
+             patch.object(al, "get_authenticated_session", return_value=MagicMock()), \
+             patch.object(be, "submit_simulation", return_value=(None, "submit failed (500): boom")), \
+             patch("google.genai.Client"), patch("time.sleep"):
+            al.main()
+        assert "rank(implied_volatility_call_60)" in seen[0]  # round 1 already knows the best past idea
     in_tmp(tmp_path, run)
 
 

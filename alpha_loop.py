@@ -1,3 +1,63 @@
+"""
+alpha_loop.py — autonomous generate -> test -> learn -> repeat loop for WorldQuant BRAIN,
+now with optional autonomous submission of alphas that clear a quality bar.
+
+Setup (once), same folder as brain_engine.py:
+    pip install requests python-dotenv google-genai pydantic
+    .env needs three lines:
+        WQ_EMAIL=you@example.com
+        WQ_PASSWORD=your-password
+        GEMINI_API_KEY=...
+
+Run:
+    python alpha_loop.py
+
+NOTE on the LLM library: this uses google-genai (import as `from google import genai`),
+NOT google-generativeai (`import google.generativeai as genai`) - that package was
+deprecated in August 2025 and is now archived/legacy. If you see import errors or silent
+generation failures with the old package, that's why. Model defaults to gemini-3.8-flash
+(current as of Sept 2026) - Google ships new Flash versions every few weeks, so this is
+overridable via GEMINI_MODEL without touching code.
+
+When Gemini is busy (503) or rate-limited (429), idea generation retries with backoff
+(10s, 20s, 40s, 80s), then tries GEMINI_FALLBACK_MODEL once (default gemini-3.7-flash,
+which Google's own 3.8 Flash docs name as the fully supported alternative). A failed
+generation does NOT use up one of the MAX_ROUNDS - rounds only count when ideas actually
+get tested. After MAX_GENERATION_FAILURES failed attempts in a row, the run stops cleanly;
+nothing was simulated in that case, so no BRAIN quota was spent.
+
+READ BEFORE YOU RUN THIS:
+- It spends real BRAIN simulation quota and real Gemini API cost, unattended, up to the
+  caps below (defaults: 5 rounds x 8 ideas = 40 simulations max per run). Raise
+  IDEAS_PER_ROUND / MAX_ROUNDS via env vars once you trust it, not before.
+- This version can AUTONOMOUSLY SUBMIT alphas to BRAIN, at most MAX_SUBMISSIONS_PER_DAY
+  (default 1) per BRAIN day, which starts at 3 AM US Eastern, not local midnight. An alpha
+  qualifies when Sharpe >= 1.25, fitness >= 1.0 and every check passes, except SELF_CORRELATION
+  while it reads PENDING: BRAIN only works that one out during submission, so it shows PENDING
+  on every unsubmitted alpha. Before submitting, the loop asks BRAIN's free pre-submit
+  self-correlation check and skips anything at 0.7 or above, so the daily slot isn't wasted.
+  After submitting, it waits for BRAIN's verdict and only logs "YES" once BRAIN lists the
+  alpha as ACTIVE. Anything unclear is logged as VERDICT_PENDING - confirm those with the
+  dashboard's Check with BRAIN button. The submit and correlation endpoints follow community
+  clients that recorded BRAIN's live traffic; BRAIN publishes no official API docs.
+- Auto-flip: when an alpha scores Sharpe -1.0 or worse, the loop also tests reverse(<expression>)
+  in the same round (up to MAX_FLIPS_PER_ROUND, default 3), since a strongly negative signal
+  usually turns positive when flipped. Flips use extra simulations.
+- Auto-smooth: when an alpha has Sharpe >= 1.25 but fitness under 1.0 (or turnover over 70%) and
+  turnover above SMOOTH_MIN_TURNOVER (default 0.2), the loop also tests
+  ts_decay_linear(<expression>, 10) in the same round (up to MAX_SMOOTHS_PER_ROUND, default 3).
+  Fitness divides by turnover, so trading less can lift it over the bar.
+- Memory across runs: every round, the generator sees your best MEMORY_TOP_N (default 10) results
+  from all runs so far (read from alpha_loop_results.csv), not just the last round.
+- operators.json holds the full base-tier operator list (66 operators) transcribed from
+  your BRAIN account. Its "fields" list is still the small 8-field starter set - add the
+  data fields your account can use to widen what the generator can propose.
+- "Unattended" has a real ceiling: BRAIN sessions expire (roughly 4 hours) and can
+  require a one-time identity check to renew. This script saves its session to disk
+  so a re-run doesn't need to log in again unnecessarily, but if BRAIN asks for
+  verification mid-run with nobody there to click the link, it STOPS CLEANLY and
+  logs why. It does not hang waiting for input that will never come.
+"""
 import csv
 import json
 import logging
@@ -47,6 +107,14 @@ SUBMIT_URL = "https://api.worldquantbrain.com/alphas/{alpha_id}/submit"
 # Auto-flip: a strongly negative Sharpe is a real signal pointing the wrong way, so test its reverse.
 FLIP_SHARPE_AT_OR_BELOW = float(os.environ.get("FLIP_SHARPE_AT_OR_BELOW", -1.0))
 MAX_FLIPS_PER_ROUND = int(os.environ.get("MAX_FLIPS_PER_ROUND", 3))  # caps the extra simulations flips add
+
+# Auto-smooth: a good Sharpe held back by trading too much gets re-tested with linear decay.
+SMOOTH_DECAY_DAYS = int(os.environ.get("SMOOTH_DECAY_DAYS", 10))
+SMOOTH_MIN_TURNOVER = float(os.environ.get("SMOOTH_MIN_TURNOVER", 0.2))  # below this, decay can barely help fitness
+MAX_SMOOTHS_PER_ROUND = int(os.environ.get("MAX_SMOOTHS_PER_ROUND", 3))  # caps the extra simulations smoothing adds
+
+# Memory across runs: how many of your best past results the generator sees each round.
+MEMORY_TOP_N = int(os.environ.get("MEMORY_TOP_N", 10))
 
 OPERATORS_FILE = "operators.json"
 RESULTS_FILE = "alpha_loop_results.csv"  # separate from brain_engine.py's own results.csv
@@ -209,6 +277,34 @@ def summarize_round(rows: list) -> str:
     return "\n".join(lines)
 
 
+def completed_history() -> list:
+    """Every completed simulation from every run so far, read from the results CSV."""
+    if not Path(RESULTS_FILE).exists():
+        return []
+    with open(RESULTS_FILE, encoding="utf-8") as f:
+        return [r for r in csv.DictReader(f)
+                if r.get("status") == "COMPLETE" and as_float(r.get("fitness")) is not None]
+
+
+def build_feedback(last_round_rows=None) -> str:
+    """What the generator sees each round: your best results across ALL runs so far, so a new run
+    builds on what already worked instead of starting from scratch, plus how the last round went."""
+    history = completed_history()
+    parts = []
+    if history:
+        best = sorted(history, key=lambda r: as_float(r["fitness"]), reverse=True)[:MEMORY_TOP_N]
+        lines = [f"Your best results so far, out of {len(history)} simulated alphas across all runs "
+                 f"(best fitness first). Build on what works here - keep the data and the idea, fix what's "
+                 f"holding it back (usually fitness or turnover) - but keep some ideas genuinely new:"]
+        for r in best:
+            lines.append(f"- {r['expression']} -> sharpe={r['sharpe']} fitness={r['fitness']} "
+                         f"turnover={r['turnover']}{turnover_note(r)}")
+        parts.append("\n".join(lines))
+    if last_round_rows:
+        parts.append(summarize_round(last_round_rows))
+    return "\n\n".join(parts) if parts else "This is round 1 - no prior results yet."
+
+
 def generate_ideas(client: genai.Client, model: str, operators, fields, settings, feedback_text, avoid: set, n: int):
     op_list = "\n".join(f"- {o['name']}: {o['usage']}" for o in operators)
     field_list = "\n".join(f"- {f['name']}: {f['description']}" for f in fields)
@@ -223,7 +319,8 @@ def generate_ideas(client: genai.Client, model: str, operators, fields, settings
         f"and turnover between {TURNOVER_MIN} and {TURNOVER_MAX} (1% to 70% of the book traded per day). "
         f"High turnover also drags fitness down, so favour smoother signals: longer lookback windows, "
         f"ts_decay_linear, or hump. Ideas that scored a strongly negative Sharpe are re-tested reversed "
-        f"automatically, so don't spend ideas on negating past results.\n\n"
+        f"automatically, and promising ideas that trade too much are re-tested smoothed with "
+        f"ts_decay_linear, so don't spend ideas on negating or smoothing past results.\n\n"
         f"{feedback_text}\n\n"
         f"Propose {n} NEW candidate expressions, genuinely different in shape from each "
         f"other (not the same template with one field swapped). Each needs a one-sentence "
@@ -414,6 +511,16 @@ def try_submit(session, alpha_id: str) -> str:
     return f"FAILED: {detail}"
 
 
+def needs_smoothing(sharpe, fitness, turnover) -> bool:
+    """A good Sharpe held back by trading too much: fitness under the bar, or turnover over BRAIN's
+    limit. Fitness divides by turnover (floored at 0.125), so decay helps most when turnover is high."""
+    if sharpe is None or fitness is None or turnover is None:
+        return False
+    if sharpe < SUBMIT_MIN_SHARPE or turnover <= SMOOTH_MIN_TURNOVER:
+        return False
+    return fitness < SUBMIT_MIN_FITNESS or turnover > TURNOVER_MAX
+
+
 def qualifies(metrics: dict, checks: list) -> bool:
     """Every check must pass, except SELF_CORRELATION while it reads PENDING: BRAIN only works
     that one out during submission, so it shows PENDING on every unsubmitted alpha."""
@@ -498,10 +605,10 @@ def run_round(session, client, operators, fields, settings, email, password, rou
     except Exception as e:
         raise GenerationFailed(short_error(e)) from e
 
-    queue = deque(ideas)
-    round_rows, flips = [], 0
+    queue = deque((expression, rationale, "idea") for expression, rationale in ideas)
+    round_rows, flips, smooths = [], 0, 0
     while queue:
-        expression, rationale = queue.popleft()
+        expression, rationale, kind = queue.popleft()
         if expression in avoid:
             logger.info("Skipping duplicate: %s", expression)
             continue
@@ -509,16 +616,29 @@ def run_round(session, client, operators, fields, settings, email, password, rou
         row = evaluate_idea(session, expression, rationale, settings, email, password, round_num)
         round_rows.append(row)
 
-        # Auto-flip: a strongly negative Sharpe means a real signal pointing the wrong way.
-        sharpe = as_float(row.get("sharpe"))
-        if (row["status"] == "COMPLETE" and sharpe is not None and sharpe <= FLIP_SHARPE_AT_OR_BELOW
-                and flips < MAX_FLIPS_PER_ROUND and not expression.startswith("reverse(")):
-            flipped = f"reverse({expression})"
-            if flipped not in avoid:
-                flips += 1
-                logger.info("  Sharpe %.2f points the wrong way - queueing the flipped version.", sharpe)
-                queue.append((flipped, f"Auto-flip of {expression}, which scored Sharpe {sharpe:.2f}; "
-                                       f"reversed, it should score about {-sharpe:.2f}."))
+        if row["status"] == "COMPLETE":
+            sharpe, fitness, turnover = (as_float(row.get(k)) for k in ("sharpe", "fitness", "turnover"))
+
+            # Auto-flip: a strongly negative Sharpe means a real signal pointing the wrong way.
+            if (kind == "idea" and sharpe is not None and sharpe <= FLIP_SHARPE_AT_OR_BELOW
+                    and flips < MAX_FLIPS_PER_ROUND and not expression.startswith("reverse(")):
+                flipped = f"reverse({expression})"
+                if flipped not in avoid:
+                    flips += 1
+                    logger.info("  Sharpe %.2f points the wrong way - queueing the flipped version.", sharpe)
+                    queue.append((flipped, f"Auto-flip of {expression}, which scored Sharpe {sharpe:.2f}; "
+                                           f"reversed, it should score about {-sharpe:.2f}.", "flip"))
+
+            # Auto-smooth: the Sharpe is there, but trading too much is holding it back.
+            if kind != "smooth" and smooths < MAX_SMOOTHS_PER_ROUND and needs_smoothing(sharpe, fitness, turnover):
+                smoothed = f"ts_decay_linear({expression}, {SMOOTH_DECAY_DAYS})"
+                if smoothed not in avoid:
+                    smooths += 1
+                    logger.info("  Sharpe %.2f is there, but fitness %.2f at %.0f%% turnover isn't - "
+                                "queueing a smoothed version.", sharpe, fitness, turnover * 100)
+                    queue.append((smoothed, f"Auto-smooth of {expression}: Sharpe {sharpe:.2f} but fitness "
+                                            f"{fitness:.2f} at {turnover:.0%} turnover; decaying it over "
+                                            f"{SMOOTH_DECAY_DAYS} days should cut turnover.", "smooth"))
         time.sleep(3)
 
     return round_rows
@@ -549,7 +669,10 @@ def main():
 
     session = get_authenticated_session(email, password)
     avoid = already_tried()
-    feedback_text = "This is round 1 - no prior results yet."
+    feedback_text = build_feedback()
+    past = len(completed_history())
+    if past:
+        logger.info("Starting from your best results across %d past simulations.", past)
 
     logger.info("Starting: up to %d rounds x %d ideas (%d max simulations), %ds runtime cap, "
                 "%d submission(s)/day max.", MAX_ROUNDS, IDEAS_PER_ROUND,
@@ -584,7 +707,7 @@ def main():
             break
         failures_in_a_row = 0
         rounds_done += 1
-        feedback_text = summarize_round(round_rows)
+        feedback_text = build_feedback(round_rows)
         time.sleep(5)
 
     logger.info("Done: %d round(s) of ideas tested. Full history is in %s.", rounds_done, RESULTS_FILE)
