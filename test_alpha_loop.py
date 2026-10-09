@@ -2,6 +2,7 @@ import csv
 import json
 import os
 import sys
+from collections import Counter
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -461,7 +462,9 @@ class FakeBrain:
         if url.startswith("sim-"):
             return fake_response(200, {"status": "COMPLETE", "alpha": url[4:]})
         if url.endswith("/correlations/self"):
-            return fake_response(200, {"max": self.corr})
+            alpha_id = url.split("/")[-3]
+            corr = self.corr.get(alpha_id, 0.3) if isinstance(self.corr, dict) else self.corr
+            return fake_response(200, {"max": corr})
         if url.endswith("/submit"):
             self.submit_polls += 1
             if self.submit_polls == 1:  # first poll: still working
@@ -771,7 +774,7 @@ def test_followups_run_right_after_their_trigger(tmp_path):
         brain = FakeBrain({"neg": alpha_json(sharpe=-1.5, checks=[]), "flip": calm(), "b": calm(), "c": calm()})
         client = MagicMock()
         client.models.generate_content.return_value = fake_gemini_response(ideas)
-        with patch("time.sleep"):
+        with patch("time.sleep"), patch.object(al, "PARALLEL_SIMULATIONS", 1):  # one at a time: exact order
             rows = al.run_round(brain.session, client, [], [], SETTINGS, "e@x.com", "pw", 1, "round 1", set())
         assert [r["expression"] for r in rows] == ["rank(a)", "reverse(rank(a))", "rank(b)", "rank(c)"]
     in_tmp(tmp_path, run)
@@ -813,7 +816,8 @@ def test_try_followups_run_immediately(tmp_path):
         brain = FakeBrain({"fast": alpha_json(sharpe=1.70, fitness=0.80, turnover=0.399, checks=[]),
                            "smooth": calm(), "next": calm()})
         expr = "group_rank(ts_av_diff(unsystematic_risk_last_90_days, 60), industry)"
-        rows = run_main_try(brain, ["--try", expr, "rank(close)"])
+        with patch.object(al, "PARALLEL_SIMULATIONS", 1):  # one at a time: exact order
+            rows = run_main_try(brain, ["--try", expr, "rank(close)"])
         assert [r["expression"] for r in rows] == [expr, f"ts_decay_linear({expr}, 10)", "rank(close)"]
     in_tmp(tmp_path, run)
 
@@ -935,6 +939,462 @@ def test_startup_survives_a_dropped_connection(tmp_path):
              patch.object(be, "authenticate", return_value=True) as auth:
             assert al.get_authenticated_session("e@x.com", "pw") is fresh
         auth.assert_called_once()  # couldn't check the old session, so it logged in fresh
+    in_tmp(tmp_path, run)
+
+
+
+# ---- Held alphas go first ----
+
+def held_row(alpha_id, fitness, sharpe=1.4, expression=None, submitted=al.HELD_LABEL):
+    row = _history_row(expression or f"rank({alpha_id})", sharpe, fitness, 0.11)
+    row.update(alpha_id=alpha_id, submitted=submitted, round="1", checks_passed="7", checks_total="8")
+    return row
+
+
+def csv_rows():
+    with open(al.RESULTS_FILE, encoding="utf-8") as f:
+        return list(csv.DictReader(f))
+
+
+def submitted_value(alpha_id):
+    return next(r["submitted"] for r in csv_rows() if r["alpha_id"] == alpha_id)
+
+
+def submit_posts(brain):
+    return [c.args[0].split("/")[-2] for c in brain.session.post.call_args_list if c.args[0].endswith("/submit")]
+
+
+def run_held(brain):
+    with patch("time.sleep"):
+        return al.submit_held(brain.session)
+
+
+def test_held_candidates_best_fitness_first_and_skips_decided(tmp_path):
+    def run():
+        al.append_result(held_row("low", 1.05))
+        al.append_result(held_row("high", 1.30))
+        al.append_result(held_row("done", 1.10, submitted="YES"))
+        al.append_result(held_row("fallback", 1.50))
+        al.append_result(held_row("fallback", 1.50, submitted="YES"))  # outcome appended later
+        al.append_result(_history_row("rank(failed(", "", "", "", status="FAILED"))
+        assert [r["alpha_id"] for r in al.held_candidates()] == ["high", "low"]
+    in_tmp(tmp_path, run)
+
+
+def test_best_held_alpha_is_submitted_and_its_row_updated_in_place(tmp_path):
+    def run():
+        al.append_result(_history_row("rank(other)", 0.5, 0.2, 0.1))
+        al.append_result(held_row("h_low", 1.05))
+        al.append_result(held_row("h_best", 1.27))
+        before = csv_rows()
+        brain = FakeBrain({"h_low": alpha_json(), "h_best": alpha_json()})
+        assert run_held(brain) == "YES"
+        assert submit_posts(brain) == ["h_best"]           # best fitness only - one slot a day
+        assert al.submissions_today() == 1
+        after = csv_rows()
+        assert len(after) == len(before)                    # updated in place, no extra row
+        assert submitted_value("h_best") == "YES"
+        assert submitted_value("h_low") == al.HELD_LABEL    # still queued for tomorrow
+        assert [r for r in after if r["alpha_id"] != "h_best"] == [r for r in before if r["alpha_id"] != "h_best"]
+        assert not Path(al.RESULTS_FILE + ".tmp").exists()
+    in_tmp(tmp_path, run)
+
+
+def test_held_alphas_wait_when_todays_slot_is_used(tmp_path):
+    def run():
+        al.append_result(held_row("h1", 1.2))
+        al.record_submission()
+        brain = FakeBrain({"h1": alpha_json()})
+        assert run_held(brain) is None
+        assert not brain.session.get.called and not brain.session.post.called   # BRAIN not even asked
+        assert submitted_value("h1") == al.HELD_LABEL
+    in_tmp(tmp_path, run)
+
+
+def test_too_correlated_held_alpha_is_marked_and_the_next_one_tried(tmp_path):
+    def run():
+        al.append_result(held_row("similar", 1.4))
+        al.append_result(held_row("fresh", 1.1))
+        brain = FakeBrain({"similar": alpha_json(), "fresh": alpha_json()}, corr={"similar": 0.81})
+        assert run_held(brain) == "YES"
+        assert submitted_value("similar") == "TOO_CORRELATED (max 0.81)"
+        assert submitted_value("fresh") == "YES"
+        assert submit_posts(brain) == ["fresh"]
+        assert al.submissions_today() == 1
+    in_tmp(tmp_path, run)
+
+
+def test_held_alpha_already_submitted_on_brain_is_marked_yes_without_resubmitting(tmp_path):
+    def run():
+        al.append_result(held_row("by_hand", 1.3))
+        al.append_result(held_row("next", 1.1))
+        brain = FakeBrain({"by_hand": alpha_json(status="ACTIVE"), "next": alpha_json()})
+        assert run_held(brain) == "YES"
+        assert submitted_value("by_hand") == "YES" and submitted_value("next") == "YES"
+        assert submit_posts(brain) == ["next"]   # the slot went to the next one in line
+    in_tmp(tmp_path, run)
+
+
+def test_held_alpha_that_now_fails_a_check_is_dropped(tmp_path):
+    def run():
+        al.append_result(held_row("changed", 1.3))
+        failing = QUALIFYING_CHECKS[:2] + [{"name": "HIGH_TURNOVER", "result": "FAIL"}] + QUALIFYING_CHECKS[3:]
+        brain = FakeBrain({"changed": alpha_json(checks=failing)})
+        assert run_held(brain) is None
+        assert submitted_value("changed") == "NOT_SUBMITTED (no longer qualifies: failed HIGH_TURNOVER)"
+        assert submit_posts(brain) == [] and al.submissions_today() == 0
+        assert al.held_candidates() == []
+    in_tmp(tmp_path, run)
+
+
+def test_held_alpha_with_an_unsettled_check_stays_queued(tmp_path):
+    def run():
+        al.append_result(held_row("unsettled", 1.3))
+        pending = QUALIFYING_CHECKS[:2] + [{"name": "HIGH_TURNOVER", "result": "PENDING"}] + QUALIFYING_CHECKS[3:]
+        brain = FakeBrain({"unsettled": alpha_json(checks=pending)})
+        assert run_held(brain) is None
+        assert submitted_value("unsettled") == al.HELD_LABEL
+        assert submit_posts(brain) == []
+    in_tmp(tmp_path, run)
+
+
+def test_held_alpha_stays_queued_when_the_submit_fails(tmp_path):
+    def run():
+        al.append_result(held_row("h1", 1.3))
+        brain = FakeBrain({"h1": alpha_json()}, submit_post=500)
+        assert run_held(brain) is None
+        assert submitted_value("h1") == al.HELD_LABEL
+        assert al.submissions_today() == 0
+    in_tmp(tmp_path, run)
+
+
+def test_held_queue_leaves_everything_queued_when_brain_is_unreachable(tmp_path):
+    def run():
+        al.append_result(held_row("h1", 1.3))
+        brain = FakeBrain({"h1": alpha_json()})
+        brain.session.get.side_effect = _requests.ConnectionError("down")
+        assert run_held(brain) is None
+        assert submitted_value("h1") == al.HELD_LABEL
+        assert not brain.session.post.called
+    in_tmp(tmp_path, run)
+
+
+def test_locked_csv_falls_back_to_appending_the_outcome(tmp_path):
+    def run():
+        al.append_result(held_row("h1", 1.3))
+        al.append_result(held_row("h2", 1.1))
+        brain = FakeBrain({"h1": alpha_json(), "h2": alpha_json()})
+        with patch.object(al.os, "replace", side_effect=PermissionError("in use")):
+            assert run_held(brain) == "YES"
+        rows = csv_rows()
+        assert [(r["alpha_id"], r["submitted"], r["round"]) for r in rows] == [
+            ("h1", al.HELD_LABEL, "1"), ("h2", al.HELD_LABEL, "1"), ("h1", "YES", "held")]
+        assert [r["alpha_id"] for r in al.held_candidates()] == ["h2"]   # h1 counts as done
+        assert not Path(al.RESULTS_FILE + ".tmp").exists()
+    in_tmp(tmp_path, run)
+
+
+def test_a_broken_held_queue_never_stops_the_run(tmp_path):
+    def run():
+        al.append_result(held_row("h1", 1.3))
+        brain = FakeBrain({"x": calm()})
+        with patch.object(al, "_submit_held", side_effect=KeyError("surprise")):
+            rows = run_main_try(brain, ["--try", "rank(close)"])
+        assert [r["expression"] for r in rows if r["round"] == "try"] == ["rank(close)"]
+    in_tmp(tmp_path, run)
+
+
+def test_held_from_yesterday_goes_first_on_the_next_day_in_try_mode(tmp_path):
+    def run():
+        day = {"d": _date(2026, 10, 8)}
+        with patch.object(al, "brain_day", side_effect=lambda *a: day["d"]):
+            al.record_submission()                                  # yesterday's slot already used
+            brain = FakeBrain({"held1": alpha_json(sharpe=1.34, fitness=1.05, turnover=0.1059)})
+            run_one_idea(brain, THREE[0])                           # qualifies, so it's held
+            assert submitted_value("held1") == al.HELD_LABEL
+
+            day["d"] = _date(2026, 10, 9)                           # BRAIN's next day: slot free
+            brain = FakeBrain({"new": calm(), "held1": alpha_json(sharpe=1.34, fitness=1.05, turnover=0.1059)})
+            run_main_try(brain, ["--try", "rank(close)"])
+            urls = [c.args[0] for c in brain.session.post.call_args_list]
+            first_sim = next(i for i, u in enumerate(urls) if u.endswith("/simulations"))
+            assert urls.index("https://api.worldquantbrain.com/alphas/held1/submit") < first_sim
+            assert submitted_value("held1") == "YES"
+            assert al.submissions_today() == 1
+    in_tmp(tmp_path, run)
+
+
+def test_normal_run_submits_held_alpha_before_asking_gemini(tmp_path):
+    def run():
+        _write_operators()
+        al.append_result(held_row("held1", 1.05, expression=THREE[0]))
+        brain = FakeBrain({"new": calm(), "held1": alpha_json()})  # the one simulation gets "new"
+        order = []
+        real_submit_held = al.submit_held
+
+        def gen(*a, **kw):
+            order.append("gemini")
+            return [("rank(close)", "r")]
+
+        def held(session):
+            order.append("held")
+            return real_submit_held(session)
+
+        with patch.object(al, "MAX_ROUNDS", 1), patch.object(al, "generate_with_fallback", side_effect=gen), \
+             patch.object(al, "submit_held", side_effect=held), \
+             patch.object(al, "get_authenticated_session", return_value=brain.session), \
+             patch("google.genai.Client"), patch("time.sleep"):
+            al.main([])
+        assert order == ["held", "gemini"]
+        assert submitted_value("held1") == "YES"
+        assert [(r["expression"], r["alpha_id"]) for r in csv_rows()] == [(THREE[0], "held1"), ("rank(close)", "new")]
+    in_tmp(tmp_path, run)
+
+
+# ---- Parallel simulations ----
+
+class SlowBrain:
+    """Simulations that take a few checks to finish, with BRAIN's limit on how many run at once.
+    Each expression's result is fixed in advance, so mixed-up results would show."""
+    def __init__(self, results, polls=None, limit=3, busy_first=0, expire_on=None, renew_ok=True):
+        self.results = results              # {expression: alpha json}
+        self.polls = polls or {}            # {expression: checks needed before it's done} (default 1)
+        self.limit, self.busy_first = limit, busy_first
+        self.expire_on, self.renew_ok = expire_on, renew_ok
+        self.running, self.started, self.peak, self.sim, self.alpha_of = {}, [], 0, 0, {}
+        self.session = MagicMock()
+        self.session.get.side_effect = self.get
+        self.session.post.side_effect = self.post
+
+    def post(self, url, **kw):
+        if url == be.AUTH_URL:
+            return fake_response(201, {"user": {"id": "u"}}) if self.renew_ok else fake_response(401, text="no")
+        if url.endswith("/simulations"):
+            if self.busy_first > 0 or len(self.running) >= self.limit:
+                self.busy_first -= 1
+                return fake_response(429, {"detail": "CONCURRENT_SIMULATION_LIMIT_EXCEEDED"},
+                                     text='{"detail": "CONCURRENT_SIMULATION_LIMIT_EXCEEDED"}')
+            self.sim += 1
+            expression = kw["json"]["regular"]
+            self.running[f"sim-{self.sim}"] = [expression, self.polls.get(expression, 1)]
+            self.started.append(expression)
+            self.peak = max(self.peak, len(self.running))
+            return fake_response(201, headers={"Location": f"sim-{self.sim}"})
+        raise AssertionError(f"unexpected POST {url}")
+
+    def get(self, url, **kw):
+        if url.startswith("sim-"):
+            expression, left = self.running[url]
+            if expression == self.expire_on:
+                self.expire_on = None
+                return fake_response(401, {"detail": "Incorrect authentication credentials."})
+            if left > 1:
+                self.running[url][1] -= 1
+                return fake_response(200, {"progress": 0.5})
+            del self.running[url]
+            self.alpha_of[f"id{url[4:]}"] = expression
+            return fake_response(200, {"status": "COMPLETE", "alpha": f"id{url[4:]}"})
+        return fake_response(200, self.results[self.alpha_of[url.rsplit("/", 1)[-1]]])
+
+
+def run_queue(brain, expressions, parallel=3):
+    items = [(e, "r", "idea") for e in expressions]
+    with patch("time.sleep"), patch.object(al, "PARALLEL_SIMULATIONS", parallel):
+        return al.process_queue(brain.session, items, SETTINGS, "e@x.com", "pw", 1, set())
+
+
+def test_runs_three_simulations_at_once_and_keeps_results_straight(tmp_path):
+    def run():
+        exprs = [f"rank(x{i})" for i in range(6)]
+        brain = SlowBrain({e: calm(sharpe=0.1 * i) for i, e in enumerate(exprs)},
+                          polls={e: 4 - i % 3 for i, e in enumerate(exprs)})
+        rows = run_queue(brain, exprs)
+        assert brain.peak == 3
+        assert sorted(r["expression"] for r in rows) == exprs and all(r["status"] == "COMPLETE" for r in rows)
+        for r in rows:  # each row carries its own expression's result
+            assert r["sharpe"] == 0.1 * int(r["expression"][6:-1])
+            assert brain.alpha_of[r["alpha_id"]] == r["expression"]
+        assert len(csv_rows()) == 6
+    in_tmp(tmp_path, run)
+
+
+def test_quick_results_dont_wait_for_a_slow_one(tmp_path):
+    def run():
+        brain = SlowBrain({e: calm() for e in ("rank(slow)", "rank(a)", "rank(b)", "rank(c)")},
+                          polls={"rank(slow)": 6})
+        rows = run_queue(brain, ["rank(slow)", "rank(a)", "rank(b)", "rank(c)"])
+        assert [r["expression"] for r in rows][-1] == "rank(slow)"
+        assert brain.started == ["rank(slow)", "rank(a)", "rank(b)", "rank(c)"]
+    in_tmp(tmp_path, run)
+
+
+def test_brain_busy_drops_to_what_it_allows(tmp_path):
+    def run():
+        exprs = [f"rank(x{i})" for i in range(5)]
+        brain = SlowBrain({e: calm() for e in exprs}, polls={e: 2 for e in exprs}, limit=2)
+        rows = run_queue(brain, exprs)
+        assert brain.peak == 2
+        assert all(r["status"] == "COMPLETE" for r in rows) and len(rows) == 5   # nothing lost to the 429s
+    in_tmp(tmp_path, run)
+
+
+def test_busy_with_nothing_running_waits_then_starts(tmp_path):
+    def run():
+        brain = SlowBrain({"rank(a)": calm()}, busy_first=2)
+        with patch("time.sleep") as sleep, patch.object(al, "PARALLEL_SIMULATIONS", 3):
+            rows = al.process_queue(brain.session, [("rank(a)", "r", "idea")], SETTINGS, "e@x.com", "pw", 1, set())
+        assert [r["status"] for r in rows] == ["COMPLETE"]
+        assert [c.args[0] for c in sleep.call_args_list].count(al.BUSY_WAIT_SECONDS) == 2
+    in_tmp(tmp_path, run)
+
+
+def test_busy_too_long_gives_up_on_that_idea_only(tmp_path):
+    def run():
+        brain = SlowBrain({"rank(a)": calm()}, limit=0)
+        with patch.object(al, "MAX_BUSY_WAIT_SECONDS", 0):
+            rows = run_queue(brain, ["rank(a)"])
+        assert rows[0]["status"] == "FAILED" and "stayed busy" in rows[0]["error"]
+    in_tmp(tmp_path, run)
+
+
+def test_followup_takes_the_next_free_slot(tmp_path):
+    def run():
+        results = {"rank(a)": alpha_json(sharpe=-1.5, checks=[]), "reverse(rank(a))": calm(),
+                   "rank(b)": calm(), "rank(c)": calm(), "rank(d)": calm()}
+        brain = SlowBrain(results, polls={"rank(b)": 5})
+        run_queue(brain, ["rank(a)", "rank(b)", "rank(c)", "rank(d)"], parallel=2)
+        assert brain.started[:3] == ["rank(a)", "rank(b)", "reverse(rank(a))"]   # ahead of c and d
+    in_tmp(tmp_path, run)
+
+
+def test_expired_session_while_checking_renews_and_carries_on(tmp_path):
+    def run():
+        brain = SlowBrain({e: calm() for e in ("rank(a)", "rank(b)")}, expire_on="rank(a)")
+        rows = run_queue(brain, ["rank(a)", "rank(b)"])
+        assert sorted(r["status"] for r in rows) == ["COMPLETE", "COMPLETE"]
+    in_tmp(tmp_path, run)
+
+
+def test_session_lost_while_checking_stops_and_records_every_running_idea(tmp_path):
+    def run():
+        brain = SlowBrain({e: calm() for e in ("rank(a)", "rank(b)", "rank(c)")},
+                          polls={"rank(b)": 3, "rank(c)": 3}, expire_on="rank(a)", renew_ok=False)
+        try:
+            run_queue(brain, ["rank(a)", "rank(b)", "rank(c)"])
+            assert False, "should have stopped"
+        except al.StopLoop:
+            pass
+        saved = {r["expression"]: (r["status"], r["error"]) for r in csv_rows()}
+        assert saved["rank(a)"] == ("STOPPED", "session expired and could not renew unattended")
+        assert saved["rank(b)"][0] == saved["rank(c)"][0] == "STOPPED"
+        assert "retry it with --try" in saved["rank(b)"][1]
+    in_tmp(tmp_path, run)
+
+
+def test_submissions_never_overlap_when_several_qualify(tmp_path):
+    def run():
+        good = alpha_json(sharpe=1.6, fitness=1.2, turnover=0.2)
+        brain = SlowBrain({"rank(a)": good, "rank(b)": good, "rank(c)": calm()})
+        submitted = []
+
+        def fake_try_submit(session, alpha_id):
+            submitted.append(alpha_id)
+            al.record_submission()
+            return "YES"
+
+        with patch.object(al, "try_submit", side_effect=fake_try_submit):
+            rows = run_queue(brain, ["rank(a)", "rank(b)", "rank(c)"])
+        assert len(submitted) == 1                                     # daily cap still holds
+        by_expr = {r["expression"]: r["submitted"] for r in rows}
+        assert sorted(by_expr.values()) == ["NO", al.HELD_LABEL, "YES"]
+    in_tmp(tmp_path, run)
+
+
+# ---- Variety across data types ----
+
+def write_cache(categories):
+    Path(al.FIELDS_CACHE_FILE).write_text(json.dumps({"matrix_fields": [
+        {"id": name, "category": {"id": cat[:3].lower(), "name": cat}} for name, cat in categories.items()]}),
+        encoding="utf-8")
+
+
+FOUR_TYPES = {"implied_volatility_call_60": "Option", "implied_volatility_put_90": "Option",
+              "sales": "Fundamental", "debt": "Fundamental", "est_eps": "Analyst", "close": "Price Volume"}
+FIELDS = [{"name": n, "description": "d [some dataset]"} for n in FOUR_TYPES] + \
+         [{"name": "industry", "description": "group field - use as the group argument of group_* operators. [x]"}]
+
+
+def test_field_types_prefers_brain_categories_then_dataset_tag(tmp_path):
+    def run():
+        fields = [{"name": "iv", "description": "implied vol [Volatility Data]"},
+                  {"name": "sales", "description": "Sales [Fundamental Data]"},
+                  {"name": "mystery", "description": "no tag here"},
+                  {"name": "sector", "description": "group field - use as the group argument. [Univ]"}]
+        assert al.field_types(fields) == {"iv": "Volatility Data", "sales": "Fundamental Data"}
+        write_cache({"iv": "Option", "sales": "Fundamental"})
+        assert al.field_types(fields) == {"iv": "Option", "sales": "Fundamental"}
+        Path(al.FIELDS_CACHE_FILE).write_text("not json", encoding="utf-8")
+        assert al.field_types(fields)["iv"] == "Volatility Data"         # broken cache: falls back
+    in_tmp(tmp_path, run)
+
+
+def test_crowded_types_come_from_submitted_queued_and_too_similar(tmp_path):
+    def run():
+        for expr, submitted in [("rank(implied_volatility_put_90)", "YES"),
+                                ("rank(implied_volatility_call_60)", al.HELD_LABEL),
+                                ("rank(est_eps)", "TOO_CORRELATED (max 0.81)"),
+                                ("rank(sales)", "NO"), ("rank(debt)", "REJECTED: failed LOW_SHARPE")]:
+            al.append_result(dict(_history_row(expr, 1.3, 1.0, 0.1), submitted=submitted))
+        assert al.crowded_types(FOUR_TYPES) == Counter({"Option": 2, "Analyst": 1})
+    in_tmp(tmp_path, run)
+
+
+def test_pick_varied_caps_crowded_and_busy_types(tmp_path):
+    ideas = [(f"rank(implied_volatility_call_60) + {i}", "r") for i in range(3)] + \
+            [("rank(sales)", "r"), ("rank(debt)", "r"), ("rank(sales * debt)", "r"),
+             ("rank(est_eps)", "r"), ("rank(close)", "r"), ("rank(volume_ratio)", "r")]
+    kept = [e for e, _ in al.pick_varied(ideas, FOUR_TYPES, Counter({"Option": 1}), 8)]
+    assert kept == ["rank(implied_volatility_call_60) + 0", "rank(sales)", "rank(debt)",
+                    "rank(est_eps)", "rank(close)", "rank(volume_ratio)"]   # unknown fields aren't capped
+    assert len(al.pick_varied(ideas, FOUR_TYPES, Counter(), 2)) == 2
+
+
+def test_round_prompt_steers_away_from_submitted_data(tmp_path):
+    def run():
+        write_cache(FOUR_TYPES)
+        al.append_result(dict(_history_row("rank(implied_volatility_put_90)", 1.63, 1.27, 0.16), submitted="YES"))
+        returned = [{"expression": f"rank(ts_delta(implied_volatility_call_60, {i}))", "rationale": "r"} for i in range(5)] + \
+                   [{"expression": "rank(sales)", "rationale": "r"}, {"expression": "rank(debt)", "rationale": "r"},
+                    {"expression": "rank(sales / debt)", "rationale": "r"}, {"expression": "rank(est_eps)", "rationale": "r"}]
+        client = MagicMock()
+        client.models.generate_content.return_value = fake_gemini_response(returned)
+        brain = SlowBrain({e["expression"]: calm() for e in returned})
+        with patch("time.sleep"):
+            rows = al.run_round(brain.session, client, [], FIELDS, SETTINGS, "e@x.com", "pw", 1,
+                                al.build_feedback(), set())
+        prompt = client.models.generate_content.call_args.kwargs["contents"]
+        assert "- implied_volatility_call_60: [type: Option]" in prompt
+        assert "- industry: group field" in prompt                         # group fields unlabelled
+        assert "already use: Option (1)" in prompt
+        assert "favour these: Analyst, Fundamental, Price Volume" in prompt
+        assert f"Propose {al.IDEAS_PER_ROUND + al.VARIETY_EXTRA_IDEAS} NEW" in prompt
+        assert "rank(implied_volatility_put_90) -> sharpe=1.63" in prompt and "[submitted]" in prompt
+        assert "keep the data" not in prompt
+        assert sorted(r["expression"] for r in rows) == [
+            "rank(debt)", "rank(est_eps)", "rank(sales)", "rank(ts_delta(implied_volatility_call_60, 0))"]
+    in_tmp(tmp_path, run)
+
+
+def test_no_variety_rule_without_data_types(tmp_path):
+    def run():
+        client = MagicMock()
+        client.models.generate_content.return_value = fake_gemini_response(ONE_IDEA)
+        brain = SlowBrain({"rank(close)": calm()})
+        with patch("time.sleep"):
+            al.run_round(brain.session, client, [], [{"name": "close", "description": "d"}], SETTINGS,
+                         "e@x.com", "pw", 1, "round 1", set())
+        prompt = client.models.generate_content.call_args.kwargs["contents"]
+        assert "VARIETY RULE" not in prompt and f"Propose {al.IDEAS_PER_ROUND} NEW" in prompt
     in_tmp(tmp_path, run)
 
 

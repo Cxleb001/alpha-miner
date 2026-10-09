@@ -56,6 +56,20 @@ def test_submit_simulation_expired_session_detected():
     assert loc is None and err == "EXPIRED_SESSION"
 
 
+def test_poll_once_reports_each_state_without_waiting():
+    session = MagicMock()
+    cases = [(fake_response(200, {"progress": 0.4}), ("RUNNING", 0.4)),
+             (fake_response(200, {"status": "COMPLETE", "alpha": "a1"}), ("DONE", "a1")),
+             (fake_response(200, {"alpha": "a2"}), ("DONE", "a2")),
+             (fake_response(200, {"status": "ERROR", "message": "bad field"}), ("ERROR", "bad field")),
+             (fake_response(401, {"detail": "Incorrect authentication credentials."}), ("EXPIRED", None))]
+    with patch("time.sleep") as sleep:
+        for resp, expected in cases:
+            session.get.return_value = resp
+            assert be.poll_once(session, "loc") == expected
+    sleep.assert_not_called()
+
+
 def test_poll_simulation_status_shape_complete():
     session = MagicMock()
     session.get.return_value = fake_response(200, {"status": "COMPLETE", "alpha": "alpha_1"})

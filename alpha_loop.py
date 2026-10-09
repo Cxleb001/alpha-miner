@@ -43,6 +43,13 @@ READ BEFORE YOU RUN THIS:
   alpha as ACTIVE. Anything unclear is logged as VERDICT_PENDING - confirm those with the
   dashboard's Check with BRAIN button. The submit and correlation endpoints follow community
   clients that recorded BRAIN's live traffic; BRAIN publishes no official API docs.
+- Held alphas: one that clears the bar after today's submission is used is logged as
+  QUALIFIED_NOT_SUBMITTED. Every run (--try included) starts by submitting the best held alpha,
+  highest fitness first, if today's slot is free. It re-reads each one from BRAIN first: one BRAIN
+  already lists as submitted is marked YES, one where a check now FAILs is marked NOT_SUBMITTED,
+  and the rest go through the same self-correlation pre-check. One that's too correlated is
+  marked and the next one is tried, since that doesn't use the slot. If BRAIN can't be reached
+  or the submit itself fails, the alpha stays queued for the next run.
 - Auto-flip: when an alpha scores Sharpe -1.0 or worse, the loop also tests reverse(<expression>)
   right after it (up to MAX_FLIPS_PER_ROUND per round, default 3), since a strongly negative signal
   usually turns positive when flipped. Flips use extra simulations.
@@ -50,6 +57,15 @@ READ BEFORE YOU RUN THIS:
   turnover above SMOOTH_MIN_TURNOVER (default 0.2), the loop also tests
   ts_decay_linear(<expression>, 10) right after it (up to MAX_SMOOTHS_PER_ROUND per round, default 3).
   Fitness divides by turnover, so trading less can lift it over the bar.
+- Variety: alphas built on the same kind of data usually come back too correlated to submit. Each
+  field is labelled with its data type - BRAIN's own category from data_fields_cache.json (written by
+  fetch_fields.py), or the dataset name in operators.json without it. The generator is told which types
+  your submitted or queued alphas already use, and asked for VARIETY_EXTRA_IDEAS (default 4) spare
+  ideas; the loop then keeps at most MAX_IDEAS_PER_TYPE (default 2) per type per round, and at most
+  MAX_IDEAS_PER_CROWDED_TYPE (default 1) for types you've already submitted.
+- Parallel simulations: up to PARALLEL_SIMULATIONS (default 3) run at once. If BRAIN answers that too
+  many are running, the loop carries on with however many it already has going. Results are still
+  handled one at a time, so submissions never overlap. Set PARALLEL_SIMULATIONS=1 for the old pace.
 - Network resilience: every request to BRAIN has a 30-second timeout and is retried after a dropped
   connection (waiting 5s, 15s, 45s). If an idea still can't get through, the loop logs it as
   "Couldn't reach BRAIN" and moves on to the next one; after MAX_NETWORK_FAILURES (default 3) in a
@@ -69,9 +85,11 @@ import argparse
 import csv
 import json
 import logging
+import math
 import os
+import re
 import time
-from collections import deque
+from collections import Counter, deque
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -125,6 +143,19 @@ MAX_SMOOTHS_PER_ROUND = int(os.environ.get("MAX_SMOOTHS_PER_ROUND", 3))  # caps 
 # Network resilience: one dropped connection skips that idea; this many in a row stops the run cleanly.
 MAX_NETWORK_FAILURES = int(os.environ.get("MAX_NETWORK_FAILURES", 3))
 
+# Variety: alphas built on the same kind of data tend to be too correlated to submit together.
+FIELDS_CACHE_FILE = "data_fields_cache.json"  # written by fetch_fields.py - holds BRAIN's category per field
+MAX_IDEAS_PER_TYPE = int(os.environ.get("MAX_IDEAS_PER_TYPE", 2))  # per data type, per round
+MAX_IDEAS_PER_CROWDED_TYPE = int(os.environ.get("MAX_IDEAS_PER_CROWDED_TYPE", 1))  # types you've already submitted
+VARIETY_EXTRA_IDEAS = int(os.environ.get("VARIETY_EXTRA_IDEAS", 4))  # ask for spares, keep the most varied
+
+# Parallel simulations: BRAIN runs a few of yours at once. If it says it's busy (429), the loop
+# drops to however many were already running and keeps going.
+PARALLEL_SIMULATIONS = max(1, int(os.environ.get("PARALLEL_SIMULATIONS", 3)))
+SIM_CHECK_SECONDS = 5            # how often running simulations are checked
+BUSY_WAIT_SECONDS = 15           # BRAIN busy and nothing of ours running: wait this long, then retry
+MAX_BUSY_WAIT_SECONDS = 10 * 60  # ...for at most this long before giving up on that idea
+
 # Memory across runs: how many of your best past results the generator sees each round.
 MEMORY_TOP_N = int(os.environ.get("MEMORY_TOP_N", 10))
 
@@ -139,6 +170,9 @@ OPERATORS_FILE = "operators.json"
 RESULTS_FILE = "alpha_loop_results.csv"  # separate from brain_engine.py's own results.csv
 SESSION_FILE = "session_cookies.json"
 SUBMISSION_LOG_FILE = "submissions_log.json"  # {"YYYY-MM-DD": count} - enforces the daily cap across runs
+HELD_PREFIX = "QUALIFIED_NOT_SUBMITTED"
+HELD_LABEL = f"{HELD_PREFIX} (daily cap reached)"  # cleared the bar, waiting for a free submission slot
+REPLACE_ATTEMPTS = 5  # Windows blocks swapping in the updated CSV while another program is reading it
 
 RESULTS_HEADER = [
     "round", "timestamp", "expression", "rationale", "status", "sharpe", "fitness",
@@ -308,6 +342,115 @@ def completed_history() -> list:
                 if r.get("status") == "COMPLETE" and as_float(r.get("fitness")) is not None]
 
 
+def pool_tag(row) -> str:
+    """Marks results that are already in (or headed for) your submitted pool."""
+    submitted = (row.get("submitted") or "").strip()
+    if submitted == "YES" or submitted.startswith("VERDICT_PENDING"):
+        return " [submitted]"
+    if submitted.startswith(HELD_PREFIX):
+        return " [queued]"
+    if submitted.startswith("TOO_CORRELATED"):
+        return " [too similar to a submitted alpha]"
+    return ""
+
+
+# ---- Variety: spread ideas across data types ----
+
+def field_types(fields) -> dict:
+    """{field name: data type} for the signal fields the generator can use. The data type is BRAIN's
+    own category for the field (Option, Fundamental, Analyst...), read from data_fields_cache.json;
+    without that file, the dataset name fetch_fields.py keeps in [brackets] in each description.
+    Group fields (sector, industry...) are left out - every idea uses them for grouping."""
+    categories = {}
+    try:
+        cache = json.loads(Path(FIELDS_CACHE_FILE).read_text(encoding="utf-8"))
+        for f in cache.get("matrix_fields") or []:
+            cat = f.get("category")
+            name = (cat.get("name") or cat.get("id")) if isinstance(cat, dict) else cat
+            if f.get("id") and name:
+                categories[f["id"]] = str(name)
+    except (OSError, ValueError, AttributeError):
+        pass
+    found = {}
+    for f in fields:
+        name, desc = f.get("name"), (f.get("description") or "").strip()
+        if not name or desc.startswith("group field"):
+            continue
+        if name in categories:
+            found[name] = categories[name]
+        else:
+            tag = re.search(r"\[([^\[\]]+)\]$", desc)
+            if tag:
+                found[name] = tag.group(1)
+    return found
+
+
+def expression_types(expression: str, type_map: dict) -> set:
+    return {type_map[word] for word in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", expression) if word in type_map}
+
+
+def crowded_types(type_map: dict) -> Counter:
+    """Data types your submitted, queued or too-similar alphas are built on, with how many of each."""
+    counts = Counter()
+    if not type_map or not Path(RESULTS_FILE).exists():
+        return counts
+    with open(RESULTS_FILE, encoding="utf-8", newline="") as f:
+        for r in csv.DictReader(f):
+            if pool_tag(r):
+                counts.update(expression_types(r.get("expression") or "", type_map))
+    return counts
+
+
+def per_type_cap(n: int, type_map: dict) -> int:
+    """Ideas allowed per data type - loosened if there are too few types to fill a round otherwise."""
+    return max(MAX_IDEAS_PER_TYPE, math.ceil(n / max(1, len(set(type_map.values())))))
+
+
+def variety_rule(type_map: dict, crowded: Counter, n: int) -> str:
+    all_types = sorted(set(type_map.values()))
+    if len(all_types) < 2:
+        return ""
+    lines = ["VARIETY RULE - this is what gets new alphas accepted. BRAIN won't take an alpha whose "
+             "self-correlation with your submitted alphas is 0.7 or more, and alphas built on the same "
+             "kind of data usually are. Every field above is labelled with its data type."]
+    if crowded:
+        used = ", ".join(f"{t} ({c})" for t, c in crowded.most_common())
+        lines.append(f"- Your submitted or queued alphas already use: {used}. At most "
+                     f"{MAX_IDEAS_PER_CROWDED_TYPE} idea(s) this round may use each of these.")
+    fresh = [t for t in all_types if t not in crowded]
+    if fresh:
+        lines.append(f"- Not used yet - favour these: {', '.join(fresh)}.")
+    lines.append(f"- At most {per_type_cap(n, type_map)} ideas per data type. Carry the shapes that scored well "
+                 f"(operators, windows, grouping, decay) over to other data types instead of repeating the same data.")
+    return "\n".join(lines)
+
+
+def label_fields(fields, type_map: dict) -> list:
+    return [dict(f, description=f"[type: {type_map[f['name']]}] {f.get('description', '')}")
+            if f.get("name") in type_map else f for f in fields]
+
+
+def pick_varied(ideas, type_map: dict, crowded: Counter, n: int) -> list:
+    """Keep up to n ideas, in Gemini's order, without going over the per-type caps."""
+    cap = per_type_cap(n, type_map)
+    used, kept, dropped = Counter(), [], []
+    for expression, rationale in ideas:
+        types_used = expression_types(expression, type_map)
+        if any(used[t] >= (MAX_IDEAS_PER_CROWDED_TYPE if t in crowded else cap) for t in types_used):
+            dropped.append(expression)
+            continue
+        kept.append((expression, rationale))
+        used.update(types_used)
+        if len(kept) == n:
+            break
+    if dropped:
+        logger.info("Variety: skipped %d idea(s) leaning on data types already used enough this round.",
+                    len(dropped))
+    if used:
+        logger.info("This round's data types: %s", ", ".join(f"{t} x{c}" for t, c in used.most_common()))
+    return kept
+
+
 def build_feedback(last_round_rows=None) -> str:
     """What the generator sees each round: your best results across ALL runs so far, so a new run
     builds on what already worked instead of starting from scratch, plus how the last round went."""
@@ -316,11 +459,13 @@ def build_feedback(last_round_rows=None) -> str:
     if history:
         best = sorted(history, key=lambda r: as_float(r["fitness"]), reverse=True)[:MEMORY_TOP_N]
         lines = [f"Your best results so far, out of {len(history)} simulated alphas across all runs "
-                 f"(best fitness first). Build on what works here - keep the data and the idea, fix what's "
-                 f"holding it back (usually fitness or turnover) - but keep some ideas genuinely new:"]
+                 f"(best fitness first). Learn from what works here - the operators, lookback windows, "
+                 f"grouping and decay that score well, and what's holding each one back (usually fitness or "
+                 f"turnover). But don't keep reusing the same data: a new alpha on the same data as one "
+                 f"marked [submitted] or [queued] usually comes back too similar to submit."]
         for r in best:
             lines.append(f"- {r['expression']} -> sharpe={r['sharpe']} fitness={r['fitness']} "
-                         f"turnover={r['turnover']}{turnover_note(r)}")
+                         f"turnover={r['turnover']}{turnover_note(r)}{pool_tag(r)}")
         parts.append("\n".join(lines))
     if last_round_rows:
         parts.append(summarize_round(last_round_rows))
@@ -576,34 +721,182 @@ def append_result(row: dict):
         writer.writerow(row)
 
 
-def evaluate_idea(session, expression, rationale, settings, email, password, round_num) -> dict:
-    """Simulate one expression, log it, and submit it if it qualifies. Returns its row."""
+# ---- Held alphas: cleared the bar on a day the submission slot was already used ----
+
+def held_candidates() -> list:
+    """Held alphas still waiting, best fitness first (Sharpe breaks ties). An alpha that already
+    has an outcome logged in another row (mark_held's fallback) is left out."""
+    if not Path(RESULTS_FILE).exists():
+        return []
+    with open(RESULTS_FILE, encoding="utf-8", newline="") as f:
+        rows = list(csv.DictReader(f))
+    held, decided = {}, set()
+    for r in rows:
+        alpha_id = (r.get("alpha_id") or "").strip()
+        submitted = (r.get("submitted") or "").strip()
+        if not alpha_id:
+            continue
+        if submitted.startswith(HELD_PREFIX):
+            held.setdefault(alpha_id, r)
+        elif submitted not in ("", "NO"):
+            decided.add(alpha_id)
+    waiting = [r for alpha_id, r in held.items() if alpha_id not in decided]
+    return sorted(waiting, key=lambda r: (safe_float(r.get("fitness")), safe_float(r.get("sharpe"))),
+                  reverse=True)
+
+
+def mark_held(alpha_id: str, outcome: str):
+    """Swap a held alpha's 'submitted' value for what happened to it, so the dashboard and later
+    runs still see one row per alpha. The CSV is written to a temporary file and swapped in, so a
+    crash can't leave it half-written. If Windows blocks the swap (another program has the file
+    open), the outcome is appended as a new row instead, so it's never lost."""
+    with open(RESULTS_FILE, encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        fieldnames = reader.fieldnames or RESULTS_HEADER
+        rows = list(reader)
+    target = None
+    for r in rows:
+        if r.get("alpha_id") == alpha_id and (r.get("submitted") or "").startswith(HELD_PREFIX):
+            r["submitted"] = outcome
+            target = target or r
+    if target is None:
+        return
+
+    tmp = Path(RESULTS_FILE + ".tmp")
+    with open(tmp, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+    for attempt in range(REPLACE_ATTEMPTS):
+        try:
+            os.replace(tmp, RESULTS_FILE)
+            return
+        except OSError:
+            if attempt < REPLACE_ATTEMPTS - 1:
+                time.sleep(1)
+    try:
+        tmp.unlink()
+    except OSError:
+        pass
+    logger.warning("Couldn't update %s in place (is it open in another program?) - adding the outcome "
+                   "for %s as a new row instead.", RESULTS_FILE, alpha_id)
+    append_result(dict(target, round="held", timestamp=time.strftime("%Y-%m-%d %H:%M:%S")))
+
+
+def submit_held(session):
+    """Start-of-run step: if today's slot is free, submit the best held alpha. Returns the outcome
+    that used the slot (YES, REJECTED..., VERDICT_PENDING...), or None. Never stops the run."""
+    try:
+        return _submit_held(session)
+    except Exception:
+        logger.exception("The held-alpha queue hit an unexpected problem - skipping it this run. "
+                         "Held alphas stay queued.")
+        return None
+
+
+def _submit_held(session):
+    queue = held_candidates()
+    if not queue:
+        return None
+    if submissions_today() >= MAX_SUBMISSIONS_PER_DAY:
+        logger.info("%d held alpha(s) waiting, but today's submission slot is used - they stay queued "
+                    "until BRAIN's next day starts (3 AM US Eastern).", len(queue))
+        return None
+    logger.info("%d held alpha(s) waiting and today's submission slot is free - trying the best one first.",
+                len(queue))
+
+    for row in queue:
+        if submissions_today() >= MAX_SUBMISSIONS_PER_DAY:
+            break
+        alpha_id = row["alpha_id"]
+        logger.info("Held alpha %s (Sharpe %s, fitness %s): %s", alpha_id, row.get("sharpe"),
+                    row.get("fitness"), row.get("expression"))
+        try:
+            alpha = be.fetch_alpha(session, alpha_id)
+        except requests.RequestException as exc:
+            logger.warning("Couldn't reach BRAIN to check held alpha %s (%s) - everything stays queued "
+                           "for the next run.", alpha_id, type(exc).__name__)
+            return None
+
+        if alpha.get("status") == "ACTIVE":
+            logger.info("BRAIN already lists %s as submitted - marking it YES.", alpha_id)
+            mark_held(alpha_id, "YES")
+            continue
+        checks = (alpha.get("is") or {}).get("checks") or []
+        if not checks:
+            logger.warning("BRAIN didn't return %s's checks - leaving it queued.", alpha_id)
+            continue
+        metrics = be.metrics_from_alpha(alpha_id, alpha)
+        if not qualifies(metrics, checks):
+            failed = [str(c.get("name")) for c in checks if c.get("result") == "FAIL"]
+            if (failed or safe_float(metrics.get("sharpe")) < SUBMIT_MIN_SHARPE
+                    or safe_float(metrics.get("fitness")) < SUBMIT_MIN_FITNESS):
+                reason = ("failed " + ", ".join(failed)) if failed else "below the Sharpe/fitness bar"
+                logger.warning("Held alpha %s no longer qualifies on BRAIN (%s) - dropping it from the queue.",
+                               alpha_id, reason)
+                mark_held(alpha_id, f"NOT_SUBMITTED (no longer qualifies: {reason})")
+            else:
+                logger.info("A check on %s isn't settled yet - leaving it queued.", alpha_id)
+            continue
+
+        outcome = try_submit(session, alpha_id)
+        if outcome.startswith("FAILED"):
+            logger.warning("Held alpha %s stays queued - the submit didn't go through.", alpha_id)
+            continue
+        mark_held(alpha_id, outcome)
+        if not outcome.startswith("TOO_CORRELATED"):
+            return outcome  # BRAIN processed it, so today's slot is used
+    return None
+
+
+BUSY = "BUSY"  # BRAIN is already running as many of your simulations as it allows
+
+
+def new_row(expression, rationale, round_num) -> dict:
     row = {k: "" for k in RESULTS_HEADER}
     row.update(round=round_num, timestamp=time.strftime("%Y-%m-%d %H:%M:%S"),
                expression=expression, rationale=rationale, submitted="NO")
+    return row
 
-    location, err = be.submit_simulation(session, expression, settings)
+
+def renew_session(session, email, password, row):
+    """One unattended re-login. If BRAIN wants identity verification, logs this idea as STOPPED
+    and raises StopLoop - nobody is here to click the link."""
+    logger.warning("Session expired mid-run - attempting one re-auth...")
+    session.cookies.clear()
+    if not be.authenticate(session, email, password):
+        row["status"], row["error"] = "STOPPED", "session expired and could not renew unattended"
+        append_result(row)
+        raise StopLoop("BRAIN needs re-authentication (likely identity verification) and no one is here to complete it.")
+    save_session(session)
+
+
+def is_busy(err) -> bool:
+    """BRAIN's 'too many simulations at once' answer (429, or a CONCURRENT_SIMULATION... message)."""
+    text = str(err or "").upper()
+    return text.startswith("SUBMIT FAILED (429)") or "CONCURRENT_SIMULATION" in text or "SIMULATION_LIMIT" in text
+
+
+def start_idea(session, row, settings, email, password):
+    """Start the simulation. Returns (location, None), (None, BUSY) or (None, error)."""
+    location, err = be.submit_simulation(session, row["expression"], settings)
     if err == "EXPIRED_SESSION":
-        logger.warning("Session expired mid-run - attempting one re-auth...")
-        session.cookies.clear()
-        if not be.authenticate(session, email, password):
-            row["status"], row["error"] = "STOPPED", "session expired and could not renew unattended"
-            append_result(row)
-            raise StopLoop("BRAIN needs re-authentication (likely identity verification) and no one is here to complete it.")
-        save_session(session)
-        location, err = be.submit_simulation(session, expression, settings)
+        renew_session(session, email, password, row)
+        location, err = be.submit_simulation(session, row["expression"], settings)
+    if err and is_busy(err):
+        return None, BUSY
+    return location, err
 
-    if err:
-        row["status"], row["error"] = "FAILED", str(err)[:300]
-        append_result(row)
-        return row
 
-    alpha_id, err = be.poll_simulation(session, location)
-    if err:
-        row["status"], row["error"] = "FAILED", str(err)[:300]
-        append_result(row)
-        return row
+def fail(row, error) -> dict:
+    row["status"], row["error"] = "FAILED", str(error)[:300]
+    append_result(row)
+    return row
 
+
+def finish_idea(session, row, alpha_id) -> dict:
+    """A simulation finished: read BRAIN's result, log it, and submit the alpha if it qualifies."""
+    expression = row["expression"]
     alpha = be.fetch_alpha(session, alpha_id)
     metrics = be.metrics_from_alpha(alpha_id, alpha)
     checks = (alpha.get("is") or {}).get("checks") or []
@@ -613,9 +906,10 @@ def evaluate_idea(session, expression, rationale, settings, email, password, rou
 
     if qualifies(metrics, checks):
         if submissions_today() >= MAX_SUBMISSIONS_PER_DAY:
-            logger.warning("Alpha %s qualifies but today's submission limit (%d) is used - logging it, "
-                           "not submitting.", alpha_id, MAX_SUBMISSIONS_PER_DAY)
-            row["submitted"] = "QUALIFIED_NOT_SUBMITTED (daily cap reached)"
+            logger.warning("Alpha %s qualifies but today's submission limit (%d) is used - holding it. "
+                           "The first run with a free slot submits held alphas first.",
+                           alpha_id, MAX_SUBMISSIONS_PER_DAY)
+            row["submitted"] = HELD_LABEL
         else:
             row["submitted"] = try_submit(session, alpha_id)
 
@@ -628,83 +922,195 @@ def evaluate_idea(session, expression, rationale, settings, email, password, rou
 
 def run_round(session, client, operators, fields, settings, email, password, round_num, feedback_text, avoid):
     logger.info("=== Round %d: generating %d ideas ===", round_num, IDEAS_PER_ROUND)
+    type_map = field_types(fields)
+    crowded = crowded_types(type_map)
+    rule = variety_rule(type_map, crowded, IDEAS_PER_ROUND)
+    asked = IDEAS_PER_ROUND + (VARIETY_EXTRA_IDEAS if rule else 0)
+    prompt_text = f"{feedback_text}\n\n{rule}" if rule else feedback_text
     try:
-        ideas = generate_with_fallback(client, operators, fields, settings, feedback_text, avoid, IDEAS_PER_ROUND)
+        ideas = generate_with_fallback(client, operators, label_fields(fields, type_map), settings,
+                                       prompt_text, avoid, asked)
     except Exception as e:
         raise GenerationFailed(short_error(e)) from e
+
+    if rule:
+        fresh_ideas = []
+        for expression, rationale in ideas:
+            if expression in avoid:
+                logger.info("Skipping duplicate: %s", expression)
+            else:
+                fresh_ideas.append((expression, rationale))
+        ideas = pick_varied(fresh_ideas, type_map, crowded, IDEAS_PER_ROUND)
 
     return process_queue(session, [(e, r, "idea") for e, r in ideas], settings, email, password, round_num, avoid)
 
 
 def process_queue(session, items, settings, email, password, round_num, avoid) -> list:
-    """Test each (expression, rationale, kind) in order. A flip or smooth goes to the FRONT of
-    the queue, so it runs right after the alpha that triggered it - even a short or interrupted
-    run tests its best leads first."""
+    """Test each (expression, rationale, kind), up to PARALLEL_SIMULATIONS at once. A flip or
+    smooth goes to the FRONT of the queue, so it starts in the next free slot, right after the
+    alpha that triggered it - even a short or interrupted run tests its best leads first.
+    Finished simulations are handled one at a time, so submissions never overlap."""
     queue = deque(items)
-    round_rows, flips, smooths, network_failures = [], 0, 0, 0
-    while queue:
-        expression, rationale, kind = queue.popleft()
-        if expression in avoid:
-            logger.info("Skipping duplicate: %s", expression)
-            continue
-        avoid.add(expression)
-        try:
-            row = evaluate_idea(session, expression, rationale, settings, email, password, round_num)
-            network_failures = 0
-        except StopLoop:
-            raise
-        except requests.RequestException as exc:
-            network_failures += 1
-            logger.warning("Couldn't reach BRAIN while testing %s (%s), even after retrying - skipping it. "
-                           "Retry it later with --try.", expression, type(exc).__name__)
-            round_rows.append(failure_row(expression, rationale, round_num,
-                                          f"Couldn't reach BRAIN ({type(exc).__name__}) - not a verdict on the "
-                                          f"idea; retry it with --try"))
-            if network_failures >= MAX_NETWORK_FAILURES:
-                raise StopLoop(f"Couldn't reach BRAIN for {network_failures} ideas in a row - your connection "
-                               f"seems to be down. Stopped cleanly; everything so far is saved.")
-            continue
-        except Exception as exc:  # an unexpected reply shouldn't end the whole run
-            logger.exception("Unexpected error while testing %s - skipping it and carrying on.", expression)
-            round_rows.append(failure_row(expression, rationale, round_num,
-                                          f"Unexpected error: {type(exc).__name__}: {exc}"))
-            continue
-        round_rows.append(row)
+    running = []  # each: {"row", "kind", "location", "started"}
+    rows = []
+    counts = {"flips": 0, "smooths": 0, "network": 0}
+    limit = PARALLEL_SIMULATIONS
+    busy_since = None
+    last_note = time.time()
 
-        if row["status"] == "COMPLETE":
-            sharpe, fitness, turnover = (as_float(row.get(k)) for k in ("sharpe", "fitness", "turnover"))
+    def network_trouble(row, exc):
+        counts["network"] += 1
+        logger.warning("Couldn't reach BRAIN while testing %s (%s), even after retrying - skipping it. "
+                       "Retry it later with --try.", row["expression"], type(exc).__name__)
+        rows.append(fail(row, f"Couldn't reach BRAIN ({type(exc).__name__}) - not a verdict on the idea; "
+                              f"retry it with --try"))
+        if counts["network"] >= MAX_NETWORK_FAILURES:
+            raise StopLoop(f"Couldn't reach BRAIN for {counts['network']} ideas in a row - your connection "
+                           f"seems to be down. Stopped cleanly; everything so far is saved.")
 
-            # Auto-flip: a strongly negative Sharpe means a real signal pointing the wrong way.
-            if (kind == "idea" and sharpe is not None and sharpe <= FLIP_SHARPE_AT_OR_BELOW
-                    and flips < MAX_FLIPS_PER_ROUND and not expression.startswith("reverse(")):
-                flipped = f"reverse({expression})"
-                if flipped not in avoid:
-                    flips += 1
-                    logger.info("  Sharpe %.2f points the wrong way - testing the flipped version next.", sharpe)
-                    queue.appendleft((flipped, f"Auto-flip of {expression}, which scored Sharpe {sharpe:.2f}; "
-                                               f"reversed, it should score about {-sharpe:.2f}.", "flip"))
+    def unexpected(row, exc):  # an unexpected reply shouldn't end the whole run
+        logger.error("Unexpected error while testing %s (%s: %s) - skipping it and carrying on.",
+                     row["expression"], type(exc).__name__, exc, exc_info=exc)
+        rows.append(fail(row, f"Unexpected error: {type(exc).__name__}: {exc}"))
 
-            # Auto-smooth: the Sharpe is there, but trading too much is holding it back.
-            if kind != "smooth" and smooths < MAX_SMOOTHS_PER_ROUND and needs_smoothing(sharpe, fitness, turnover):
-                smoothed = f"ts_decay_linear({expression}, {SMOOTH_DECAY_DAYS})"
-                if smoothed not in avoid:
-                    smooths += 1
-                    logger.info("  Sharpe %.2f is there, but fitness %.2f at %.0f%% turnover isn't - "
-                                "testing a smoothed version next.", sharpe, fitness, turnover * 100)
-                    queue.appendleft((smoothed, f"Auto-smooth of {expression}: Sharpe {sharpe:.2f} but fitness "
-                                                f"{fitness:.2f} at {turnover:.0%} turnover; decaying it over "
-                                                f"{SMOOTH_DECAY_DAYS} days should cut turnover.", "smooth"))
-        time.sleep(3)
+    try:
+        while queue or running:
+            # 1. Start ideas while there's a free slot.
+            while queue and len(running) < limit:
+                expression, rationale, kind = queue[0]
+                if expression in avoid:
+                    queue.popleft()
+                    logger.info("Skipping duplicate: %s", expression)
+                    continue
+                row = new_row(expression, rationale, round_num)
+                try:
+                    location, err = start_idea(session, row, settings, email, password)
+                except StopLoop:
+                    raise
+                except requests.RequestException as exc:
+                    queue.popleft()
+                    avoid.add(expression)
+                    network_trouble(row, exc)
+                    continue
+                except Exception as exc:
+                    queue.popleft()
+                    avoid.add(expression)
+                    unexpected(row, exc)
+                    continue
 
-    return round_rows
+                if err == BUSY:
+                    if running:  # BRAIN's limit is however many we already have going
+                        if limit != len(running):
+                            limit = len(running)
+                            logger.info("BRAIN is running as many of your simulations as it allows - "
+                                        "carrying on with %d at a time.", limit)
+                        break
+                    busy_since = busy_since or time.time()
+                    if time.time() - busy_since >= MAX_BUSY_WAIT_SECONDS:
+                        queue.popleft()
+                        avoid.add(expression)
+                        busy_since = None
+                        rows.append(fail(row, "BRAIN stayed busy for 10 minutes (simulations running "
+                                              "elsewhere?) - retry it with --try"))
+                        continue
+                    logger.info("BRAIN says it's busy - waiting %ds before starting the next idea.",
+                                BUSY_WAIT_SECONDS)
+                    time.sleep(BUSY_WAIT_SECONDS)
+                    continue
+
+                queue.popleft()
+                avoid.add(expression)
+                busy_since = None
+                counts["network"] = 0
+                if err:
+                    rows.append(fail(row, err))
+                    continue
+                running.append({"row": row, "kind": kind, "location": location, "started": time.time()})
+                logger.info("Simulating (%d running): %s", len(running), expression)
+
+            if not running:
+                continue
+
+            # 2. Check each running simulation once.
+            time.sleep(SIM_CHECK_SECONDS)
+            if time.time() - last_note >= 60:
+                last_note = time.time()
+                logger.info("  ... %d simulation(s) running, longest for %ds", len(running),
+                            int(time.time() - min(i["started"] for i in running)))
+            for item in list(running):
+                row = item["row"]
+                try:
+                    state, info = be.poll_once(session, item["location"])
+                except requests.RequestException as exc:
+                    running.remove(item)
+                    network_trouble(row, exc)
+                    continue
+                except Exception as exc:
+                    running.remove(item)
+                    unexpected(row, exc)
+                    continue
+
+                if state == "RUNNING":
+                    if time.time() - item["started"] > be.MAX_POLL_SECONDS:
+                        running.remove(item)
+                        rows.append(fail(row, f"timed out after {be.MAX_POLL_SECONDS}s"))
+                    continue
+                running.remove(item)
+                if state == "EXPIRED":
+                    renew_session(session, email, password, row)  # raises StopLoop if it can't
+                    running.append(item)                            # renewed: keep checking it
+                    continue
+                if state == "ERROR":
+                    rows.append(fail(row, info))
+                    continue
+
+                counts["network"] = 0
+                try:
+                    row = finish_idea(session, row, info)
+                except requests.RequestException as exc:
+                    network_trouble(row, exc)
+                    continue
+                except Exception as exc:
+                    unexpected(row, exc)
+                    continue
+                rows.append(row)
+                queue_followups(row, item["kind"], queue, avoid, counts)
+    except StopLoop:
+        for item in running:  # don't lose track of simulations still going
+            item["row"].update(status="STOPPED",
+                               error="the run stopped before this simulation finished - retry it with --try")
+            append_result(item["row"])
+        raise
+    return rows
 
 
-def failure_row(expression, rationale, round_num, error) -> dict:
-    row = {k: "" for k in RESULTS_HEADER}
-    row.update(round=round_num, timestamp=time.strftime("%Y-%m-%d %H:%M:%S"), expression=expression,
-               rationale=rationale, status="FAILED", error=str(error)[:300], submitted="NO")
-    append_result(row)
-    return row
+def queue_followups(row, kind, queue, avoid, counts):
+    """Flip or smooth a finished alpha when that could rescue it. Goes to the front of the queue."""
+    if row["status"] != "COMPLETE":
+        return
+    expression = row["expression"]
+    sharpe, fitness, turnover = (as_float(row.get(k)) for k in ("sharpe", "fitness", "turnover"))
+
+    # Auto-flip: a strongly negative Sharpe means a real signal pointing the wrong way.
+    if (kind == "idea" and sharpe is not None and sharpe <= FLIP_SHARPE_AT_OR_BELOW
+            and counts["flips"] < MAX_FLIPS_PER_ROUND and not expression.startswith("reverse(")):
+        flipped = f"reverse({expression})"
+        if flipped not in avoid:
+            counts["flips"] += 1
+            logger.info("  Sharpe %.2f points the wrong way - testing the flipped version next.", sharpe)
+            queue.appendleft((flipped, f"Auto-flip of {expression}, which scored Sharpe {sharpe:.2f}; "
+                                       f"reversed, it should score about {-sharpe:.2f}.", "flip"))
+
+    # Auto-smooth: the Sharpe is there, but trading too much is holding it back.
+    if kind != "smooth" and counts["smooths"] < MAX_SMOOTHS_PER_ROUND and needs_smoothing(sharpe, fitness, turnover):
+        smoothed = f"ts_decay_linear({expression}, {SMOOTH_DECAY_DAYS})"
+        if smoothed not in avoid:
+            counts["smooths"] += 1
+            logger.info("  Sharpe %.2f is there, but fitness %.2f at %.0f%% turnover isn't - "
+                        "testing a smoothed version next.", sharpe, fitness, turnover * 100)
+            queue.appendleft((smoothed, f"Auto-smooth of {expression}: Sharpe {sharpe:.2f} but fitness "
+                                        f"{fitness:.2f} at {turnover:.0%} turnover; decaying it over "
+                                        f"{SMOOTH_DECAY_DAYS} days should cut turnover.", "smooth"))
 
 
 def run_try(session, expressions, settings, email, password) -> list:
@@ -737,6 +1143,7 @@ def main(argv=None):
     email, password = be.get_credentials()
     if args.try_expressions:
         session = get_authenticated_session(email, password)
+        submit_held(session)
         try:
             rows = run_try(session, args.try_expressions, SETTINGS, email, password)
         except StopLoop as e:
@@ -762,15 +1169,20 @@ def main(argv=None):
 
     settings = SETTINGS
     session = get_authenticated_session(email, password)
+    submit_held(session)  # before building feedback, so the generator sees the updated outcome
     avoid = already_tried()
     feedback_text = build_feedback()
     past = len(completed_history())
     if past:
         logger.info("Starting from your best results across %d past simulations.", past)
 
-    logger.info("Starting: up to %d rounds x %d ideas (%d max simulations), %ds runtime cap, "
-                "%d submission(s)/day max.", MAX_ROUNDS, IDEAS_PER_ROUND,
-                MAX_ROUNDS * IDEAS_PER_ROUND, MAX_RUNTIME_SECONDS, MAX_SUBMISSIONS_PER_DAY)
+    logger.info("Starting: up to %d rounds x %d ideas (%d max simulations, %d at a time), %ds runtime cap, "
+                "%d submission(s)/day max.", MAX_ROUNDS, IDEAS_PER_ROUND, MAX_ROUNDS * IDEAS_PER_ROUND,
+                PARALLEL_SIMULATIONS, MAX_RUNTIME_SECONDS, MAX_SUBMISSIONS_PER_DAY)
+    type_map = field_types(fields)
+    if type_map:
+        logger.info("Variety: your %d fields span %d data types (%s).", len(type_map),
+                    len(set(type_map.values())), ", ".join(sorted(set(type_map.values()))))
 
     started = time.time()
     rounds_done = 0

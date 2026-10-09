@@ -148,34 +148,47 @@ def poll_simulation(session: requests.Session, location: str):
     """
     started = time.time()
     while time.time() - started < MAX_POLL_SECONDS:
-        resp = with_retries(lambda: session.get(location, timeout=REQUEST_TIMEOUT), "checking on a simulation")
-        if looks_like_expired_session(resp):
+        state, info = poll_once(session, location)
+        if state == "DONE":
+            return info, None
+        if state == "EXPIRED":
             return None, "EXPIRED_SESSION"
-        try:
-            data = resp.json()
-        except ValueError:
-            return None, f"non-JSON poll response ({resp.status_code}): {resp.text[:200]}"
-
-        status = data.get("status")
-        alpha_id = data.get("alpha")
-        progress = data.get("progress")
-
-        if status == "COMPLETE" or alpha_id:
-            if alpha_id:
-                return alpha_id, None
-            return None, f"marked complete but no alpha id in response: {data}"
-
-        if status == "ERROR" or (progress is None and "message" in data):
-            return None, data.get("message", data)
+        if state == "ERROR":
+            return None, info
 
         elapsed = int(time.time() - started)
-        if progress is not None:
-            logger.info("  ... %d%% (%ds elapsed)", int(progress * 100), elapsed)
+        if info is not None:
+            logger.info("  ... %d%% (%ds elapsed)", int(info * 100), elapsed)
         else:
             logger.info("  ... still running (%ds elapsed)", elapsed)
         time.sleep(POLL_INTERVAL_SECONDS)
 
     return None, f"timed out after {MAX_POLL_SECONDS}s"
+
+
+def poll_once(session: requests.Session, location: str):
+    """One look at a simulation. Returns ("DONE", alpha_id), ("RUNNING", progress or None),
+    ("ERROR", message) or ("EXPIRED", None). A dropped connection is retried a few times and
+    raises if it persists. Lets a caller keep several simulations going and check each in turn."""
+    resp = with_retries(lambda: session.get(location, timeout=REQUEST_TIMEOUT), "checking on a simulation")
+    if looks_like_expired_session(resp):
+        return "EXPIRED", None
+    try:
+        data = resp.json()
+    except ValueError:
+        return "ERROR", f"non-JSON poll response ({resp.status_code}): {resp.text[:200]}"
+
+    status = data.get("status")
+    alpha_id = data.get("alpha")
+    progress = data.get("progress")
+
+    if status == "COMPLETE" or alpha_id:
+        if alpha_id:
+            return "DONE", alpha_id
+        return "ERROR", f"marked complete but no alpha id in response: {data}"
+    if status == "ERROR" or (progress is None and "message" in data):
+        return "ERROR", data.get("message", data)
+    return "RUNNING", progress
 
 
 def fetch_alpha(session: requests.Session, alpha_id: str) -> dict:
