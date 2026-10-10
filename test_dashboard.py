@@ -11,8 +11,16 @@ from unittest.mock import MagicMock, patch
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
-os.environ.setdefault("WQ_EMAIL", "e@x.com")
-os.environ.setdefault("WQ_PASSWORD", "pw")
+# Tests never read your real .env or credentials: python-dotenv is switched off before brain_engine
+# loads, and any miner setting already in the environment is cleared, so every test sees the defaults
+# it was written for - whatever your .env sets (MAX_SUBMISSIONS_PER_DAY, GEMINI_MODEL, ...).
+import re as _re
+import dotenv as _dotenv
+_dotenv.load_dotenv = lambda *args, **kwargs: False
+for _setting in _re.findall(r'os\.environ\.get\("([A-Z0-9_]+)"',
+                            (Path(__file__).resolve().parent / "alpha_loop.py").read_text(encoding="utf-8")):
+    os.environ.pop(_setting, None)
+os.environ.update(WQ_EMAIL="e@x.com", WQ_PASSWORD="pw", GEMINI_API_KEY="fake-test-key")
 
 import alpha_loop as al
 import brain_engine as be

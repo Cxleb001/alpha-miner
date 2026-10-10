@@ -14,6 +14,11 @@ Run:
     python alpha_loop.py --try "<expression>" "<another>"
                                               # test your own expressions through the same
                                               # pipeline: simulate, check, submit if they qualify
+    python alpha_loop.py --log-dir logs       # also keep the log in logs/alpha_loop_YYYY-MM-DD.log
+                                              # (what the daily scheduled run uses)
+
+Only one run at a time: a second run started while one is going exits straight away (alpha_loop.lock),
+so a scheduled run and a manual one can never double-submit.
 
 NOTE on the LLM library: this uses google-genai (import as `from google import genai`),
 NOT google-generativeai (`import google.generativeai as genai`) - that package was
@@ -43,13 +48,14 @@ READ BEFORE YOU RUN THIS:
   alpha as ACTIVE. Anything unclear is logged as VERDICT_PENDING - confirm those with the
   dashboard's Check with BRAIN button. The submit and correlation endpoints follow community
   clients that recorded BRAIN's live traffic; BRAIN publishes no official API docs.
-- Held alphas: one that clears the bar after today's submission is used is logged as
-  QUALIFIED_NOT_SUBMITTED. Every run (--try included) starts by submitting the best held alpha,
-  highest fitness first, if today's slot is free. It re-reads each one from BRAIN first: one BRAIN
-  already lists as submitted is marked YES, one where a check now FAILs is marked NOT_SUBMITTED,
-  and the rest go through the same self-correlation pre-check. One that's too correlated is
-  marked and the next one is tried, since that doesn't use the slot. If BRAIN can't be reached
-  or the submit itself fails, the alpha stays queued for the next run.
+- Held alphas: one that clears the bar after today's submission is used is first run through BRAIN's
+  free self-correlation check - too similar to your submitted alphas, it's logged TOO_CORRELATED;
+  otherwise it's held as QUALIFIED_NOT_SUBMITTED. Every run (--try included) starts by re-checking
+  every held alpha, slot free or not, since similarity grows as you submit more: one BRAIN already
+  lists as submitted is marked YES, one where a check now FAILs is marked NOT_SUBMITTED, one that's
+  become too similar is marked TOO_CORRELATED. If today's slot is free, the best remaining one
+  (highest fitness) is submitted. If BRAIN can't be reached or the submit itself fails, the alpha stays
+  queued for the next run. Re-checking stops after HELD_CHECK_BUDGET_SECONDS (default 300) per run.
 - Auto-flip: when an alpha scores Sharpe -1.0 or worse, the loop also tests reverse(<expression>)
   right after it (up to MAX_FLIPS_PER_ROUND per round, default 3), since a strongly negative signal
   usually turns positive when flipped. Flips use extra simulations.
@@ -57,12 +63,25 @@ READ BEFORE YOU RUN THIS:
   turnover above SMOOTH_MIN_TURNOVER (default 0.2), the loop also tests
   ts_decay_linear(<expression>, 10) right after it (up to MAX_SMOOTHS_PER_ROUND per round, default 3).
   Fitness divides by turnover, so trading less can lift it over the bar.
+- Auto-repair: an alpha with Sharpe and fitness over the bar that FAILs one of BRAIN's fixable checks
+  gets up to MAX_REPAIRS_PER_ALPHA (default 2) repaired versions tested right after it, at most
+  MAX_REPAIRS_PER_ROUND (default 4) per round: CONCENTRATED_WEIGHT -> rank(...) or ts_backfill on its data
+  fields; LOW_SUB_UNIVERSE_SHARPE -> rank within subindustry, or neutralize against market-cap buckets;
+  LOW_TURNOVER -> drop the outer ts_decay_linear. Repairs follow community write-ups of BRAIN's checks,
+  and BRAIN's own result decides whether each worked. If the original is already too similar to your
+  submitted alphas, it isn't repaired (the repair would be too). Each normal run also starts by
+  re-examining up to MAX_PAST_REPAIRS (default 5) earlier near-misses whose fixes haven't been tried.
 - Variety: alphas built on the same kind of data usually come back too correlated to submit. Each
   field is labelled with its data type - BRAIN's own category from data_fields_cache.json (written by
   fetch_fields.py), or the dataset name in operators.json without it. The generator is told which types
   your submitted or queued alphas already use, and asked for VARIETY_EXTRA_IDEAS (default 4) spare
   ideas; the loop then keeps at most MAX_IDEAS_PER_TYPE (default 2) per type per round, and at most
   MAX_IDEAS_PER_CROWDED_TYPE (default 1) for types you've already submitted.
+- Formula shape: each expression is reduced to its skeleton (fields, numbers and groups stripped, any
+  ts_*/group_* operator treated alike). Shapes your submitted, queued or too-similar alphas use - or that
+  make up 30%+ of your last 60 simulations - count as overused: the generator is shown them with a list of
+  other structures from your operator list, and the loop keeps at most MAX_IDEAS_PER_CROWDED_SHAPE
+  (default 2) ideas per overused shape per round.
 - Parallel simulations: up to PARALLEL_SIMULATIONS (default 3) run at once. If BRAIN answers that too
   many are running, the loop carries on with however many it already has going. Results are still
   handled one at a time, so submissions never overlap. Set PARALLEL_SIMULATIONS=1 for the old pace.
@@ -143,11 +162,22 @@ MAX_SMOOTHS_PER_ROUND = int(os.environ.get("MAX_SMOOTHS_PER_ROUND", 3))  # caps 
 # Network resilience: one dropped connection skips that idea; this many in a row stops the run cleanly.
 MAX_NETWORK_FAILURES = int(os.environ.get("MAX_NETWORK_FAILURES", 3))
 
+# Auto-repair: a strong alpha (Sharpe and fitness over the bar) failing a fixable check gets
+# re-tested with a known fix for that check. Each repair is one extra simulation.
+MAX_REPAIRS_PER_ALPHA = int(os.environ.get("MAX_REPAIRS_PER_ALPHA", 2))
+MAX_REPAIRS_PER_ROUND = int(os.environ.get("MAX_REPAIRS_PER_ROUND", 4))
+MAX_PAST_REPAIRS = int(os.environ.get("MAX_PAST_REPAIRS", 5))  # earlier near-misses re-examined per run
+BACKFILL_DAYS = 120
+
 # Variety: alphas built on the same kind of data tend to be too correlated to submit together.
 FIELDS_CACHE_FILE = "data_fields_cache.json"  # written by fetch_fields.py - holds BRAIN's category per field
 MAX_IDEAS_PER_TYPE = int(os.environ.get("MAX_IDEAS_PER_TYPE", 2))  # per data type, per round
 MAX_IDEAS_PER_CROWDED_TYPE = int(os.environ.get("MAX_IDEAS_PER_CROWDED_TYPE", 1))  # types you've already submitted
-VARIETY_EXTRA_IDEAS = int(os.environ.get("VARIETY_EXTRA_IDEAS", 4))  # ask for spares, keep the most varied
+VARIETY_EXTRA_IDEAS = int(os.environ.get("VARIETY_EXTRA_IDEAS", 6))  # ask for spares, keep the most varied
+# Formula shape: the operators nested the same way, whatever the fields, windows or groups.
+MAX_IDEAS_PER_CROWDED_SHAPE = int(os.environ.get("MAX_IDEAS_PER_CROWDED_SHAPE", 2))  # per round
+SHAPE_LOOKBACK = 60          # recent simulations looked at to spot an overused shape
+SHAPE_CROWDED_SHARE = 0.3    # a shape making up this share of them counts as overused
 
 # Parallel simulations: BRAIN runs a few of yours at once. If it says it's busy (429), the loop
 # drops to however many were already running and keeps going.
@@ -173,6 +203,7 @@ SUBMISSION_LOG_FILE = "submissions_log.json"  # {"YYYY-MM-DD": count} - enforces
 HELD_PREFIX = "QUALIFIED_NOT_SUBMITTED"
 HELD_LABEL = f"{HELD_PREFIX} (daily cap reached)"  # cleared the bar, waiting for a free submission slot
 REPLACE_ATTEMPTS = 5  # Windows blocks swapping in the updated CSV while another program is reading it
+HELD_CHECK_BUDGET_SECONDS = int(os.environ.get("HELD_CHECK_BUDGET_SECONDS", 300))  # per run, for re-checking held alphas
 
 RESULTS_HEADER = [
     "round", "timestamp", "expression", "rationale", "status", "sharpe", "fitness",
@@ -425,27 +456,103 @@ def variety_rule(type_map: dict, crowded: Counter, n: int) -> str:
     return "\n".join(lines)
 
 
+# ---- Variety of formula shape ----
+
+def skeleton(expression: str) -> str:
+    """The formula's shape with the specifics stripped out: data fields -> F, groups -> G, numbers -> N,
+    any ts_* operator -> ts_*, any group_* operator -> group_*. Two alphas with the same skeleton are the
+    same idea with different data or windows."""
+    group_spans = list(_group_calls(expression))
+    cuts = [(s, e, "G") for s, e in group_spans]
+    cuts += [(s, e, "F") for s, e, _ in data_fields_in(expression)
+             if not any(gs <= s and e <= ge for gs, ge in group_spans)]
+    out = expression
+    for s, e, token in sorted(cuts, reverse=True):
+        out = out[:s] + token + out[e:]
+    out = _QUOTED.sub("Q", out)
+    out = re.sub(r"(?<![A-Za-z_])\d+(\.\d+)?([eE]-?\d+)?", "N", out)
+    out = re.sub(r"\bts_\w+", "ts_*", out)
+    out = re.sub(r"\bgroup_\w+", "group_*", out)
+    return re.sub(r"\s+", "", out)
+
+
+def crowded_shapes() -> dict:
+    """{skeleton: example expression} for shapes your submitted, queued or too-similar alphas use, plus
+    any shape that makes up SHAPE_CROWDED_SHARE or more of your last SHAPE_LOOKBACK simulations."""
+    if not Path(RESULTS_FILE).exists():
+        return {}
+    with open(RESULTS_FILE, encoding="utf-8", newline="") as f:
+        done = [r for r in csv.DictReader(f) if r.get("status") == "COMPLETE" and r.get("expression")]
+    shapes = {}
+    for r in done:
+        if pool_tag(r):
+            shapes[skeleton(r["expression"])] = r["expression"]
+    recent = done[-SHAPE_LOOKBACK:]
+    if len(recent) >= 10:
+        counts = Counter(skeleton(r["expression"]) for r in recent)
+        for r in recent:
+            shape = skeleton(r["expression"])
+            if counts[shape] / len(recent) >= SHAPE_CROWDED_SHARE:
+                shapes[shape] = r["expression"]
+    return shapes
+
+
+SHAPE_IDEAS = (  # (operators needed, suggestion) - only suggested if your account has those operators
+    (("rank", "divide"), "a ratio or spread of two fields, ranked: rank(divide(x, y)) or rank(x - y)"),
+    (("ts_corr", "rank"), "how two fields move together: -ts_corr(rank(x), rank(y), d)"),
+    (("ts_regression",), "what's left after regressing one field on another: ts_regression(y, x, d)"),
+    (("trade_when",), "a position that only updates when a condition holds: trade_when(condition, signal, -1)"),
+    (("ts_delta", "ts_std_dev"), "a change scaled by its own volatility: ts_delta(x, d) / ts_std_dev(x, d)"),
+    (("rank",), "a blend of two different data types: rank(x) + rank(y)"),
+    (("ts_rank",), "where today's value sits in its own history: ts_rank(x, d)"),
+    (("hump",), "turnover control with hump(x, hump=0.01) instead of ts_decay_linear"),
+    (("if_else",), "switching between two signals: if_else(condition, signal_a, signal_b)"),
+)
+
+
+def shape_rule(shapes: dict, operators) -> str:
+    if not shapes:
+        return ""
+    names = {o.get("name") for o in operators or []}
+    examples = "; ".join(list(shapes.values())[:3])
+    lines = ["SHAPE RULE - vary the formula's structure, not just its data. These shapes are already "
+             f"overused (same operators nested the same way, whatever the fields, windows or groups) - "
+             f"e.g. {examples}. At most {MAX_IDEAS_PER_CROWDED_SHAPE} ideas this round may use any one of them."]
+    ideas = [text for needed, text in SHAPE_IDEAS if not names or all(op in names for op in needed)]
+    if ideas:
+        lines.append("Other structures to try:\n" + "\n".join(f"- {text}" for text in ideas))
+    return "\n".join(lines)
+
+
 def label_fields(fields, type_map: dict) -> list:
     return [dict(f, description=f"[type: {type_map[f['name']]}] {f.get('description', '')}")
             if f.get("name") in type_map else f for f in fields]
 
 
-def pick_varied(ideas, type_map: dict, crowded: Counter, n: int) -> list:
-    """Keep up to n ideas, in Gemini's order, without going over the per-type caps."""
+def pick_varied(ideas, type_map: dict, crowded: Counter, n: int, overused_shapes=()) -> list:
+    """Keep up to n ideas, in Gemini's order, without going over the per-type caps or using an
+    overused formula shape more than MAX_IDEAS_PER_CROWDED_SHAPE times."""
     cap = per_type_cap(n, type_map)
-    used, kept, dropped = Counter(), [], []
+    used, shapes_used, kept, by_type, by_shape = Counter(), Counter(), [], 0, 0
     for expression, rationale in ideas:
         types_used = expression_types(expression, type_map)
         if any(used[t] >= (MAX_IDEAS_PER_CROWDED_TYPE if t in crowded else cap) for t in types_used):
-            dropped.append(expression)
+            by_type += 1
+            continue
+        shape = skeleton(expression)
+        if shape in overused_shapes and shapes_used[shape] >= MAX_IDEAS_PER_CROWDED_SHAPE:
+            by_shape += 1
             continue
         kept.append((expression, rationale))
         used.update(types_used)
+        shapes_used[shape] += 1
         if len(kept) == n:
             break
-    if dropped:
-        logger.info("Variety: skipped %d idea(s) leaning on data types already used enough this round.",
-                    len(dropped))
+    if by_type or by_shape:
+        logger.info("Variety: skipped %d idea(s) leaning on data types already used enough this round and "
+                    "%d repeating an overused formula shape.", by_type, by_shape)
+    if kept:
+        logger.info("This round: %d idea(s) in %d different formula shape(s).", len(kept), len(shapes_used))
     if used:
         logger.info("This round's data types: %s", ", ".join(f"{t} x{c}" for t, c in used.most_common()))
     return kept
@@ -647,10 +754,19 @@ def is_active_on_brain(session, alpha_id: str) -> bool:
     return be.fetch_alpha(session, alpha_id).get("status") == "ACTIVE"
 
 
-def try_submit(session, alpha_id: str) -> str:
-    """Pre-check self-correlation, submit, wait for the verdict. Returns the CSV 'submitted' value."""
-    corr = self_correlation_max(session, alpha_id)
-    if corr is not None and corr >= MAX_SELF_CORRELATION:
+_UNCHECKED = object()  # try_submit's default: no self-correlation reading taken yet
+
+
+def too_similar(corr) -> bool:
+    return corr is not None and corr >= MAX_SELF_CORRELATION
+
+
+def try_submit(session, alpha_id: str, corr=_UNCHECKED) -> str:
+    """Pre-check self-correlation (unless the caller just did), submit, wait for the verdict.
+    Returns the CSV 'submitted' value."""
+    if corr is _UNCHECKED:
+        corr = self_correlation_max(session, alpha_id)
+    if too_similar(corr):
         logger.info("Alpha %s clears the bar, but its self-correlation is %.2f (limit %.1f) - "
                     "not spending today's submission on it.", alpha_id, corr, MAX_SELF_CORRELATION)
         return f"TOO_CORRELATED (max {corr:.2f})"
@@ -692,6 +808,182 @@ def needs_smoothing(sharpe, fitness, turnover) -> bool:
     if sharpe < SUBMIT_MIN_SHARPE or turnover <= SMOOTH_MIN_TURNOVER:
         return False
     return fitness < SUBMIT_MIN_FITNESS or turnover > TURNOVER_MAX
+
+
+# ---- Auto-repair: strong alphas that fail one of BRAIN's fixable checks ----
+# Fixes follow community write-ups of BRAIN's checks (rank / ts_backfill for concentrated weight;
+# finer groups / no size tilt for weak sub-universe Sharpe). Each repair is one extra simulation,
+# and BRAIN's own result decides whether it worked.
+
+_QUOTED = re.compile(r"'[^']*'|\"[^\"]*\"")
+_WORD = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+COARSE_GROUPS = ("market", "sector", "industry")
+NOT_FIELDS = {"true", "false", "nan", "inf"}
+
+
+def _blank_quotes(text: str) -> str:
+    """Same length, with quoted parts (like range='0, 1, 0.1') blanked out so commas and words inside
+    them are ignored."""
+    return _QUOTED.sub(lambda m: " " * len(m.group()), text)
+
+
+def matching_paren(text: str, open_index: int) -> int:
+    depth = 0
+    plain = _blank_quotes(text)
+    for i in range(open_index, len(plain)):
+        if plain[i] == "(":
+            depth += 1
+        elif plain[i] == ")":
+            depth -= 1
+            if depth == 0:
+                return i
+    return -1
+
+
+def split_top_level(text: str) -> list:
+    """Split an argument list at its own commas, not at commas inside nested calls or quotes."""
+    plain, parts, depth, start = _blank_quotes(text), [], 0, 0
+    for i, ch in enumerate(plain):
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        elif ch == "," and depth == 0:
+            parts.append(text[start:i])
+            start = i + 1
+    parts.append(text[start:])
+    return parts
+
+
+def outer_call(expression: str):
+    """(name, args) when the whole expression is one call like ts_decay_linear(x, 10), else None."""
+    expr = expression.strip()
+    m = re.match(r"([A-Za-z_]\w*)\s*\(", expr)
+    if not m:
+        return None
+    close = matching_paren(expr, m.end() - 1)
+    if close != len(expr) - 1:
+        return None
+    return m.group(1), split_top_level(expr[m.end():close])
+
+
+def _group_calls(expression: str):
+    """(start of last argument, end of call) for every group_* call - the last argument is the group."""
+    plain = _blank_quotes(expression)
+    for m in re.finditer(r"\bgroup_\w+\s*\(", plain):
+        close = matching_paren(expression, m.end() - 1)
+        if close < 0:
+            continue
+        args = split_top_level(expression[m.end():close])
+        yield close - len(args[-1]), close
+
+
+def data_fields_in(expression: str) -> list:
+    """(start, end, name) of each data-field reference: bare words that aren't operators, keyword
+    arguments, quoted text or the group argument of a group_* call."""
+    plain = _blank_quotes(expression)
+    group_args = [(s, e) for s, e in _group_calls(expression)]
+    found = []
+    for m in _WORD.finditer(plain):
+        after = plain[m.end():].lstrip()
+        if after.startswith("(") or (after.startswith("=") and not after.startswith("==")):
+            continue
+        if m.group().lower() in NOT_FIELDS or plain[max(0, m.start() - 1)].isdigit():
+            continue
+        if any(s <= m.start() and m.end() <= e and expression[s:e].strip() == m.group() for s, e in group_args):
+            continue
+        found.append((m.start(), m.end(), m.group()))
+    return found
+
+
+def field_exists(name: str) -> bool:
+    """Whether BRAIN listed this data field for your account (data_fields_cache.json from fetch_fields.py)."""
+    try:
+        cache = json.loads(Path(FIELDS_CACHE_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return any(f.get("id") == name for f in cache.get("matrix_fields") or [] if isinstance(f, dict))
+
+
+def _wrap_in_rank(expr):
+    call = outer_call(expr)
+    if call and call[0] == "rank":
+        return None
+    return (f"rank({expr.strip()})",
+            "rank() spreads the weight evenly across stocks instead of a few big bets")
+
+
+def _backfill_fields(expr):
+    fields = data_fields_in(expr)
+    if not fields or "ts_backfill(" in expr:
+        return None
+    for start, end, name in reversed(fields):
+        expr = expr[:start] + f"ts_backfill({name}, {BACKFILL_DAYS})" + expr[end:]
+    return (expr.strip(), f"ts_backfill fills gaps in sparse data (up to {BACKFILL_DAYS} days), so more stocks "
+                          f"get a position")
+
+
+def _finer_groups(expr):
+    changed = False
+    for start, end in sorted(_group_calls(expr), reverse=True):
+        arg = expr[start:end]
+        if arg.strip() in COARSE_GROUPS:
+            expr = expr[:start] + arg[:len(arg) - len(arg.lstrip())] + "subindustry" + expr[end:]
+            changed = True
+    if not changed:
+        return None
+    return (expr.strip(), "ranking within subindustries removes the size and sector tilts that weaken it in "
+                          "the larger, more liquid stocks")
+
+
+def _size_neutral(expr):
+    if "bucket(rank(cap)" in expr or not field_exists("cap"):
+        return None
+    return (f"group_neutralize({expr.strip()}, bucket(rank(cap), range='0, 1, 0.1'))",
+            "neutralizing against market-cap buckets removes the size tilt that weakens it in the more "
+            "liquid stocks")
+
+
+def _less_smoothing(expr):
+    call = outer_call(expr)
+    if not call or call[0] != "ts_decay_linear" or not call[1][0].strip():
+        return None
+    return (call[1][0].strip(), "without the outer ts_decay_linear it trades enough to clear the 1% minimum")
+
+
+REPAIRS = {  # check name -> fixes to try, most promising first
+    "CONCENTRATED_WEIGHT": (_wrap_in_rank, _backfill_fields),
+    "LOW_SUB_UNIVERSE_SHARPE": (_finer_groups, _size_neutral),
+    "LOW_TURNOVER": (_less_smoothing,),
+}
+
+
+def repair_candidates(expression: str, failed_checks) -> list:
+    """(new expression, why) fixes for these failed checks - one per check first, then the next fix for
+    each, up to MAX_REPAIRS_PER_ALPHA. Empty if any failed check isn't one we know how to fix."""
+    failed = [c for c in dict.fromkeys(failed_checks)]
+    if not failed or any(c not in REPAIRS for c in failed):
+        return []
+    out, seen = [], {expression.strip()}
+    for depth in range(max(len(REPAIRS[c]) for c in failed)):
+        for check in failed:
+            if depth < len(REPAIRS[check]):
+                fix = REPAIRS[check][depth](expression)
+                if fix and fix[0] not in seen:
+                    seen.add(fix[0])
+                    out.append((fix[0], f"failed {check}; {fix[1]}"))
+    return out[:MAX_REPAIRS_PER_ALPHA]
+
+
+def all_repair_variants(expression: str) -> set:
+    """Every repair any fixable check could produce - lets a run skip alphas whose repairs were all tried."""
+    return {fix[0] for fixes in REPAIRS.values() for f in fixes for fix in [f(expression)] if fix}
+
+
+def strong_numbers(row) -> bool:
+    sharpe, fitness = as_float(row.get("sharpe")), as_float(row.get("fitness"))
+    return (sharpe is not None and fitness is not None
+            and sharpe >= SUBMIT_MIN_SHARPE and fitness >= SUBMIT_MIN_FITNESS)
 
 
 def qualifies(metrics: dict, checks: list) -> bool:
@@ -795,18 +1087,24 @@ def submit_held(session):
 
 
 def _submit_held(session):
+    """Re-check every held alpha with BRAIN - including its free similarity check, which grows stricter
+    as you submit more - so the queue only keeps alphas that could still be submitted. If today's slot
+    is free, the best remaining one (highest fitness) is submitted. Stops after HELD_CHECK_BUDGET_SECONDS;
+    anything not checked yet waits for the next run."""
     queue = held_candidates()
     if not queue:
         return None
-    if submissions_today() >= MAX_SUBMISSIONS_PER_DAY:
-        logger.info("%d held alpha(s) waiting, but today's submission slot is used - they stay queued "
-                    "until BRAIN's next day starts (3 AM US Eastern).", len(queue))
-        return None
-    logger.info("%d held alpha(s) waiting and today's submission slot is free - trying the best one first.",
-                len(queue))
+    slot_free = submissions_today() < MAX_SUBMISSIONS_PER_DAY
+    logger.info("%d held alpha(s) - checking they're still worth submitting. %s", len(queue),
+                "Today's submission slot is free, so the best one goes first." if slot_free else
+                "Today's slot is used, so they wait for BRAIN's next day (3 AM US Eastern).")
 
-    for row in queue:
-        if submissions_today() >= MAX_SUBMISSIONS_PER_DAY:
+    deadline = time.time() + HELD_CHECK_BUDGET_SECONDS
+    first_outcome, submitted, waiting, dropped = None, 0, 0, 0
+    for index, row in enumerate(queue):
+        if time.time() > deadline:
+            waiting += len(queue) - index
+            logger.info("Held-queue check time is up - the rest are checked next run.")
             break
         alpha_id = row["alpha_id"]
         logger.info("Held alpha %s (Sharpe %s, fitness %s): %s", alpha_id, row.get("sharpe"),
@@ -814,9 +1112,10 @@ def _submit_held(session):
         try:
             alpha = be.fetch_alpha(session, alpha_id)
         except requests.RequestException as exc:
-            logger.warning("Couldn't reach BRAIN to check held alpha %s (%s) - everything stays queued "
+            logger.warning("Couldn't reach BRAIN to check held alpha %s (%s) - the rest stay queued "
                            "for the next run.", alpha_id, type(exc).__name__)
-            return None
+            waiting += len(queue) - index
+            break
 
         if alpha.get("status") == "ACTIVE":
             logger.info("BRAIN already lists %s as submitted - marking it YES.", alpha_id)
@@ -825,6 +1124,7 @@ def _submit_held(session):
         checks = (alpha.get("is") or {}).get("checks") or []
         if not checks:
             logger.warning("BRAIN didn't return %s's checks - leaving it queued.", alpha_id)
+            waiting += 1
             continue
         metrics = be.metrics_from_alpha(alpha_id, alpha)
         if not qualifies(metrics, checks):
@@ -835,18 +1135,35 @@ def _submit_held(session):
                 logger.warning("Held alpha %s no longer qualifies on BRAIN (%s) - dropping it from the queue.",
                                alpha_id, reason)
                 mark_held(alpha_id, f"NOT_SUBMITTED (no longer qualifies: {reason})")
+                dropped += 1
             else:
                 logger.info("A check on %s isn't settled yet - leaving it queued.", alpha_id)
+                waiting += 1
             continue
 
-        outcome = try_submit(session, alpha_id)
+        corr = self_correlation_max(session, alpha_id)
+        if too_similar(corr):
+            logger.info("Held alpha %s is now too similar to your submitted alphas (self-correlation %.2f) - "
+                        "dropping it from the queue.", alpha_id, corr)
+            mark_held(alpha_id, f"TOO_CORRELATED (max {corr:.2f})")
+            dropped += 1
+            continue
+        if submissions_today() >= MAX_SUBMISSIONS_PER_DAY:
+            waiting += 1  # still a good candidate - stays queued for a free slot
+            continue
+
+        outcome = try_submit(session, alpha_id, corr=corr)
         if outcome.startswith("FAILED"):
             logger.warning("Held alpha %s stays queued - the submit didn't go through.", alpha_id)
+            waiting += 1
             continue
         mark_held(alpha_id, outcome)
-        if not outcome.startswith("TOO_CORRELATED"):
-            return outcome  # BRAIN processed it, so today's slot is used
-    return None
+        submitted += 1  # BRAIN processed it, so it used a slot
+        first_outcome = first_outcome or outcome
+
+    logger.info("Held queue: %d submitted, %d dropped (too similar or no longer qualifying), %d still waiting.",
+                submitted, dropped, waiting)
+    return first_outcome
 
 
 BUSY = "BUSY"  # BRAIN is already running as many of your simulations as it allows
@@ -903,13 +1220,22 @@ def finish_idea(session, row, alpha_id) -> dict:
     row.update(status="COMPLETE", alpha_id=alpha_id, **metrics)
     # Kept in memory for the next round's feedback; the CSV doesn't store it.
     row["failing_checks"] = ", ".join(f"{c.get('name')}:{c.get('result')}" for c in checks if c.get("result") != "PASS")
+    row["failed_checks"] = [str(c.get("name")) for c in checks if c.get("result") == "FAIL"]
 
     if qualifies(metrics, checks):
         if submissions_today() >= MAX_SUBMISSIONS_PER_DAY:
-            logger.warning("Alpha %s qualifies but today's submission limit (%d) is used - holding it. "
-                           "The first run with a free slot submits held alphas first.",
-                           alpha_id, MAX_SUBMISSIONS_PER_DAY)
-            row["submitted"] = HELD_LABEL
+            # Only hold it if it could actually be submitted later: BRAIN's similarity check is free.
+            corr = self_correlation_max(session, alpha_id)
+            if too_similar(corr):
+                logger.info("Alpha %s clears the bar, but it's too similar to your submitted alphas "
+                            "(self-correlation %.2f, limit %.1f) - not holding it.",
+                            alpha_id, corr, MAX_SELF_CORRELATION)
+                row["submitted"] = f"TOO_CORRELATED (max {corr:.2f})"
+            else:
+                logger.warning("Alpha %s qualifies%s, but today's submission limit (%d) is used - holding "
+                               "it. The first run with a free slot submits held alphas first.", alpha_id,
+                               "" if corr is None else f" (self-correlation {corr:.2f})", MAX_SUBMISSIONS_PER_DAY)
+                row["submitted"] = HELD_LABEL
         else:
             row["submitted"] = try_submit(session, alpha_id)
 
@@ -924,23 +1250,24 @@ def run_round(session, client, operators, fields, settings, email, password, rou
     logger.info("=== Round %d: generating %d ideas ===", round_num, IDEAS_PER_ROUND)
     type_map = field_types(fields)
     crowded = crowded_types(type_map)
-    rule = variety_rule(type_map, crowded, IDEAS_PER_ROUND)
-    asked = IDEAS_PER_ROUND + (VARIETY_EXTRA_IDEAS if rule else 0)
-    prompt_text = f"{feedback_text}\n\n{rule}" if rule else feedback_text
+    overused = crowded_shapes()
+    rules = [r for r in (variety_rule(type_map, crowded, IDEAS_PER_ROUND), shape_rule(overused, operators)) if r]
+    asked = IDEAS_PER_ROUND + (VARIETY_EXTRA_IDEAS if rules else 0)
+    prompt_text = "\n\n".join([feedback_text, *rules])
     try:
         ideas = generate_with_fallback(client, operators, label_fields(fields, type_map), settings,
                                        prompt_text, avoid, asked)
     except Exception as e:
         raise GenerationFailed(short_error(e)) from e
 
-    if rule:
+    if rules:
         fresh_ideas = []
         for expression, rationale in ideas:
             if expression in avoid:
                 logger.info("Skipping duplicate: %s", expression)
             else:
                 fresh_ideas.append((expression, rationale))
-        ideas = pick_varied(fresh_ideas, type_map, crowded, IDEAS_PER_ROUND)
+        ideas = pick_varied(fresh_ideas, type_map, crowded, IDEAS_PER_ROUND, overused)
 
     return process_queue(session, [(e, r, "idea") for e, r in ideas], settings, email, password, round_num, avoid)
 
@@ -953,7 +1280,7 @@ def process_queue(session, items, settings, email, password, round_num, avoid) -
     queue = deque(items)
     running = []  # each: {"row", "kind", "location", "started"}
     rows = []
-    counts = {"flips": 0, "smooths": 0, "network": 0}
+    counts = {"flips": 0, "smooths": 0, "repairs": 0, "network": 0}
     limit = PARALLEL_SIMULATIONS
     busy_since = None
     last_note = time.time()
@@ -1074,7 +1401,7 @@ def process_queue(session, items, settings, email, password, round_num, avoid) -
                     unexpected(row, exc)
                     continue
                 rows.append(row)
-                queue_followups(row, item["kind"], queue, avoid, counts)
+                queue_followups(session, row, item["kind"], queue, avoid, counts)
     except StopLoop:
         for item in running:  # don't lose track of simulations still going
             item["row"].update(status="STOPPED",
@@ -1084,8 +1411,8 @@ def process_queue(session, items, settings, email, password, round_num, avoid) -
     return rows
 
 
-def queue_followups(row, kind, queue, avoid, counts):
-    """Flip or smooth a finished alpha when that could rescue it. Goes to the front of the queue."""
+def queue_followups(session, row, kind, queue, avoid, counts):
+    """Flip, smooth or repair a finished alpha when that could rescue it. Goes to the front of the queue."""
     if row["status"] != "COMPLETE":
         return
     expression = row["expression"]
@@ -1112,6 +1439,73 @@ def queue_followups(row, kind, queue, avoid, counts):
                                         f"{fitness:.2f} at {turnover:.0%} turnover; decaying it over "
                                         f"{SMOOTH_DECAY_DAYS} days should cut turnover.", "smooth"))
 
+    # Auto-repair: strong numbers held back by one of BRAIN's fixable checks.
+    if kind != "repair" and row.get("submitted", "NO") == "NO" and strong_numbers(row):
+        fixes = [f for f in repair_candidates(expression, row.get("failed_checks") or []) if f[0] not in avoid]
+        room = MAX_REPAIRS_PER_ROUND - counts["repairs"]
+        if fixes and room > 0 and worth_repairing(session, row):
+            counts["repairs"] += min(room, len(fixes))
+            for new_expression, why in reversed(fixes[:room]):  # reversed: appendleft keeps their order
+                queue.appendleft((new_expression, f"Auto-repair of {expression}: {why}.", "repair"))
+
+
+def worth_repairing(session, row) -> bool:
+    """A repair is a close copy of the original, so if the original is already too similar to your
+    submitted alphas, the repair would be too. BRAIN's similarity check is free; asking first saves
+    the simulations."""
+    corr = self_correlation_max(session, row["alpha_id"])
+    if too_similar(corr):
+        logger.info("  %s fails %s, but it's too similar to your submitted alphas (self-correlation %.2f) - "
+                    "not repairing it.", row["expression"], ", ".join(row.get("failed_checks") or []), corr)
+        return False
+    logger.info("  Strong numbers but failed %s - testing a repaired version next.",
+                ", ".join(row.get("failed_checks") or []))
+    return True
+
+
+def near_miss_rows() -> list:
+    """Earlier alphas with Sharpe and fitness over the bar that weren't submitted - most recent first."""
+    if not Path(RESULTS_FILE).exists():
+        return []
+    with open(RESULTS_FILE, encoding="utf-8", newline="") as f:
+        rows = [r for r in csv.DictReader(f)
+                if r.get("status") == "COMPLETE" and r.get("alpha_id") and strong_numbers(r)
+                and (r.get("submitted") or "NO").strip() == "NO"]
+    unique = {r["alpha_id"]: r for r in rows}  # one row per alpha
+    return sorted(unique.values(), key=lambda r: r.get("timestamp") or "", reverse=True)
+
+
+def repair_past_near_misses(session, settings, email, password, avoid) -> list:
+    """Start-of-run step: re-examine recent near-misses (at most MAX_PAST_REPAIRS whose repairs haven't
+    all been tried), ask BRAIN which check each failed, and test the fixes for the fixable ones."""
+    items, looked = [], 0
+    for row in near_miss_rows():
+        if looked >= MAX_PAST_REPAIRS:
+            break
+        if all_repair_variants(row["expression"]) <= avoid:
+            continue  # every possible fix was already tried
+        looked += 1
+        try:
+            alpha = be.fetch_alpha(session, row["alpha_id"])
+        except requests.RequestException as exc:
+            logger.warning("Couldn't reach BRAIN to look at earlier near-misses (%s) - skipping repairs this run.",
+                           type(exc).__name__)
+            break
+        checks = (alpha.get("is") or {}).get("checks") or []
+        row["failed_checks"] = [str(c.get("name")) for c in checks if c.get("result") == "FAIL"]
+        fixes = [f for f in repair_candidates(row["expression"], row["failed_checks"]) if f[0] not in avoid]
+        if not fixes:
+            continue
+        logger.info("Earlier near-miss %s (Sharpe %s, fitness %s):", row["expression"], row.get("sharpe"),
+                    row.get("fitness"))
+        if not worth_repairing(session, row):
+            continue
+        items.extend((e, f"Auto-repair of {row['expression']}: {why}.", "repair") for e, why in fixes)
+    if not items:
+        return []
+    logger.info("=== Repairing earlier near-misses: %d repaired version(s) to test ===", len(items))
+    return process_queue(session, items, settings, email, password, "repair", avoid)
+
 
 def run_try(session, expressions, settings, email, password) -> list:
     """--try: your own expressions through the full pipeline, flips and smooths included.
@@ -1133,13 +1527,66 @@ def run_try(session, expressions, settings, email, password) -> list:
     return process_queue(session, items, settings, email, password, "try", avoid)
 
 
+LOCK_FILE = "alpha_loop.lock"
+
+
+def acquire_run_lock(path=LOCK_FILE):
+    """Hold an operating-system lock on a small file for the whole run, so a scheduled run and a manual
+    run never overlap - they'd share the results file and the daily submission count. The OS drops the
+    lock when the process ends, even after a crash. Returns the open file (keep it open), or None if
+    another run holds it."""
+    handle = open(path, "a+", encoding="utf-8")
+    try:
+        if os.name == "nt":
+            import msvcrt
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.close()
+        return None
+    return handle
+
+
+def add_log_file(log_dir) -> logging.Handler:
+    """Also write this run's log to <log_dir>/alpha_loop_YYYY-MM-DD.log (UTF-8, appended), for runs
+    nobody is watching, such as the daily scheduled one."""
+    Path(log_dir).mkdir(parents=True, exist_ok=True)
+    handler = logging.FileHandler(Path(log_dir) / f"alpha_loop_{time.strftime('%Y-%m-%d')}.log", encoding="utf-8")
+    handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+    logging.getLogger().addHandler(handler)
+    return handler
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Generate, test and submit WorldQuant BRAIN alphas.")
     parser.add_argument("--try", dest="try_expressions", nargs="+", metavar="EXPRESSION",
                         help="simulate these exact expressions (and submit any that qualify) instead of "
                              "asking Gemini for ideas; wrap each one in double quotes")
+    parser.add_argument("--log-dir", metavar="FOLDER",
+                        help="also write the log to FOLDER/alpha_loop_YYYY-MM-DD.log (for scheduled runs)")
     args = parser.parse_args(argv)
 
+    log_file = add_log_file(args.log_dir) if args.log_dir else None
+    try:
+        lock = acquire_run_lock()
+        if lock is None:
+            logger.error("Another alpha_loop run is still going (it holds %s) - not starting a second one. "
+                         "Try again once it prints Done.", LOCK_FILE)
+            return
+        try:
+            run(args)
+        finally:
+            lock.close()
+    finally:
+        if log_file:
+            logging.getLogger().removeHandler(log_file)
+            log_file.close()
+
+
+def run(args):
     email, password = be.get_credentials()
     if args.try_expressions:
         session = get_authenticated_session(email, password)
@@ -1171,6 +1618,13 @@ def main(argv=None):
     session = get_authenticated_session(email, password)
     submit_held(session)  # before building feedback, so the generator sees the updated outcome
     avoid = already_tried()
+    try:
+        repair_past_near_misses(session, settings, email, password, avoid)
+    except StopLoop as e:
+        logger.error("Stopping: %s", e)
+        return
+    except Exception:
+        logger.exception("Repairing earlier near-misses hit an unexpected problem - skipping it this run.")
     feedback_text = build_feedback()
     past = len(completed_history())
     if past:

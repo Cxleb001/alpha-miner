@@ -7,9 +7,16 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.dirname(__file__))
-os.environ.setdefault("WQ_EMAIL", "e@x.com")
-os.environ.setdefault("WQ_PASSWORD", "pw")
-os.environ.setdefault("GEMINI_API_KEY", "fake-test-key")
+# Tests never read your real .env or credentials: python-dotenv is switched off before brain_engine
+# loads, and any miner setting already in the environment is cleared, so every test sees the defaults
+# it was written for - whatever your .env sets (MAX_SUBMISSIONS_PER_DAY, GEMINI_MODEL, ...).
+import re as _re
+import dotenv as _dotenv
+_dotenv.load_dotenv = lambda *args, **kwargs: False
+for _setting in _re.findall(r'os\.environ\.get\("([A-Z0-9_]+)"',
+                            (Path(__file__).resolve().parent / "alpha_loop.py").read_text(encoding="utf-8")):
+    os.environ.pop(_setting, None)
+os.environ.update(WQ_EMAIL="e@x.com", WQ_PASSWORD="pw", GEMINI_API_KEY="fake-test-key")
 
 import alpha_loop as al
 import brain_engine as be
@@ -188,6 +195,7 @@ def test_run_round_respects_daily_submission_cap(tmp_path):
             fake_response(200, {"status": "COMPLETE", "alpha": "aid1"}),
             fake_response(200, {"is": {"sharpe": 2.0, "fitness": 1.5, "turnover": 0.1,
                                         "checks": [{"name": "X", "result": "PASS"}]}}),
+            fake_response(200, {"max": 0.41}, text='{"max": 0.41}'),   # free similarity check before holding
         ]
         with patch("time.sleep", return_value=None):
             rows = al.run_round(session, client, [], [], {"region": "USA", "universe": "TOP3000", "delay": 1},
@@ -1006,8 +1014,9 @@ def test_held_alphas_wait_when_todays_slot_is_used(tmp_path):
         al.record_submission()
         brain = FakeBrain({"h1": alpha_json()})
         assert run_held(brain) is None
-        assert not brain.session.get.called and not brain.session.post.called   # BRAIN not even asked
-        assert submitted_value("h1") == al.HELD_LABEL
+        assert not brain.session.post.called                     # checked, never submitted
+        assert submitted_value("h1") == al.HELD_LABEL             # still a good candidate: stays queued
+        assert al.submissions_today() == 1
     in_tmp(tmp_path, run)
 
 
@@ -1151,17 +1160,90 @@ def test_normal_run_submits_held_alpha_before_asking_gemini(tmp_path):
     in_tmp(tmp_path, run)
 
 
+# ---- Similarity checked before holding; held queue re-checked every run ----
+
+def test_too_similar_alpha_is_not_held(tmp_path):
+    def run():
+        al.record_submission()                                    # today's slot already used
+        brain = FakeBrain({"a1": alpha_json()}, corr=0.85)
+        rows = run_one_idea(brain)
+        assert rows[0]["submitted"] == "TOO_CORRELATED (max 0.85)"
+        assert al.held_candidates() == []                         # never enters the queue
+        assert not any(c.args[0].endswith("/submit") for c in brain.session.post.call_args_list)
+    in_tmp(tmp_path, run)
+
+
+def test_different_enough_alpha_is_held(tmp_path):
+    def run():
+        al.record_submission()
+        brain = FakeBrain({"a1": alpha_json()}, corr=0.31)
+        rows = run_one_idea(brain)
+        assert rows[0]["submitted"] == al.HELD_LABEL
+        assert [r["alpha_id"] for r in al.held_candidates()] == ["a1"]
+    in_tmp(tmp_path, run)
+
+
+def test_unreadable_similarity_still_holds(tmp_path):
+    def run():
+        al.record_submission()
+        brain = FakeBrain({"a1": alpha_json()}, corr={"a1": None})  # BRAIN gives no number
+        rows = run_one_idea(brain)
+        assert rows[0]["submitted"] == al.HELD_LABEL              # checked again when its turn comes
+    in_tmp(tmp_path, run)
+
+
+def test_held_queue_drops_too_similar_even_when_slot_used(tmp_path):
+    def run():
+        al.append_result(held_row("dup", 1.5))
+        al.append_result(held_row("fresh", 1.2))
+        al.record_submission()
+        brain = FakeBrain({"dup": alpha_json(), "fresh": alpha_json()}, corr={"dup": 0.92, "fresh": 0.22})
+        assert run_held(brain) is None
+        assert submitted_value("dup") == "TOO_CORRELATED (max 0.92)"
+        assert submitted_value("fresh") == al.HELD_LABEL
+        assert submit_posts(brain) == []
+        assert [r["alpha_id"] for r in al.held_candidates()] == ["fresh"]
+    in_tmp(tmp_path, run)
+
+
+def test_held_queue_fills_two_slots_best_first(tmp_path):
+    def run():
+        for alpha_id, fitness in (("third", 1.1), ("best", 1.6), ("second", 1.4)):
+            al.append_result(held_row(alpha_id, fitness))
+        brain = FakeBrain({a: alpha_json() for a in ("third", "best", "second")})
+        brain.submit_polls = -10  # skip FakeBrain's one 'still working' reply per submit
+        with patch.object(al, "MAX_SUBMISSIONS_PER_DAY", 2):
+            assert run_held(brain) == "YES"
+            assert al.submissions_today() == 2
+        assert submit_posts(brain) == ["best", "second"]
+        assert submitted_value("third") == al.HELD_LABEL
+    in_tmp(tmp_path, run)
+
+
+def test_held_queue_stops_when_its_time_is_up(tmp_path):
+    def run():
+        al.append_result(held_row("h1", 1.3))
+        brain = FakeBrain({"h1": alpha_json()})
+        with patch.object(al, "HELD_CHECK_BUDGET_SECONDS", -1):
+            assert run_held(brain) is None
+        assert not brain.session.get.called and submitted_value("h1") == al.HELD_LABEL
+    in_tmp(tmp_path, run)
+
+
 # ---- Parallel simulations ----
 
 class SlowBrain:
     """Simulations that take a few checks to finish, with BRAIN's limit on how many run at once.
     Each expression's result is fixed in advance, so mixed-up results would show."""
-    def __init__(self, results, polls=None, limit=3, busy_first=0, expire_on=None, renew_ok=True):
+    def __init__(self, results, polls=None, limit=3, busy_first=0, expire_on=None, renew_ok=True,
+                 corr=0.3, existing=None):
         self.results = results              # {expression: alpha json}
+        self.corr = corr                    # similarity reading: a number, or {alpha_id: number}
         self.polls = polls or {}            # {expression: checks needed before it's done} (default 1)
         self.limit, self.busy_first = limit, busy_first
         self.expire_on, self.renew_ok = expire_on, renew_ok
-        self.running, self.started, self.peak, self.sim, self.alpha_of = {}, [], 0, 0, {}
+        self.running, self.started, self.peak, self.sim = {}, [], 0, 0
+        self.alpha_of = dict(existing or {})  # {alpha_id: expression}, incl. alphas from earlier runs
         self.session = MagicMock()
         self.session.get.side_effect = self.get
         self.session.post.side_effect = self.post
@@ -1183,6 +1265,10 @@ class SlowBrain:
         raise AssertionError(f"unexpected POST {url}")
 
     def get(self, url, **kw):
+        if url.endswith("/correlations/self"):
+            alpha_id = url.split("/")[-3]
+            corr = self.corr.get(alpha_id, 0.3) if isinstance(self.corr, dict) else self.corr
+            return fake_response(200, {"max": corr}, text=json.dumps({"max": corr}))
         if url.startswith("sim-"):
             expression, left = self.running[url]
             if expression == self.expire_on:
@@ -1369,7 +1455,7 @@ def test_round_prompt_steers_away_from_submitted_data(tmp_path):
         client = MagicMock()
         client.models.generate_content.return_value = fake_gemini_response(returned)
         brain = SlowBrain({e["expression"]: calm() for e in returned})
-        with patch("time.sleep"):
+        with patch("time.sleep"), patch.object(al, "MAX_IDEAS_PER_CROWDED_SHAPE", 99):  # data types only here
             rows = al.run_round(brain.session, client, [], FIELDS, SETTINGS, "e@x.com", "pw", 1,
                                 al.build_feedback(), set())
         prompt = client.models.generate_content.call_args.kwargs["contents"]
@@ -1395,6 +1481,246 @@ def test_no_variety_rule_without_data_types(tmp_path):
                          "e@x.com", "pw", 1, "round 1", set())
         prompt = client.models.generate_content.call_args.kwargs["contents"]
         assert "VARIETY RULE" not in prompt and f"Propose {al.IDEAS_PER_ROUND} NEW" in prompt
+    in_tmp(tmp_path, run)
+
+
+# ---- Auto-repair of strong alphas that fail a fixable check ----
+
+DIVIDEND = "ts_decay_linear(group_rank(ts_delta(dividend, 180), market), 20)"
+CW_FAIL = [{"name": "LOW_SHARPE", "result": "PASS"}, {"name": "LOW_FITNESS", "result": "PASS"},
+           {"name": "CONCENTRATED_WEIGHT", "result": "FAIL"}, {"name": "SELF_CORRELATION", "result": "PENDING"}]
+SUB_FAIL = [{"name": "LOW_SUB_UNIVERSE_SHARPE", "result": "FAIL"}, {"name": "SELF_CORRELATION", "result": "PENDING"}]
+RANKED = f"rank({DIVIDEND})"
+BACKFILLED = "ts_decay_linear(group_rank(ts_delta(ts_backfill(dividend, 120), 180), market), 20)"
+FINER = "ts_decay_linear(group_rank(ts_delta(dividend, 180), subindustry), 20)"
+
+
+def near_miss(checks=None):
+    return alpha_json(sharpe=1.35, fitness=1.34, turnover=0.13, checks=CW_FAIL if checks is None else checks)
+
+
+def test_strong_alpha_failing_a_fixable_check_is_repaired_right_after(tmp_path):
+    def run():
+        brain = SlowBrain({DIVIDEND: near_miss(), RANKED: calm(), BACKFILLED: calm(), "rank(b)": calm()})
+        rows = run_queue(brain, [DIVIDEND, "rank(b)"], parallel=1)
+        assert brain.started == [DIVIDEND, RANKED, BACKFILLED, "rank(b)"]
+        repair = next(r for r in rows if r["expression"] == RANKED)
+        assert repair["rationale"].startswith(f"Auto-repair of {DIVIDEND}: failed CONCENTRATED_WEIGHT; rank()")
+    in_tmp(tmp_path, run)
+
+
+def test_a_repair_that_passes_is_submitted(tmp_path):
+    def run():
+        brain = SlowBrain({DIVIDEND: near_miss(SUB_FAIL), FINER: alpha_json(sharpe=1.5, fitness=1.3, turnover=0.12)})
+        brain.session.post.side_effect = lambda url, **kw: (
+            fake_response(201, {}, headers={}) if url.endswith("/submit") else brain.post(url, **kw))
+        with patch.object(al, "submit_alpha", return_value=("YES", None)), \
+             patch.object(al, "is_active_on_brain", return_value=True):
+            rows = run_queue(brain, [DIVIDEND], parallel=1)
+        assert {r["expression"]: r["submitted"] for r in rows} == {DIVIDEND: "NO", FINER: "YES"}
+    in_tmp(tmp_path, run)
+
+
+def test_no_repair_when_the_original_is_too_similar(tmp_path):
+    def run():
+        brain = SlowBrain({DIVIDEND: near_miss()}, corr=0.88)
+        rows = run_queue(brain, [DIVIDEND], parallel=1)
+        assert brain.started == [DIVIDEND] and len(rows) == 1
+    in_tmp(tmp_path, run)
+
+
+def test_no_repair_for_checks_we_cant_fix_or_weak_numbers(tmp_path):
+    def run():
+        unfixable = [{"name": "MATCHES_COMPETITION", "result": "FAIL"}] + CW_FAIL
+        weak = alpha_json(sharpe=1.0, fitness=0.6, turnover=0.13, checks=CW_FAIL)
+        brain = SlowBrain({"rank(a)": near_miss(unfixable), "rank(b)": weak})
+        run_queue(brain, ["rank(a)", "rank(b)"], parallel=1)
+        assert brain.started == ["rank(a)", "rank(b)"]
+    in_tmp(tmp_path, run)
+
+
+def test_repairs_are_not_repaired_again_and_are_capped(tmp_path):
+    def run():
+        exprs = [f"group_rank(ts_delta(dividend, {d}), market)" for d in (30, 60, 90)]
+        results = {e: near_miss() for e in exprs}
+        for e in exprs:   # every repair fails the same check again
+            results[f"rank({e})"] = near_miss()
+            results[e.replace("dividend", "ts_backfill(dividend, 120)")] = near_miss()
+        brain = SlowBrain(results)
+        rows = run_queue(brain, exprs, parallel=1)
+        repairs = [r for r in rows if r["rationale"].startswith("Auto-repair")]
+        assert len(repairs) == al.MAX_REPAIRS_PER_ROUND == 4
+        assert not any(r["rationale"].startswith("Auto-repair of rank(") for r in repairs)
+    in_tmp(tmp_path, run)
+
+
+def test_earlier_near_miss_is_repaired_at_the_start_of_a_run(tmp_path):
+    def run():
+        _write_operators()
+        al.append_result(dict(_history_row(DIVIDEND, 1.35, 1.34, 0.1349), alpha_id="div", submitted="NO",
+                              timestamp="2026-10-10 12:14:01"))
+        brain = SlowBrain({DIVIDEND: near_miss(), RANKED: calm(), BACKFILLED: calm(), "rank(close)": calm()},
+                          existing={"div": DIVIDEND})
+        gen = MagicMock(return_value=[("rank(close)", "r")])
+        with patch.object(al, "MAX_ROUNDS", 1), patch.object(al, "generate_with_fallback", gen), \
+             patch.object(al, "get_authenticated_session", return_value=brain.session), \
+             patch("google.genai.Client"), patch("time.sleep"):
+            al.main([])
+        assert brain.started[:2] == [RANKED, BACKFILLED]            # repairs before Gemini's ideas
+        assert {r["expression"]: r["round"] for r in csv_rows()}[RANKED] == "repair"
+        assert "rank(close)" in brain.started
+    in_tmp(tmp_path, run)
+
+
+def test_earlier_near_misses_are_only_looked_at_until_every_fix_was_tried(tmp_path):
+    def run():
+        al.append_result(dict(_history_row(DIVIDEND, 1.35, 1.34, 0.13), alpha_id="div", submitted="NO"))
+        brain = SlowBrain({}, existing={"div": DIVIDEND})
+        tried = set(al.all_repair_variants(DIVIDEND))
+        with patch("time.sleep"):
+            assert al.repair_past_near_misses(brain.session, SETTINGS, "e@x.com", "pw", tried) == []
+        assert not brain.session.get.called                        # nothing left to try: BRAIN not asked
+    in_tmp(tmp_path, run)
+
+
+def test_near_miss_rows_skip_submitted_held_and_weak(tmp_path):
+    def run():
+        for alpha_id, submitted, sharpe, fitness in [("nm", "NO", 1.35, 1.34), ("sub", "YES", 1.6, 1.3),
+                                                     ("held", al.HELD_LABEL, 1.5, 1.2), ("weak", "NO", 1.1, 0.7)]:
+            al.append_result(dict(_history_row(f"rank({alpha_id})", sharpe, fitness, 0.1),
+                                  alpha_id=alpha_id, submitted=submitted))
+        assert [r["alpha_id"] for r in al.near_miss_rows()] == ["nm"]
+    in_tmp(tmp_path, run)
+
+
+def test_repair_helpers_read_expressions_carefully():
+    expr = "rank(ts_regression(returns, rel_ret_comp, 60, lag=0, rettype=0)) * 1e-3"
+    assert [n for _, _, n in al.data_fields_in(expr)] == ["returns", "rel_ret_comp"]
+    grouped = "group_neutralize(rank(-returns), bucket(rank(cap), range='0, 1, 0.1'))"
+    assert [n for _, _, n in al.data_fields_in(grouped)] == ["returns", "cap"]
+    assert al.split_top_level("a, f(b, c), 'x, y'") == ["a", " f(b, c)", " 'x, y'"]
+    assert al.outer_call("rank(x) + 1") is None and al.outer_call("rank(x)") == ("rank", ["x"])
+    assert al.repair_candidates(DIVIDEND, ["CONCENTRATED_WEIGHT", "LOW_SUB_UNIVERSE_SHARPE"]) [1][0] == FINER
+    assert al.repair_candidates(DIVIDEND, ["SELF_CORRELATION"]) == []
+
+
+# ---- Variety of formula shape ----
+
+TEMPLATE = [  # the shape every submitted alpha so far shares
+    "ts_decay_linear(group_rank(ts_zscore(rel_ret_all, 60), sector), 10)",
+    "ts_decay_linear(group_rank(ts_delta(dividend, 180), market), 20)",
+    "ts_decay_linear(group_rank(ts_av_diff(unsystematic_risk_last_360_days, 60), subindustry), 10)",
+]
+
+
+def test_skeleton_ignores_data_windows_groups_and_which_ts_operator():
+    assert {al.skeleton(e) for e in TEMPLATE} == {"ts_*(group_*(ts_*(F,N),G),N)"}
+    assert al.skeleton("rank(ts_regression(returns, rel_ret_comp, 60, lag=0, rettype=0))") == \
+        "rank(ts_*(F,F,N,lag=N,rettype=N))"
+    assert al.skeleton("group_neutralize(rank(-returns), bucket(rank(cap), range='0, 1, 0.1'))") == \
+        "group_*(rank(-F),G)"
+    assert al.skeleton("vwap/close") == "F/F"
+    assert al.skeleton(TEMPLATE[0]) != al.skeleton(f"ts_decay_linear({TEMPLATE[0]}, 10)")
+
+
+def test_crowded_shapes_from_the_pool_and_from_recent_history(tmp_path):
+    def run():
+        assert al.crowded_shapes() == {}
+        al.append_result(dict(_history_row(TEMPLATE[0], 1.86, 1.71, 0.13), submitted="YES"))
+        assert list(al.crowded_shapes()) == ["ts_*(group_*(ts_*(F,N),G),N)"]
+        for i in range(12):   # a run of one other shape: 12 of 13 recent simulations
+            al.append_result(_history_row(f"rank(field_{i})", 0.4, 0.2, 0.1))
+        assert set(al.crowded_shapes()) == {"ts_*(group_*(ts_*(F,N),G),N)", "rank(F)"}
+    in_tmp(tmp_path, run)
+
+
+def test_round_caps_the_overused_shape_and_suggests_others(tmp_path):
+    def run():
+        al.append_result(dict(_history_row(TEMPLATE[0], 1.86, 1.71, 0.13), submitted="YES"))
+        returned = [{"expression": f"ts_decay_linear(group_rank(ts_delta(field_{i}, 30), sector), 10)",
+                     "rationale": "r"} for i in range(5)] + \
+                   [{"expression": "rank(divide(sales, debt))", "rationale": "r"},
+                    {"expression": "-ts_corr(rank(close), rank(volume), 20)", "rationale": "r"}]
+        client = MagicMock()
+        client.models.generate_content.return_value = fake_gemini_response(returned)
+        brain = SlowBrain({e["expression"]: calm() for e in returned})
+        operators = [{"name": n, "usage": "u"} for n in ("rank", "divide", "ts_corr", "ts_delta", "group_rank",
+                                                         "ts_decay_linear")]
+        with patch("time.sleep"):
+            rows = al.run_round(brain.session, client, operators, [], SETTINGS, "e@x.com", "pw", 1,
+                                al.build_feedback(), set())
+        prompt = client.models.generate_content.call_args.kwargs["contents"]
+        assert "SHAPE RULE" in prompt and TEMPLATE[0] in prompt
+        assert "rank(divide(x, y))" in prompt and "-ts_corr(rank(x), rank(y), d)" in prompt
+        assert "ts_regression(y, x, d)" not in prompt          # operator not on this account's list
+        assert f"Propose {al.IDEAS_PER_ROUND + al.VARIETY_EXTRA_IDEAS} NEW" in prompt
+        shapes = Counter(al.skeleton(r["expression"]) for r in rows)
+        assert shapes["ts_*(group_*(ts_*(F,N),G),N)"] == al.MAX_IDEAS_PER_CROWDED_SHAPE == 2
+        assert len(rows) == 4                                   # 2 of the template + the 2 new shapes
+    in_tmp(tmp_path, run)
+
+
+def test_no_shape_rule_without_an_overused_shape(tmp_path):
+    def run():
+        client = MagicMock()
+        client.models.generate_content.return_value = fake_gemini_response(ONE_IDEA)
+        brain = SlowBrain({"rank(close)": calm()})
+        with patch("time.sleep"):
+            al.run_round(brain.session, client, [], [], SETTINGS, "e@x.com", "pw", 1, "round 1", set())
+        assert "SHAPE RULE" not in client.models.generate_content.call_args.kwargs["contents"]
+    in_tmp(tmp_path, run)
+
+
+# ---- Daily scheduled run: one run at a time, log to a file ----
+
+def test_only_one_run_at_a_time(tmp_path):
+    def run():
+        first = al.acquire_run_lock()
+        assert first is not None
+        assert al.acquire_run_lock() is None          # a second run can't get it
+        first.close()                                 # the first run ends (or crashes)
+        again = al.acquire_run_lock()
+        assert again is not None
+        again.close()
+    in_tmp(tmp_path, run)
+
+
+def test_a_second_run_exits_without_touching_brain(tmp_path):
+    def run():
+        held = al.acquire_run_lock()
+        try:
+            with patch.object(al, "get_authenticated_session", side_effect=AssertionError("must not log in")):
+                al.main(["--try", "rank(close)"])
+        finally:
+            held.close()
+        assert not Path(al.RESULTS_FILE).exists()
+    in_tmp(tmp_path, run)
+
+
+def test_windows_lock_uses_msvcrt(tmp_path):
+    def run():
+        fake = MagicMock()
+        fake.LK_NBLCK = 2
+        with patch.dict(sys.modules, {"msvcrt": fake}), patch.object(al.os, "name", "nt"):
+            handle = al.acquire_run_lock()
+            fake.locking.assert_called_once_with(handle.fileno(), 2, 1)
+            handle.close()
+            fake.locking.side_effect = OSError(13, "Permission denied")  # another run holds it
+            assert al.acquire_run_lock() is None
+    in_tmp(tmp_path, run)
+
+
+def test_log_dir_keeps_a_dated_utf8_log(tmp_path):
+    def run():
+        import logging, time as _time
+        handlers_before = list(logging.getLogger().handlers)
+        brain = FakeBrain({"a": calm()})
+        with patch.object(al, "get_authenticated_session", return_value=brain.session), patch("time.sleep"):
+            al.main(["--try", "rank(close)", "--log-dir", "logs"])
+        log = Path("logs") / f"alpha_loop_{_time.strftime('%Y-%m-%d')}.log"
+        text = log.read_text(encoding="utf-8")
+        assert "Trying 1 expression(s) you gave." in text and "Done: 1 simulation(s)" in text
+        assert logging.getLogger().handlers == handlers_before    # file handler removed afterwards
     in_tmp(tmp_path, run)
 
 

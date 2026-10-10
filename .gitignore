@@ -14,3 +14,7 @@ __pycache__/
 *.pyo
 .pytest_cache/data_fields_cache.json
 operators.json.bak
+
+logs/
+alpha_loop.lock
+*.tmp
