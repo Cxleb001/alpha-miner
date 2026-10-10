@@ -235,6 +235,21 @@ def test_every_brain_request_has_a_timeout():
     assert calls and all(c.kwargs.get("timeout") == be.REQUEST_TIMEOUT for c in calls)
 
 
+def test_fetch_alpha_raises_when_logged_out_and_warns_on_other_errors():
+    import requests
+    session = MagicMock()
+    session.get.return_value = fake_response(401, {"detail": "Incorrect authentication credentials."})
+    try:
+        be.fetch_alpha(session, "a1")
+        assert False, "should have raised"
+    except be.SessionExpired as exc:
+        assert isinstance(exc, requests.RequestException)        # old 'couldn't reach BRAIN' paths stay safe
+    session.get.return_value = fake_response(404, {"detail": "Not found."})
+    assert be.fetch_alpha(session, "a1") == {}                     # never passed off as an alpha
+    session.get.return_value = fake_response(200, {"is": {"sharpe": 1.0}})
+    assert be.fetch_alpha(session, "a1") == {"is": {"sharpe": 1.0}}
+
+
 if __name__ == "__main__":
     tests = [obj for name, obj in list(globals().items()) if name.startswith("test_")]
     import inspect

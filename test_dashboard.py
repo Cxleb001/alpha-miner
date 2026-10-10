@@ -197,8 +197,8 @@ def test_check_with_brain_shows_brains_record():
     }
 
     def fake_get(self, url, **kw):
-        if "session_check" in url:
-            return response(404, {"detail": "Not found."})  # logged in: unknown alpha, not 401
+        if url == be.AUTH_URL:   # logged in, with plenty of time left
+            return response(200, {"token": {"expiry": 9000}})
         return response(200, records[url.rsplit("/", 1)[-1]])
 
     with tempfile.TemporaryDirectory() as d:
@@ -219,8 +219,8 @@ def test_identity_verification_flow():
     state = {"verified": False}
 
     def fake_get(self, url, **kw):
-        if "session_check" in url:
-            return response(404 if state["verified"] else 401, {"detail": "x"})
+        if url == be.AUTH_URL:
+            return response(200, {"token": {"expiry": 9000}}) if state["verified"] else response(401, {"detail": "x"})
         return response(200, {"status": "ACTIVE", "is": {"checks": []}})
 
     def fake_post(self, url, **kw):
@@ -241,6 +241,16 @@ def test_identity_verification_flow():
         assert not at.exception
         assert len(at.warning) == 0                 # notice gone after the redraw
         assert len(at.dataframe) == 3               # BRAIN's record now shown
+
+
+def test_session_check_asks_brain_how_long_is_left():
+    session = MagicMock()
+    for reply, valid in ((response(200, {"token": {"expiry": 9000}}), True),
+                         (response(200, {"token": {"expiry": 30}}), False),
+                         (response(401, {"detail": "x"}), False), (response(200, {}), False)):
+        session.get.return_value = reply
+        assert db.session_is_valid(session) is valid
+        assert session.get.call_args.args[0] == be.AUTH_URL       # never inferred from an alpha lookup
 
 
 if __name__ == "__main__":

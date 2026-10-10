@@ -166,8 +166,19 @@ def save_session(session):
 
 
 def session_is_valid(session):
-    probe = session.get(be.ALPHA_URL.format(alpha_id="session_check"), timeout=20)
-    return not be.looks_like_expired_session(probe)
+    """Asks BRAIN how long this login has left (GET /authentication -> token.expiry, the check
+    WorldQuant's ACE library uses). Asking about an alpha can't tell: logged out, BRAIN may answer
+    'not found' rather than 'not logged in'."""
+    try:
+        resp = session.get(be.AUTH_URL, timeout=20)
+    except requests.RequestException:
+        return False
+    if resp.status_code != 200:
+        return False
+    try:
+        return float(resp.json()["token"]["expiry"]) > 60
+    except (ValueError, KeyError, TypeError):
+        return False
 
 
 def log_in(session, email, password):

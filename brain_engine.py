@@ -191,15 +191,27 @@ def poll_once(session: requests.Session, location: str):
     return "RUNNING", progress
 
 
+class SessionExpired(requests.RequestException):
+    """BRAIN says this session isn't logged in any more. It's a RequestException, so code that already
+    copes with 'couldn't reach BRAIN' stays safe; code that can log in again catches it first."""
+
+
 def fetch_alpha(session: requests.Session, alpha_id: str) -> dict:
-    """BRAIN's full record of one alpha, or {} if the reply wasn't readable."""
+    """BRAIN's full record of one alpha, or {} if BRAIN didn't send one (logged, with BRAIN's reply).
+    Raises SessionExpired if the login has run out."""
     resp = with_retries(lambda: session.get(ALPHA_URL.format(alpha_id=alpha_id), timeout=REQUEST_TIMEOUT),
                         "fetching an alpha's results")
+    if looks_like_expired_session(resp):
+        raise SessionExpired(f"BRAIN login expired (while reading alpha {alpha_id})")
     try:
         alpha = resp.json()
     except ValueError:
+        logger.warning("BRAIN's reply about alpha %s wasn't readable (%s).", alpha_id, resp.status_code)
         return {}
-    return alpha if isinstance(alpha, dict) else {}
+    if resp.status_code != 200 or not isinstance(alpha, dict):
+        logger.warning("BRAIN answered %s about alpha %s: %s", resp.status_code, alpha_id, str(alpha)[:150])
+        return {}
+    return alpha
 
 
 def fetch_alpha_metrics(session: requests.Session, alpha_id: str) -> dict:

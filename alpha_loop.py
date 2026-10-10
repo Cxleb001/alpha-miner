@@ -59,8 +59,9 @@ READ BEFORE YOU RUN THIS:
 - Auto-flip: when an alpha scores Sharpe -1.0 or worse, the loop also tests reverse(<expression>)
   right after it (up to MAX_FLIPS_PER_ROUND per round, default 3), since a strongly negative signal
   usually turns positive when flipped. Flips use extra simulations.
-- Auto-smooth: when an alpha has Sharpe >= 1.25 but fitness under 1.0 (or turnover over 70%) and
-  turnover above SMOOTH_MIN_TURNOVER (default 0.2), the loop also tests
+- Auto-smooth: when an alpha has Sharpe >= 1.25 but fitness under 1.0 and turnover above
+  SMOOTH_MIN_TURNOVER (default 0.2) - or turnover over BRAIN's 70% limit with Sharpe >= 1.0
+  (SMOOTH_MIN_SHARPE_OVER_LIMIT) - the loop also tests
   ts_decay_linear(<expression>, 10) right after it (up to MAX_SMOOTHS_PER_ROUND per round, default 3).
   Fitness divides by turnover, so trading less can lift it over the bar.
 - Auto-repair: an alpha with Sharpe and fitness over the bar that FAILs one of BRAIN's fixable checks
@@ -69,16 +70,26 @@ READ BEFORE YOU RUN THIS:
   fields; LOW_SUB_UNIVERSE_SHARPE -> rank within subindustry, or neutralize against market-cap buckets;
   LOW_TURNOVER -> drop the outer ts_decay_linear. Repairs follow community write-ups of BRAIN's checks,
   and BRAIN's own result decides whether each worked. If the original is already too similar to your
-  submitted alphas, it isn't repaired (the repair would be too). Each normal run also starts by
-  re-examining up to MAX_PAST_REPAIRS (default 5) earlier near-misses whose fixes haven't been tried.
+  submitted alphas, it isn't repaired (the repair would be too). A near-miss failing a check with no
+  automatic fix gets a log line naming that check.
+- Auto-sharpen: an alpha with Sharpe >= 1.25 but fitness under 1.0 whose turnover is already under 12.5%
+  - where BRAIN's fitness formula stops giving credit for trading less - is re-tested without its outer
+  ts_decay_linear/hump (up to MAX_SHARPENS_PER_ROUND, default 3), after the same free similarity check.
+- Each normal run starts by re-examining up to MAX_PAST_REPAIRS (default 8) earlier near-misses whose
+  repairs or sharpening haven't been tried.
+- Learning what doesn't work: any operator or field BRAIN rejects ('unknown variable/operator') is
+  read back from the results file, removed from what the generator sees, and ideas still using it are
+  dropped before they cost a simulation. Fields tried DEAD_END_MIN_TRIES (default 8) times without
+  fitness reaching DEAD_END_MAX_FITNESS (default 0.5) are left out the same way; basic price/volume
+  fields (close, volume, returns...) are exempt.
 - Variety: alphas built on the same kind of data usually come back too correlated to submit. Each
   field is labelled with its data type - BRAIN's own category from data_fields_cache.json (written by
   fetch_fields.py), or the dataset name in operators.json without it. The generator is told which types
   your submitted or queued alphas already use, and asked for VARIETY_EXTRA_IDEAS (default 4) spare
   ideas; the loop then keeps at most MAX_IDEAS_PER_TYPE (default 2) per type per round, and at most
   MAX_IDEAS_PER_CROWDED_TYPE (default 1) for types you've already submitted.
-- Formula shape: each expression is reduced to its skeleton (fields, numbers and groups stripped, any
-  ts_*/group_* operator treated alike). Shapes your submitted, queued or too-similar alphas use - or that
+- Formula shape: each expression is reduced to its skeleton (smoothing wrapped around the outside,
+  fields, numbers and groups stripped, any ts_*/group_* operator treated alike). Shapes your submitted, queued or too-similar alphas use - or that
   make up 30%+ of your last 60 simulations - count as overused: the generator is shown them with a list of
   other structures from your operator list, and the loop keeps at most MAX_IDEAS_PER_CROWDED_SHAPE
   (default 2) ideas per overused shape per round.
@@ -157,6 +168,7 @@ MAX_FLIPS_PER_ROUND = int(os.environ.get("MAX_FLIPS_PER_ROUND", 3))  # caps the 
 # Auto-smooth: a good Sharpe held back by trading too much gets re-tested with linear decay.
 SMOOTH_DECAY_DAYS = int(os.environ.get("SMOOTH_DECAY_DAYS", 10))
 SMOOTH_MIN_TURNOVER = float(os.environ.get("SMOOTH_MIN_TURNOVER", 0.2))  # below this, decay can barely help fitness
+SMOOTH_MIN_SHARPE_OVER_LIMIT = float(os.environ.get("SMOOTH_MIN_SHARPE_OVER_LIMIT", 1.0))  # turnover over 70%
 MAX_SMOOTHS_PER_ROUND = int(os.environ.get("MAX_SMOOTHS_PER_ROUND", 3))  # caps the extra simulations smoothing adds
 
 # Network resilience: one dropped connection skips that idea; this many in a row stops the run cleanly.
@@ -166,8 +178,17 @@ MAX_NETWORK_FAILURES = int(os.environ.get("MAX_NETWORK_FAILURES", 3))
 # re-tested with a known fix for that check. Each repair is one extra simulation.
 MAX_REPAIRS_PER_ALPHA = int(os.environ.get("MAX_REPAIRS_PER_ALPHA", 2))
 MAX_REPAIRS_PER_ROUND = int(os.environ.get("MAX_REPAIRS_PER_ROUND", 4))
-MAX_PAST_REPAIRS = int(os.environ.get("MAX_PAST_REPAIRS", 5))  # earlier near-misses re-examined per run
+MAX_PAST_REPAIRS = int(os.environ.get("MAX_PAST_REPAIRS", 8))  # earlier near-misses re-examined per run
+# Auto-sharpen: below this turnover BRAIN's fitness formula gets no extra credit, so smoothing an alpha
+# that's already this slow only dampens its returns.
+FITNESS_TURNOVER_FLOOR = 0.125
+MAX_SHARPENS_PER_ROUND = int(os.environ.get("MAX_SHARPENS_PER_ROUND", 3))
 BACKFILL_DAYS = 120
+
+# Learning what doesn't work: names BRAIN rejected, and fields that never got close.
+DEAD_END_MIN_TRIES = int(os.environ.get("DEAD_END_MIN_TRIES", 8))
+DEAD_END_MAX_FITNESS = float(os.environ.get("DEAD_END_MAX_FITNESS", 0.5))
+BASIC_FIELDS = ("open", "high", "low", "close", "vwap", "volume", "returns", "adv20", "cap")  # never dropped
 
 # Variety: alphas built on the same kind of data tend to be too correlated to submit together.
 FIELDS_CACHE_FILE = "data_fields_cache.json"  # written by fetch_fields.py - holds BRAIN's category per field
@@ -199,6 +220,8 @@ SETTINGS = {
 OPERATORS_FILE = "operators.json"
 RESULTS_FILE = "alpha_loop_results.csv"  # separate from brain_engine.py's own results.csv
 SESSION_FILE = "session_cookies.json"
+SESSION_MIN_SECONDS = 30 * 60   # reuse a saved BRAIN login only if it has at least this long left
+SESSION_RENEW_SECONDS = 5 * 60  # during a run, log in again this long before the login runs out
 SUBMISSION_LOG_FILE = "submissions_log.json"  # {"YYYY-MM-DD": count} - enforces the daily cap across runs
 HELD_PREFIX = "QUALIFIED_NOT_SUBMITTED"
 HELD_LABEL = f"{HELD_PREFIX} (daily cap reached)"  # cleared the bar, waiting for a free submission slot
@@ -213,6 +236,10 @@ RESULTS_HEADER = [
 
 class StopLoop(Exception):
     """Raised to unwind out of a round immediately - e.g. session can't be renewed unattended."""
+
+
+class LoginFailed(RuntimeError):
+    """Couldn't log in to BRAIN unattended (wrong password, or BRAIN wants identity verification)."""
 
 
 class GenerationFailed(Exception):
@@ -254,23 +281,74 @@ def load_session(session: requests.Session) -> bool:
         return False
 
 
+def session_seconds_left(session):
+    """How long BRAIN says this login has left: GET /authentication -> token.expiry, the same check
+    WorldQuant's own ACE library uses. 0 if BRAIN says it isn't logged in, None if it can't tell.
+    (Asking about an alpha can't tell: logged out, BRAIN may answer 'not found' instead.)"""
+    try:
+        resp = session.get(be.AUTH_URL, timeout=be.REQUEST_TIMEOUT)
+    except requests.RequestException:
+        return None
+    if resp.status_code in (401, 403) or be.looks_like_expired_session(resp):
+        return 0.0
+    if resp.status_code != 200:
+        return None
+    try:
+        return max(0.0, float(resp.json()["token"]["expiry"]))
+    except (ValueError, KeyError, TypeError):
+        return None
+
+
+def note_expiry(session):
+    """Remember when this login runs out, so a long run can log in again before it does."""
+    left = session_seconds_left(session)
+    session.brain_expires_at = (time.time() + left) if left else None
+
+
+def log_in(session, email, password) -> bool:
+    """be.authenticate, made safe for runs nobody is watching: if BRAIN asks for identity verification
+    and there's no keyboard to answer it, this returns False with a clear message instead of crashing."""
+    try:
+        ok = be.authenticate(session, email, password)
+    except (EOFError, OSError, RuntimeError):
+        logger.error("BRAIN wants you to confirm your identity, and nobody is here to do it. Run "
+                     "python alpha_loop.py by hand once and open the link it prints.")
+        return False
+    if ok:
+        save_session(session)
+        note_expiry(session)
+    return ok
+
+
 def get_authenticated_session(email: str, password: str) -> requests.Session:
     session = requests.Session()
     if load_session(session):
-        try:
-            probe = session.get(be.ALPHA_URL.format(alpha_id="session_check"), timeout=be.REQUEST_TIMEOUT)
-        except requests.RequestException:
-            probe = None
-        if probe is not None and not be.looks_like_expired_session(probe):
-            logger.info("Reused saved session - skipped login.")
+        left = session_seconds_left(session)
+        if left is not None and left >= SESSION_MIN_SECONDS:
+            session.brain_expires_at = time.time() + left
+            logger.info("Reused saved session (%d minutes left on it) - skipped login.", left // 60)
             return session
-        logger.info("Saved session no longer valid, logging in fresh.")
+        logger.info("Saved session %s - logging in fresh.",
+                    "couldn't be confirmed" if left is None else "has expired" if not left
+                    else f"has under {SESSION_MIN_SECONDS // 60} minutes left")
         session.cookies.clear()
 
-    if not be.authenticate(session, email, password):
-        raise RuntimeError("Could not authenticate - stopping before burning any quota.")
-    save_session(session)
+    if not log_in(session, email, password):
+        raise LoginFailed("Could not log in to BRAIN - stopping before using any quota.")
     return session
+
+
+def keep_logged_in(session, email, password):
+    """Log in again shortly before BRAIN's login runs out, instead of waiting for requests to fail."""
+    expires_at = getattr(session, "brain_expires_at", None)
+    if isinstance(expires_at, bool) or not isinstance(expires_at, (int, float)):
+        return
+    if time.time() < expires_at - SESSION_RENEW_SECONDS:
+        return
+    logger.info("BRAIN login runs out in under %d minutes - logging in again now.", SESSION_RENEW_SECONDS // 60)
+    session.cookies.clear()
+    if not log_in(session, email, password):
+        raise StopLoop("BRAIN needs re-authentication (likely identity verification) and no one is here to complete it.")
 
 
 def already_tried() -> set:
@@ -385,6 +463,49 @@ def pool_tag(row) -> str:
     return ""
 
 
+# ---- Learning what doesn't work ----
+
+_REJECTED = re.compile(r'unknown (?:variable|operator) "([^"]+)"', re.IGNORECASE)
+
+
+def rejected_names() -> set:
+    """Operators and fields BRAIN refused on your account ('unknown variable/operator "x"'), read
+    from the error column of every run so far."""
+    if not Path(RESULTS_FILE).exists():
+        return set()
+    with open(RESULTS_FILE, encoding="utf-8", newline="") as f:
+        return {name for r in csv.DictReader(f) for name in _REJECTED.findall(r.get("error") or "")}
+
+
+def dead_end_fields() -> dict:
+    """{field: (simulations, best fitness)} for fields tried DEAD_END_MIN_TRIES+ times without fitness
+    ever reaching DEAD_END_MAX_FITNESS. Basic price/volume fields are exempt - they're ingredients."""
+    stats = {}
+    for r in completed_history():
+        fitness = as_float(r.get("fitness"))
+        for name in {n for _, _, n in data_fields_in(r["expression"])}:
+            tries, best = stats.get(name, (0, fitness))
+            stats[name] = (tries + 1, max(best, fitness))
+    return {name: (tries, best) for name, (tries, best) in stats.items()
+            if name not in BASIC_FIELDS and tries >= DEAD_END_MIN_TRIES and best < DEAD_END_MAX_FITNESS}
+
+
+def uses_any(expression: str, names) -> bool:
+    return bool(set(_WORD.findall(_blank_quotes(expression))) & set(names))
+
+
+def avoid_note(rejected, dead: dict) -> str:
+    lines = []
+    if rejected:
+        lines.append("BRAIN rejected these names on your account - never use them: "
+                     + ", ".join(sorted(rejected)) + ". (Write comparisons with >, <, == instead.)")
+    if dead:
+        lines.append(f"These fields were tried {DEAD_END_MIN_TRIES}+ times and never reached fitness "
+                     f"{DEAD_END_MAX_FITNESS}, so they're left out: "
+                     + ", ".join(f"{n} ({t} tries, best {b:.2f})" for n, (t, b) in sorted(dead.items())) + ".")
+    return ("DON'T USE:\n" + "\n".join(f"- {line}" for line in lines)) if lines else ""
+
+
 # ---- Variety: spread ideas across data types ----
 
 def field_types(fields) -> dict:
@@ -458,10 +579,25 @@ def variety_rule(type_map: dict, crowded: Counter, n: int) -> str:
 
 # ---- Variety of formula shape ----
 
+SMOOTHERS = ("ts_decay_linear", "hump")
+
+
+def strip_smoothing(expression: str) -> str:
+    """The expression without any ts_decay_linear / hump wrapped around the outside."""
+    expr = expression.strip()
+    while True:
+        call = outer_call(expr)
+        if not call or call[0] not in SMOOTHERS or not call[1][0].strip():
+            return expr
+        expr = call[1][0].strip()
+
+
 def skeleton(expression: str) -> str:
-    """The formula's shape with the specifics stripped out: data fields -> F, groups -> G, numbers -> N,
-    any ts_* operator -> ts_*, any group_* operator -> group_*. Two alphas with the same skeleton are the
-    same idea with different data or windows."""
+    """The formula's shape with the specifics stripped out: smoothing wrapped around the outside
+    (ts_decay_linear, hump) is ignored - it controls turnover, it isn't the idea - then data fields -> F,
+    groups -> G, numbers -> N, any ts_* operator -> ts_*, any group_* operator -> group_*. Two alphas with
+    the same skeleton are the same idea with different data, windows or smoothing."""
+    expression = strip_smoothing(expression)
     group_spans = list(_group_calls(expression))
     cuts = [(s, e, "G") for s, e in group_spans]
     cuts += [(s, e, "F") for s, e, _ in data_fields_in(expression)
@@ -490,10 +626,10 @@ def crowded_shapes() -> dict:
     recent = done[-SHAPE_LOOKBACK:]
     if len(recent) >= 10:
         counts = Counter(skeleton(r["expression"]) for r in recent)
-        for r in recent:
+        for r in reversed(recent):  # newest example, but a submitted alpha's from above wins
             shape = skeleton(r["expression"])
             if counts[shape] / len(recent) >= SHAPE_CROWDED_SHARE:
-                shapes[shape] = r["expression"]
+                shapes.setdefault(shape, r["expression"])
     return shapes
 
 
@@ -505,7 +641,6 @@ SHAPE_IDEAS = (  # (operators needed, suggestion) - only suggested if your accou
     (("ts_delta", "ts_std_dev"), "a change scaled by its own volatility: ts_delta(x, d) / ts_std_dev(x, d)"),
     (("rank",), "a blend of two different data types: rank(x) + rank(y)"),
     (("ts_rank",), "where today's value sits in its own history: ts_rank(x, d)"),
-    (("hump",), "turnover control with hump(x, hump=0.01) instead of ts_decay_linear"),
     (("if_else",), "switching between two signals: if_else(condition, signal_a, signal_b)"),
 )
 
@@ -516,11 +651,15 @@ def shape_rule(shapes: dict, operators) -> str:
     names = {o.get("name") for o in operators or []}
     examples = "; ".join(list(shapes.values())[:3])
     lines = ["SHAPE RULE - vary the formula's structure, not just its data. These shapes are already "
-             f"overused (same operators nested the same way, whatever the fields, windows or groups) - "
-             f"e.g. {examples}. At most {MAX_IDEAS_PER_CROWDED_SHAPE} ideas this round may use any one of them."]
+             f"overused (same operators nested the same way, whatever the fields, windows, groups or "
+             f"smoothing) - e.g. {examples}. At most {MAX_IDEAS_PER_CROWDED_SHAPE} ideas this round may "
+             f"use any one of them."]
     ideas = [text for needed, text in SHAPE_IDEAS if not names or all(op in names for op in needed)]
     if ideas:
         lines.append("Other structures to try:\n" + "\n".join(f"- {text}" for text in ideas))
+    lines.append("Smoothing is NOT part of the shape - keep using it. Wrap new structures in "
+                 "ts_decay_linear(x, 10) to ts_decay_linear(x, 20), or hump(x, hump=0.01): most raw "
+                 "structures trade far more than BRAIN's 70% turnover limit and get rejected without it.")
     return "\n".join(lines)
 
 
@@ -801,13 +940,17 @@ def try_submit(session, alpha_id: str, corr=_UNCHECKED) -> str:
 
 
 def needs_smoothing(sharpe, fitness, turnover) -> bool:
-    """A good Sharpe held back by trading too much: fitness under the bar, or turnover over BRAIN's
-    limit. Fitness divides by turnover (floored at 0.125), so decay helps most when turnover is high."""
+    """A decent Sharpe held back by trading too much. Over BRAIN's 70% turnover limit the alpha is
+    rejected outright, so smoothing is tried from Sharpe SMOOTH_MIN_SHARPE_OVER_LIMIT (1.0); otherwise
+    from the submission bar, when fitness is short. Fitness divides by turnover (floored at 0.125),
+    so decay helps most when turnover is high."""
     if sharpe is None or fitness is None or turnover is None:
         return False
+    if turnover > TURNOVER_MAX:
+        return sharpe >= SMOOTH_MIN_SHARPE_OVER_LIMIT
     if sharpe < SUBMIT_MIN_SHARPE or turnover <= SMOOTH_MIN_TURNOVER:
         return False
-    return fitness < SUBMIT_MIN_FITNESS or turnover > TURNOVER_MAX
+    return fitness < SUBMIT_MIN_FITNESS
 
 
 # ---- Auto-repair: strong alphas that fail one of BRAIN's fixable checks ----
@@ -946,9 +1089,19 @@ def _size_neutral(expr):
 
 def _less_smoothing(expr):
     call = outer_call(expr)
-    if not call or call[0] != "ts_decay_linear" or not call[1][0].strip():
+    if not call or call[0] not in ("ts_decay_linear", "hump") or not call[1][0].strip():
         return None
-    return (call[1][0].strip(), "without the outer ts_decay_linear it trades enough to clear the 1% minimum")
+    return (call[1][0].strip(), f"without the outer {call[0]} it trades enough to clear the 1% minimum")
+
+
+def needs_sharpening(row) -> bool:
+    """Sharpe is over the bar but fitness isn't, while turnover is already under BRAIN's 12.5% fitness
+    floor - so the smoothing wrapped around it can't help fitness any more, only dampen returns."""
+    sharpe, fitness, turnover = (as_float(row.get(k)) for k in ("sharpe", "fitness", "turnover"))
+    if sharpe is None or fitness is None or turnover is None:
+        return False
+    return (sharpe >= SUBMIT_MIN_SHARPE and fitness < SUBMIT_MIN_FITNESS and turnover < FITNESS_TURNOVER_FLOOR
+            and _less_smoothing(row.get("expression") or "") is not None)
 
 
 REPAIRS = {  # check name -> fixes to try, most promising first
@@ -1181,11 +1334,10 @@ def renew_session(session, email, password, row):
     and raises StopLoop - nobody is here to click the link."""
     logger.warning("Session expired mid-run - attempting one re-auth...")
     session.cookies.clear()
-    if not be.authenticate(session, email, password):
+    if not log_in(session, email, password):
         row["status"], row["error"] = "STOPPED", "session expired and could not renew unattended"
         append_result(row)
         raise StopLoop("BRAIN needs re-authentication (likely identity verification) and no one is here to complete it.")
-    save_session(session)
 
 
 def is_busy(err) -> bool:
@@ -1215,6 +1367,10 @@ def finish_idea(session, row, alpha_id) -> dict:
     """A simulation finished: read BRAIN's result, log it, and submit the alpha if it qualifies."""
     expression = row["expression"]
     alpha = be.fetch_alpha(session, alpha_id)
+    if not (alpha.get("is") or {}):
+        row.update(alpha_id=alpha_id, alpha_link=f"https://platform.worldquantbrain.com/alpha/{alpha_id}")
+        logger.warning("  %s finished, but BRAIN didn't send its result.", expression)
+        return fail(row, "BRAIN finished the simulation but didn't send its result - open its BRAIN page")
     metrics = be.metrics_from_alpha(alpha_id, alpha)
     checks = (alpha.get("is") or {}).get("checks") or []
     row.update(status="COMPLETE", alpha_id=alpha_id, **metrics)
@@ -1248,10 +1404,15 @@ def finish_idea(session, row, alpha_id) -> dict:
 
 def run_round(session, client, operators, fields, settings, email, password, round_num, feedback_text, avoid):
     logger.info("=== Round %d: generating %d ideas ===", round_num, IDEAS_PER_ROUND)
+    rejected, dead = rejected_names(), dead_end_fields()
+    blocked = rejected | set(dead)
+    operators = [o for o in operators if o.get("name") not in rejected]
+    fields = [f for f in fields if f.get("name") not in blocked]
     type_map = field_types(fields)
     crowded = crowded_types(type_map)
     overused = crowded_shapes()
-    rules = [r for r in (variety_rule(type_map, crowded, IDEAS_PER_ROUND), shape_rule(overused, operators)) if r]
+    rules = [r for r in (variety_rule(type_map, crowded, IDEAS_PER_ROUND), shape_rule(overused, operators),
+                         avoid_note(rejected, dead)) if r]
     asked = IDEAS_PER_ROUND + (VARIETY_EXTRA_IDEAS if rules else 0)
     prompt_text = "\n\n".join([feedback_text, *rules])
     try:
@@ -1260,6 +1421,11 @@ def run_round(session, client, operators, fields, settings, email, password, rou
     except Exception as e:
         raise GenerationFailed(short_error(e)) from e
 
+    if blocked:
+        usable = [(e, r) for e, r in ideas if not uses_any(e, blocked)]
+        if len(usable) < len(ideas):
+            logger.info("Skipped %d idea(s) using names BRAIN rejected or dead-end fields.", len(ideas) - len(usable))
+        ideas = usable
     if rules:
         fresh_ideas = []
         for expression, rationale in ideas:
@@ -1280,7 +1446,7 @@ def process_queue(session, items, settings, email, password, round_num, avoid) -
     queue = deque(items)
     running = []  # each: {"row", "kind", "location", "started"}
     rows = []
-    counts = {"flips": 0, "smooths": 0, "repairs": 0, "network": 0}
+    counts = {"flips": 0, "smooths": 0, "repairs": 0, "sharpens": 0, "network": 0}
     limit = PARALLEL_SIMULATIONS
     busy_since = None
     last_note = time.time()
@@ -1302,6 +1468,7 @@ def process_queue(session, items, settings, email, password, round_num, avoid) -
 
     try:
         while queue or running:
+            keep_logged_in(session, email, password)
             # 1. Start ideas while there's a free slot.
             while queue and len(running) < limit:
                 expression, rationale, kind = queue[0]
@@ -1393,7 +1560,11 @@ def process_queue(session, items, settings, email, password, round_num, avoid) -
 
                 counts["network"] = 0
                 try:
-                    row = finish_idea(session, row, info)
+                    try:
+                        row = finish_idea(session, row, info)
+                    except be.SessionExpired:
+                        renew_session(session, email, password, row)  # raises StopLoop if it can't
+                        row = finish_idea(session, row, info)
                 except requests.RequestException as exc:
                     network_trouble(row, exc)
                     continue
@@ -1429,7 +1600,8 @@ def queue_followups(session, row, kind, queue, avoid, counts):
                                        f"reversed, it should score about {-sharpe:.2f}.", "flip"))
 
     # Auto-smooth: the Sharpe is there, but trading too much is holding it back.
-    if kind != "smooth" and counts["smooths"] < MAX_SMOOTHS_PER_ROUND and needs_smoothing(sharpe, fitness, turnover):
+    if (kind not in ("smooth", "sharpen") and counts["smooths"] < MAX_SMOOTHS_PER_ROUND
+            and needs_smoothing(sharpe, fitness, turnover)):  # a sharpened result isn't smoothed back
         smoothed = f"ts_decay_linear({expression}, {SMOOTH_DECAY_DAYS})"
         if smoothed not in avoid:
             counts["smooths"] += 1
@@ -1439,9 +1611,26 @@ def queue_followups(session, row, kind, queue, avoid, counts):
                                         f"{fitness:.2f} at {turnover:.0%} turnover; decaying it over "
                                         f"{SMOOTH_DECAY_DAYS} days should cut turnover.", "smooth"))
 
+    # Auto-sharpen: Sharpe is there, fitness isn't, and turnover is already under the 12.5% floor.
+    if (kind not in ("smooth", "sharpen", "repair") and counts["sharpens"] < MAX_SHARPENS_PER_ROUND
+            and row.get("submitted", "NO") == "NO" and needs_sharpening(row)):
+        sharper = _less_smoothing(expression)[0]
+        if sharper not in avoid and not too_similar_to_pool(session, row, "sharpening"):
+            counts["sharpens"] += 1
+            logger.info("  Sharpe %.2f but fitness %.2f at only %.1f%% turnover - testing it without the outer "
+                        "smoothing next.", sharpe, fitness, turnover * 100)
+            queue.appendleft((sharper, sharpen_reason(expression, sharpe, fitness, turnover), "sharpen"))
+
     # Auto-repair: strong numbers held back by one of BRAIN's fixable checks.
     if kind != "repair" and row.get("submitted", "NO") == "NO" and strong_numbers(row):
-        fixes = [f for f in repair_candidates(expression, row.get("failed_checks") or []) if f[0] not in avoid]
+        failed = row.get("failed_checks") or []
+        possible = repair_candidates(expression, failed)
+        if not possible:
+            if failed:
+                logger.info("  Strong numbers but failed %s - no automatic fix for that check.", ", ".join(failed))
+            elif row.get("failing_checks"):
+                logger.info("  Strong numbers but not every check passed (%s).", row["failing_checks"])
+        fixes = [f for f in possible if f[0] not in avoid]
         room = MAX_REPAIRS_PER_ROUND - counts["repairs"]
         if fixes and room > 0 and worth_repairing(session, row):
             counts["repairs"] += min(room, len(fixes))
@@ -1449,14 +1638,25 @@ def queue_followups(session, row, kind, queue, avoid, counts):
                 queue.appendleft((new_expression, f"Auto-repair of {expression}: {why}.", "repair"))
 
 
-def worth_repairing(session, row) -> bool:
-    """A repair is a close copy of the original, so if the original is already too similar to your
-    submitted alphas, the repair would be too. BRAIN's similarity check is free; asking first saves
-    the simulations."""
+def sharpen_reason(expression, sharpe, fitness, turnover) -> str:
+    return (f"Auto-sharpen of {expression}: Sharpe {sharpe:.2f} but fitness {fitness:.2f} at {turnover:.1%} "
+            f"turnover - under BRAIN's 12.5% fitness floor, so the outer smoothing only dampens returns.")
+
+
+def too_similar_to_pool(session, row, purpose: str) -> bool:
+    """A follow-up is a close copy of the original, so if the original is already too similar to your
+    submitted alphas, the follow-up would be too. BRAIN's similarity check is free; asking first saves
+    the simulation."""
     corr = self_correlation_max(session, row["alpha_id"])
     if too_similar(corr):
-        logger.info("  %s fails %s, but it's too similar to your submitted alphas (self-correlation %.2f) - "
-                    "not repairing it.", row["expression"], ", ".join(row.get("failed_checks") or []), corr)
+        logger.info("  %s is too similar to your submitted alphas (self-correlation %.2f) - not %s it.",
+                    row["expression"], corr, purpose)
+        return True
+    return False
+
+
+def worth_repairing(session, row) -> bool:
+    if too_similar_to_pool(session, row, "repairing"):
         return False
     logger.info("  Strong numbers but failed %s - testing a repaired version next.",
                 ", ".join(row.get("failed_checks") or []))
@@ -1475,35 +1675,73 @@ def near_miss_rows() -> list:
     return sorted(unique.values(), key=lambda r: r.get("timestamp") or "", reverse=True)
 
 
+def sharpen_candidates() -> list:
+    """Earlier alphas that needs_sharpening() and weren't submitted - most recent first."""
+    rows = [r for r in completed_history() if r.get("alpha_id") and needs_sharpening(r)
+            and (r.get("submitted") or "NO").strip() == "NO"]
+    unique = {r["alpha_id"]: r for r in rows}
+    return sorted(unique.values(), key=lambda r: r.get("timestamp") or "", reverse=True)
+
+
 def repair_past_near_misses(session, settings, email, password, avoid) -> list:
-    """Start-of-run step: re-examine recent near-misses (at most MAX_PAST_REPAIRS whose repairs haven't
-    all been tried), ask BRAIN which check each failed, and test the fixes for the fixable ones."""
+    """Start-of-run step: re-examine up to MAX_PAST_REPAIRS recent near-misses whose follow-ups haven't
+    been tried - repair the ones failing a fixable check (asking BRAIN which check failed), and test the
+    slow ones without their outer smoothing. Every near-miss looked at gets a log line saying why."""
+    candidates = [("repair", r) for r in near_miss_rows()] + [("sharpen", r) for r in sharpen_candidates()]
+    candidates.sort(key=lambda kr: kr[1].get("timestamp") or "", reverse=True)
     items, looked = [], 0
-    for row in near_miss_rows():
+    for kind, row in candidates:
         if looked >= MAX_PAST_REPAIRS:
             break
-        if all_repair_variants(row["expression"]) <= avoid:
+        expression = row["expression"]
+        if kind == "sharpen":
+            sharper = _less_smoothing(expression)[0]
+            if sharper in avoid:
+                continue  # already tried
+            looked += 1
+            logger.info("Earlier near-miss %s (Sharpe %s, fitness %s, turnover %s):", expression,
+                        row.get("sharpe"), row.get("fitness"), row.get("turnover"))
+            if too_similar_to_pool(session, row, "sharpening"):
+                continue
+            logger.info("  Turnover is under BRAIN's 12.5% fitness floor - testing it without the outer smoothing.")
+            items.append((sharper, sharpen_reason(expression, *(as_float(row[k]) for k in
+                                                                ("sharpe", "fitness", "turnover"))), "sharpen"))
+            continue
+
+        if all_repair_variants(expression) <= avoid:
             continue  # every possible fix was already tried
         looked += 1
         try:
             alpha = be.fetch_alpha(session, row["alpha_id"])
         except requests.RequestException as exc:
-            logger.warning("Couldn't reach BRAIN to look at earlier near-misses (%s) - skipping repairs this run.",
+            logger.warning("Couldn't reach BRAIN to look at earlier near-misses (%s) - skipping them this run.",
                            type(exc).__name__)
             break
         checks = (alpha.get("is") or {}).get("checks") or []
         row["failed_checks"] = [str(c.get("name")) for c in checks if c.get("result") == "FAIL"]
-        fixes = [f for f in repair_candidates(row["expression"], row["failed_checks"]) if f[0] not in avoid]
-        if not fixes:
+        label = f"Earlier near-miss {expression} (Sharpe {row.get('sharpe')}, fitness {row.get('fitness')})"
+        if not checks:
+            logger.info("%s: couldn't read BRAIN's record of it - trying again next run.", label)
             continue
-        logger.info("Earlier near-miss %s (Sharpe %s, fitness %s):", row["expression"], row.get("sharpe"),
-                    row.get("fitness"))
+        if not row["failed_checks"]:
+            pending = ", ".join(f"{c.get('name')}:{c.get('result')}" for c in checks
+                                if c.get("result") != "PASS" and c.get("name") != "SELF_CORRELATION")
+            logger.info("%s: BRAIN lists no failed check%s.", label, f" ({pending})" if pending else "")
+            continue
+        possible = repair_candidates(expression, row["failed_checks"])
+        if not possible:
+            logger.info("%s fails %s - no automatic fix for that check.", label, ", ".join(row["failed_checks"]))
+            continue
+        fixes = [f for f in possible if f[0] not in avoid]
+        if not fixes:
+            continue  # its fixes were already tried
+        logger.info("%s:", label)
         if not worth_repairing(session, row):
             continue
-        items.extend((e, f"Auto-repair of {row['expression']}: {why}.", "repair") for e, why in fixes)
+        items.extend((e, f"Auto-repair of {expression}: {why}.", "repair") for e, why in fixes)
     if not items:
         return []
-    logger.info("=== Repairing earlier near-misses: %d repaired version(s) to test ===", len(items))
+    logger.info("=== Following up earlier near-misses: %d version(s) to test ===", len(items))
     return process_queue(session, items, settings, email, password, "repair", avoid)
 
 
@@ -1578,6 +1816,11 @@ def main(argv=None):
             return
         try:
             run(args)
+        except LoginFailed as e:
+            logger.error("Stopping: %s", e)
+        except Exception:
+            logger.exception("The run crashed - the details below show where.")
+            raise
         finally:
             lock.close()
     finally:
@@ -1637,6 +1880,10 @@ def run(args):
     if type_map:
         logger.info("Variety: your %d fields span %d data types (%s).", len(type_map),
                     len(set(type_map.values())), ", ".join(sorted(set(type_map.values()))))
+    rejected, dead = rejected_names(), dead_end_fields()
+    if rejected or dead:
+        logger.info("Leaving out %d name(s) BRAIN rejected (%s) and %d dead-end field(s) (%s).", len(rejected),
+                    ", ".join(sorted(rejected)) or "none", len(dead), ", ".join(sorted(dead)) or "none")
 
     started = time.time()
     rounds_done = 0

@@ -3,6 +3,7 @@ import json
 import os
 import sys
 from collections import Counter
+import time as _time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -467,6 +468,8 @@ class FakeBrain:
         raise AssertionError(f"unexpected POST {url}")
 
     def get(self, url, **kw):
+        if url == be.AUTH_URL:   # "how long has this login got left?"
+            return fake_response(200, {"token": {"expiry": 14400}})
         if url.startswith("sim-"):
             return fake_response(200, {"status": "COMPLETE", "alpha": url[4:]})
         if url.endswith("/correlations/self"):
@@ -1265,6 +1268,8 @@ class SlowBrain:
         raise AssertionError(f"unexpected POST {url}")
 
     def get(self, url, **kw):
+        if url == be.AUTH_URL:
+            return fake_response(200, {"token": {"expiry": 14400}})
         if url.endswith("/correlations/self"):
             alpha_id = url.split("/")[-3]
             corr = self.corr.get(alpha_id, 0.3) if isinstance(self.corr, dict) else self.corr
@@ -1614,23 +1619,38 @@ TEMPLATE = [  # the shape every submitted alpha so far shares
 
 
 def test_skeleton_ignores_data_windows_groups_and_which_ts_operator():
-    assert {al.skeleton(e) for e in TEMPLATE} == {"ts_*(group_*(ts_*(F,N),G),N)"}
+    assert {al.skeleton(e) for e in TEMPLATE} == {"group_*(ts_*(F,N),G)"}
     assert al.skeleton("rank(ts_regression(returns, rel_ret_comp, 60, lag=0, rettype=0))") == \
         "rank(ts_*(F,F,N,lag=N,rettype=N))"
     assert al.skeleton("group_neutralize(rank(-returns), bucket(rank(cap), range='0, 1, 0.1'))") == \
         "group_*(rank(-F),G)"
     assert al.skeleton("vwap/close") == "F/F"
-    assert al.skeleton(TEMPLATE[0]) != al.skeleton(f"ts_decay_linear({TEMPLATE[0]}, 10)")
+
+
+def test_smoothing_is_not_part_of_the_shape():
+    raw = "group_rank(ts_delta(close, 30), sector)"
+    for smoothed in (f"ts_decay_linear({raw}, 20)", f"hump({raw}, hump=0.01)",
+                     f"ts_decay_linear(ts_decay_linear({raw}, 10), 10)", f"ts_decay_linear(hump({raw}, hump=0.01), 5)"):
+        assert al.skeleton(smoothed) == al.skeleton(raw) == "group_*(ts_*(F,N),G)"
+    assert al.skeleton("rank(ts_decay_linear(close, 5))") != al.skeleton("rank(close)")   # inner decay is part of it
+    rule = al.shape_rule({"group_*(ts_*(F,N),G)": TEMPLATE[0]}, [])
+    assert "Smoothing is NOT part of the shape - keep using it" in rule and "hump(x, hump=0.01)" in rule
+
+
+def test_over_the_limit_turnover_is_smoothed_from_sharpe_1():
+    assert al.needs_smoothing(1.14, 0.37, 1.42) is True     # the flipped ts_regression from 10 Oct
+    assert al.needs_smoothing(0.82, 0.25, 0.49) is False    # under the limit: the usual 1.25 bar applies
+    assert al.needs_smoothing(0.58, 0.06, 1.16) is False    # too weak to be worth a simulation
 
 
 def test_crowded_shapes_from_the_pool_and_from_recent_history(tmp_path):
     def run():
         assert al.crowded_shapes() == {}
         al.append_result(dict(_history_row(TEMPLATE[0], 1.86, 1.71, 0.13), submitted="YES"))
-        assert list(al.crowded_shapes()) == ["ts_*(group_*(ts_*(F,N),G),N)"]
+        assert list(al.crowded_shapes()) == ["group_*(ts_*(F,N),G)"]
         for i in range(12):   # a run of one other shape: 12 of 13 recent simulations
             al.append_result(_history_row(f"rank(field_{i})", 0.4, 0.2, 0.1))
-        assert set(al.crowded_shapes()) == {"ts_*(group_*(ts_*(F,N),G),N)", "rank(F)"}
+        assert set(al.crowded_shapes()) == {"group_*(ts_*(F,N),G)", "rank(F)"}
     in_tmp(tmp_path, run)
 
 
@@ -1655,7 +1675,7 @@ def test_round_caps_the_overused_shape_and_suggests_others(tmp_path):
         assert "ts_regression(y, x, d)" not in prompt          # operator not on this account's list
         assert f"Propose {al.IDEAS_PER_ROUND + al.VARIETY_EXTRA_IDEAS} NEW" in prompt
         shapes = Counter(al.skeleton(r["expression"]) for r in rows)
-        assert shapes["ts_*(group_*(ts_*(F,N),G),N)"] == al.MAX_IDEAS_PER_CROWDED_SHAPE == 2
+        assert shapes["group_*(ts_*(F,N),G)"] == al.MAX_IDEAS_PER_CROWDED_SHAPE == 2
         assert len(rows) == 4                                   # 2 of the template + the 2 new shapes
     in_tmp(tmp_path, run)
 
@@ -1721,6 +1741,294 @@ def test_log_dir_keeps_a_dated_utf8_log(tmp_path):
         text = log.read_text(encoding="utf-8")
         assert "Trying 1 expression(s) you gave." in text and "Done: 1 simulation(s)" in text
         assert logging.getLogger().handlers == handlers_before    # file handler removed afterwards
+    in_tmp(tmp_path, run)
+
+
+# ---- Staying logged in (the expired-login bug from the 10 Oct log) ----
+
+def login_session(auth_reply, alpha_reply=None):
+    """A session whose GET /authentication answers auth_reply() and alpha lookups alpha_reply."""
+    state = {"logged_in": False}
+    session = MagicMock()
+
+    def get(url, **kw):
+        if url == be.AUTH_URL:
+            return fake_response(200, {"token": {"expiry": 14400}}) if state["logged_in"] else auth_reply()
+        return alpha_reply or fake_response(404, {"detail": "Not found."})
+
+    def authenticate(sess, email, password):
+        state["logged_in"] = True
+        return True
+
+    session.get.side_effect = get
+    return session, authenticate
+
+
+def test_saved_login_reused_only_with_enough_time_left(tmp_path):
+    def run():
+        Path(al.SESSION_FILE).write_text('{"sid": "saved"}', encoding="utf-8")
+        for expiry, expect_login in ((7200, False), (600, True)):
+            session, authenticate = login_session(lambda: fake_response(200, {"token": {"expiry": expiry}}))
+            with patch.object(al.requests, "Session", return_value=session), \
+                 patch.object(be, "authenticate", side_effect=authenticate) as auth:
+                assert al.get_authenticated_session("e@x.com", "pw") is session
+            assert auth.called == expect_login
+            assert abs(session.brain_expires_at - (_time.time() + (14400 if expect_login else 7200))) < 60
+    in_tmp(tmp_path, run)
+
+
+def test_the_expired_login_from_the_log_is_caught(tmp_path):
+    def run():
+        # What fooled the old check: logged out, BRAIN answered alpha lookups with "not found".
+        Path(al.SESSION_FILE).write_text('{"sid": "stale"}', encoding="utf-8")
+        session, authenticate = login_session(
+            lambda: fake_response(401, {"detail": "Incorrect authentication credentials."}))
+        with patch.object(al.requests, "Session", return_value=session), \
+             patch.object(be, "authenticate", side_effect=authenticate) as auth:
+            al.get_authenticated_session("e@x.com", "pw")
+        auth.assert_called_once()                                  # logged in fresh, not reused
+    in_tmp(tmp_path, run)
+
+
+def test_a_login_brain_cant_confirm_is_renewed(tmp_path):
+    def run():
+        Path(al.SESSION_FILE).write_text('{"sid": "saved"}', encoding="utf-8")
+        session, authenticate = login_session(lambda: fake_response(200, {"something": "else"}))
+        with patch.object(al.requests, "Session", return_value=session), \
+             patch.object(be, "authenticate", side_effect=authenticate) as auth:
+            al.get_authenticated_session("e@x.com", "pw")
+        auth.assert_called_once()
+    in_tmp(tmp_path, run)
+
+
+def test_login_renewed_before_it_runs_out_mid_run(tmp_path):
+    def run():
+        brain = SlowBrain({"rank(a)": calm(), "rank(b)": calm()})
+        brain.session.brain_expires_at = _time.time() + 60          # under 5 minutes left
+        rows = run_queue(brain, ["rank(a)"])
+        posts = [c.args[0] for c in brain.session.post.call_args_list]
+        assert posts[0] == be.AUTH_URL and posts[1].endswith("/simulations")   # logged in first
+        assert brain.session.brain_expires_at > _time.time() + 3600
+        assert rows[0]["status"] == "COMPLETE"
+        brain.session.post.reset_mock()
+        run_queue(brain, ["rank(b)"])                               # plenty of time left now
+        assert be.AUTH_URL not in [c.args[0] for c in brain.session.post.call_args_list]
+    in_tmp(tmp_path, run)
+
+
+def test_expired_login_while_reading_a_result_is_renewed_and_retried(tmp_path):
+    def run():
+        brain = SlowBrain({"rank(a)": calm(sharpe=0.7)})
+        real_get, state = brain.get, {"first": True}
+
+        def get(url, **kw):
+            if "/alphas/" in url and state["first"]:
+                state["first"] = False
+                return fake_response(401, {"detail": "Incorrect authentication credentials."})
+            return real_get(url, **kw)
+
+        brain.session.get.side_effect = get
+        rows = run_queue(brain, ["rank(a)"])
+        assert rows[0]["status"] == "COMPLETE" and rows[0]["sharpe"] == 0.7
+        assert [c.args[0] for c in brain.session.post.call_args_list].count(be.AUTH_URL) == 1
+    in_tmp(tmp_path, run)
+
+
+def test_a_finished_simulation_without_a_result_is_failed_not_blank(tmp_path):
+    def run():
+        brain = SlowBrain({"rank(a)": calm()})
+        real_get = brain.get
+        brain.session.get.side_effect = lambda url, **kw: (
+            fake_response(404, {"detail": "Not found."}) if "/alphas/" in url else real_get(url, **kw))
+        rows = run_queue(brain, ["rank(a)"])
+        assert rows[0]["status"] == "FAILED" and "didn't send its result" in rows[0]["error"]
+        assert rows[0]["alpha_link"].endswith(rows[0]["alpha_id"])
+    in_tmp(tmp_path, run)
+
+
+def test_identity_check_in_an_unattended_run_stops_cleanly(tmp_path):
+    def run():
+        offline = MagicMock()
+        offline.get.side_effect = _requests.ConnectionError("no answer")
+        with patch.object(be, "authenticate", side_effect=EOFError("no keyboard")), \
+             patch.object(al.requests, "Session", return_value=offline):
+            al.main(["--try", "rank(close)"])                       # returns, doesn't crash
+        assert not Path(al.RESULTS_FILE).exists()
+    in_tmp(tmp_path, run)
+
+
+def test_a_crash_is_written_to_the_log_file(tmp_path):
+    def run():
+        with patch.object(al, "run", side_effect=ValueError("boom")):
+            try:
+                al.main(["--log-dir", "logs"])
+                assert False, "should have raised"
+            except ValueError:
+                pass
+        text = next(Path("logs").glob("*.log")).read_text(encoding="utf-8")
+        assert "The run crashed" in text and "ValueError: boom" in text
+    in_tmp(tmp_path, run)
+
+
+# ---- Learning what doesn't work: rejected names and dead-end fields ----
+
+def failed_row(expression, error):
+    return dict(_history_row(expression, "", "", "", status="FAILED"), error=error)
+
+
+def test_names_brain_rejected_are_read_from_the_errors(tmp_path):
+    def run():
+        al.append_result(failed_row("rank(divide(net_income, assets))",
+                                    'Attempted to use unknown variable "net_income". <linkToCommonErrorMessages>'))
+        al.append_result(failed_row("trade_when(gt(news_max_up_ret, 0.05), rank(close), -1)",
+                                    'Attempted to use inaccessible or unknown operator "gt". <link>'))
+        al.append_result(failed_row("rank(close)", "timed out after 1200s"))
+        assert al.rejected_names() == {"net_income", "gt"}
+    in_tmp(tmp_path, run)
+
+
+def test_dead_end_fields_need_enough_tries_and_spare_the_basics(tmp_path):
+    def run():
+        for i in range(8):
+            al.append_result(_history_row(f"rank(ts_delta(news_max_up_ret, {i + 2}))", 0.1, 0.18 - i / 100, 0.3))
+            al.append_result(_history_row(f"rank(volume) * {i}", 0.1, 0.1, 0.3))            # basic: exempt
+            al.append_result(_history_row(f"rank(snt_buzz) + {i}", 1.0, 0.6 if i == 3 else 0.2, 0.3))  # one decent result
+        for i in range(7):
+            al.append_result(_history_row(f"rank(adv_thing_{0}) + {i}", 0.1, 0.1, 0.3))     # only 7 tries
+        assert al.dead_end_fields() == {"news_max_up_ret": (8, 0.18)}
+    in_tmp(tmp_path, run)
+
+
+def test_round_leaves_out_rejected_names_and_dead_ends(tmp_path):
+    def run():
+        al.append_result(failed_row("trade_when(gt(sales, 0), rank(sales), -1)",
+                                    'Attempted to use inaccessible or unknown operator "gt".'))
+        for i in range(8):
+            al.append_result(_history_row(f"ts_rank(news_max_up_ret, {10 * i + 10})", -0.3, 0.05, 0.25))
+        returned = [{"expression": "trade_when(gt(volume, adv20), rank(sales), -1)", "rationale": "r"},
+                    {"expression": "rank(ts_delta(news_max_up_ret, 5))", "rationale": "r"},
+                    {"expression": "rank(divide(sales, assets))", "rationale": "r"}]
+        client = MagicMock()
+        client.models.generate_content.return_value = fake_gemini_response(returned)
+        brain = SlowBrain({"rank(divide(sales, assets))": calm()})
+        operators = [{"name": n, "usage": f"{n}(...)"} for n in ("gt", "rank", "divide", "trade_when")]
+        fields = [{"name": n, "description": "d"} for n in ("news_max_up_ret", "sales", "assets")]
+        with patch("time.sleep"):
+            rows = al.run_round(brain.session, client, operators, fields, SETTINGS, "e@x.com", "pw", 1, "round 1", set())
+        assert [r["expression"] for r in rows] == ["rank(divide(sales, assets))"]   # the other two cost nothing
+        prompt = client.models.generate_content.call_args.kwargs["contents"]
+        assert "never use them: gt." in prompt and "- gt: gt(...)" not in prompt
+        assert "news_max_up_ret (8 tries, best 0.05)" in prompt and "- news_max_up_ret: d" not in prompt
+    in_tmp(tmp_path, run)
+
+
+# ---- Auto-sharpen slow near-misses; log the checks we can't fix ----
+
+import contextlib
+import logging as _logging
+
+SLOW = "ts_decay_linear(group_rank(ts_delta(anl4_ebit_value, 60), market), 10)"   # 1.50 / 0.98 / 4.9% on 10 Oct
+SHARPER = "group_rank(ts_delta(anl4_ebit_value, 60), market)"
+FITNESS_FAIL = [{"name": "LOW_SHARPE", "result": "PASS"}, {"name": "LOW_FITNESS", "result": "FAIL"},
+                {"name": "SELF_CORRELATION", "result": "PENDING"}]
+
+
+def slow_near_miss():
+    return alpha_json(sharpe=1.5, fitness=0.98, turnover=0.0489, checks=FITNESS_FAIL)
+
+
+@contextlib.contextmanager
+def captured_logs():
+    lines = []
+
+    class Grab(_logging.Handler):
+        def emit(self, record):
+            lines.append(record.getMessage())
+
+    handler = Grab()
+    al.logger.addHandler(handler)
+    try:
+        yield lines
+    finally:
+        al.logger.removeHandler(handler)
+
+
+def test_slow_alpha_with_good_sharpe_is_tested_without_its_smoothing(tmp_path):
+    def run():
+        brain = SlowBrain({SLOW: slow_near_miss(), SHARPER: calm(), "rank(b)": calm()})
+        rows = run_queue(brain, [SLOW, "rank(b)"], parallel=1)
+        assert brain.started == [SLOW, SHARPER, "rank(b)"]
+        sharpened = next(r for r in rows if r["expression"] == SHARPER)
+        assert sharpened["rationale"].startswith(f"Auto-sharpen of {SLOW}: Sharpe 1.50 but fitness 0.98 at 4.9%")
+    in_tmp(tmp_path, run)
+
+
+def test_a_sharpened_result_is_not_smoothed_back(tmp_path):
+    def run():
+        slow20 = SLOW.replace(", 10)", ", 20)")          # its 10-day smoothing would be a new expression
+        brain = SlowBrain({slow20: slow_near_miss(),
+                           SHARPER: alpha_json(sharpe=1.6, fitness=0.9, turnover=0.3, checks=FITNESS_FAIL)})
+        run_queue(brain, [slow20], parallel=1)
+        assert brain.started == [slow20, SHARPER]
+    in_tmp(tmp_path, run)
+
+
+def test_no_sharpening_when_too_similar_too_fast_or_nothing_to_remove(tmp_path):
+    def run():
+        brain = SlowBrain({SLOW: slow_near_miss()}, corr=0.9)
+        run_queue(brain, [SLOW])
+        assert brain.started == [SLOW]                             # too similar to submitted alphas
+    in_tmp(tmp_path, run)
+    assert not al.needs_sharpening({"expression": SLOW, "sharpe": 1.5, "fitness": 0.9, "turnover": 0.2})
+    assert not al.needs_sharpening({"expression": SHARPER, "sharpe": 1.5, "fitness": 0.9, "turnover": 0.05})
+    assert not al.needs_sharpening({"expression": SLOW, "sharpe": 1.1, "fitness": 0.9, "turnover": 0.05})
+    assert al.needs_sharpening({"expression": SLOW, "sharpe": 1.5, "fitness": 0.98, "turnover": 0.0489})
+
+
+def test_earlier_slow_near_misses_are_sharpened_at_the_start_of_a_run(tmp_path):
+    def run():
+        _write_operators()
+        other = "ts_decay_linear(group_rank(ts_zscore(anl4_ebit_value, 120), sector), 20)"
+        al.append_result(dict(_history_row(SLOW, 1.5, 0.98, 0.0489), alpha_id="s1", timestamp="2026-10-10 12:07:05"))
+        al.append_result(dict(_history_row(other, 1.38, 0.89, 0.0406), alpha_id="s2", timestamp="2026-10-10 11:54:35"))
+        stripped = "group_rank(ts_zscore(anl4_ebit_value, 120), sector)"
+        brain = SlowBrain({SHARPER: calm(), stripped: calm(), "rank(close)": calm()},
+                          existing={"s1": SLOW, "s2": other})
+        gen = MagicMock(return_value=[("rank(close)", "r")])
+        with patch.object(al, "MAX_ROUNDS", 1), patch.object(al, "generate_with_fallback", gen), \
+             patch.object(al, "get_authenticated_session", return_value=brain.session), \
+             patch("google.genai.Client"), patch("time.sleep"):
+            al.main([])
+        assert brain.started[:2] == [SHARPER, stripped] and brain.started[2] == "rank(close)"
+        assert {r["expression"]: r["round"] for r in csv_rows()}[SHARPER] == "repair"
+    in_tmp(tmp_path, run)
+
+
+def test_a_check_we_cant_fix_is_named_in_the_log(tmp_path):
+    def run():
+        unfixable = [{"name": "MATCHES_COMPETITION", "result": "FAIL"}, {"name": "SELF_CORRELATION", "result": "PENDING"}]
+        brain = SlowBrain({DIVIDEND: near_miss(unfixable)})
+        with captured_logs() as lines:
+            run_queue(brain, [DIVIDEND])
+        assert "  Strong numbers but failed MATCHES_COMPETITION - no automatic fix for that check." in lines
+    in_tmp(tmp_path, run)
+
+
+def test_earlier_near_misses_always_say_why_they_werent_repaired(tmp_path):
+    def run():
+        al.append_result(dict(_history_row(DIVIDEND, 1.35, 1.34, 0.1349), alpha_id="div", submitted="NO"))
+        cases = [([{"name": "MATCHES_COMPETITION", "result": "FAIL"}], "fails MATCHES_COMPETITION - no automatic fix"),
+                 ([{"name": "SELF_CORRELATION", "result": "PENDING"}], "BRAIN lists no failed check")]
+        for checks, expected in cases:
+            brain = SlowBrain({DIVIDEND: near_miss(checks)}, existing={"div": DIVIDEND})
+            with captured_logs() as lines, patch("time.sleep"):
+                assert al.repair_past_near_misses(brain.session, SETTINGS, "e@x.com", "pw", set()) == []
+            assert any(expected in line for line in lines), lines
+        empty = SlowBrain({}, existing={})
+        empty.session.get.side_effect = lambda url, **kw: fake_response(404, {"detail": "Not found."})
+        with captured_logs() as lines, patch("time.sleep"):
+            al.repair_past_near_misses(empty.session, SETTINGS, "e@x.com", "pw", set())
+        assert any("couldn't read BRAIN's record of it" in line for line in lines), lines
     in_tmp(tmp_path, run)
 
 
