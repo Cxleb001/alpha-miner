@@ -36,7 +36,8 @@ nothing was simulated in that case, so no BRAIN quota was spent.
 
 READ BEFORE YOU RUN THIS:
 - It spends real BRAIN simulation quota and real Gemini API cost, unattended, up to the
-  caps below (defaults: 5 rounds x 8 ideas = 40 simulations max per run). Raise
+  caps below (defaults: 5 rounds x 8 ideas = 40 simulations per run, plus follow-ups - and on a day
+  with nothing submitted yet, up to 10 extra rounds within the 4-hour cap). Raise
   IDEAS_PER_ROUND / MAX_ROUNDS via env vars once you trust it, not before.
 - This version can AUTONOMOUSLY SUBMIT alphas to BRAIN, at most MAX_SUBMISSIONS_PER_DAY
   (default 1) per BRAIN day, which starts at 3 AM US Eastern, not local midnight. An alpha
@@ -77,6 +78,31 @@ READ BEFORE YOU RUN THIS:
   ts_decay_linear/hump (up to MAX_SHARPENS_PER_ROUND, default 3), after the same free similarity check.
 - Each normal run starts by re-examining up to MAX_PAST_REPAIRS (default 8) earlier near-misses whose
   repairs or sharpening haven't been tried.
+- Never miss a day (the Gold leaderboard counts the days you submitted on): a normal run that still has
+  nothing submitted for today after MAX_ROUNDS keeps going - up to MAX_EXTRA_ROUNDS (default 10) more rounds,
+  within the MAX_RUNTIME_SECONDS cap - and stops as soon as one lands. Before each extra round the held
+  queue gets another try. A submission only counts toward the day once BRAIN takes it: if BRAIN rejects
+  one, the run goes on to the next good alpha. If a submit doesn't go through at all (connection dropped,
+  BRAIN throttling), the alpha is held and tried again rather than lost.
+- Reserve: today's first submission always goes in. Any more, up to MAX_SUBMISSIONS_PER_DAY, only when at
+  least RESERVE_TARGET (default 3) other kinds of good alpha would still be waiting for the coming days.
+  An alpha's kind is the BRAIN dataset its data fields come from (data_fields_cache.json; without it, the
+  field name minus its numbers): alphas on the same data usually come back too similar to submit both, so
+  near-copies count once. Only alphas BRAIN confirmed during this run count. RESERVE_TARGET=0 turns it off.
+- Strong alphas first: an alpha that clears BRAIN's bar counts as strong with Sharpe >= STRONG_MIN_SHARPE (1.6),
+  fitness >= STRONG_MIN_FITNESS (1.3) and annual returns above its worst drawdown (STRONG_MIN_RETURNS_TO_DRAWDOWN,
+  1.0; 0 turns that part off). A strong alpha goes in straight away; one that only clears BRAIN's bar is held
+  ("not strong"). Held alphas are ranked strong first, then by fitness, on BRAIN's latest numbers. If nothing
+  has gone in by the end of the usual MAX_ROUNDS rounds - or the run stops early, or a --try run ends - the run
+  settles: the best held alpha that clears BRAIN's bar goes in, so the day still counts. Submissions beyond the
+  day's first must be strong. Returns and drawdown are saved in the results file (an older file gets the two
+  columns added once) and shown to the generator, which is told the strong targets.
+- --backup, for a second scheduled run later in the day: if today's submission is already in and the
+  reserve is full, it stops after re-checking the held queue; otherwise it mines like a normal run.
+- Before/after check: before each submission, and for each alpha it holds, the loop asks BRAIN's free
+  "before and after" check - how your merged performance (what the leaderboard's IS Score ranks) would
+  change with that alpha. BRAIN publishes no format for the reply, so for now it's only recorded - a
+  one-line summary in the log, the full reply in logs/before_after_checks.jsonl - and decides nothing.
 - Learning what doesn't work: any operator or field BRAIN rejects ('unknown variable/operator') is
   read back from the results file, removed from what the generator sees, and ideas still using it are
   dropped before they cost a simulation. Fields tried DEAD_END_MIN_TRIES (default 8) times without
@@ -85,7 +111,7 @@ READ BEFORE YOU RUN THIS:
 - Variety: alphas built on the same kind of data usually come back too correlated to submit. Each
   field is labelled with its data type - BRAIN's own category from data_fields_cache.json (written by
   fetch_fields.py), or the dataset name in operators.json without it. The generator is told which types
-  your submitted or queued alphas already use, and asked for VARIETY_EXTRA_IDEAS (default 4) spare
+  your submitted or queued alphas already use, and asked for VARIETY_EXTRA_IDEAS (default 6) spare
   ideas; the loop then keeps at most MAX_IDEAS_PER_TYPE (default 2) per type per round, and at most
   MAX_IDEAS_PER_CROWDED_TYPE (default 1) for types you've already submitted.
 - Formula shape: each expression is reduced to its skeleton (smoothing wrapped around the outside,
@@ -138,8 +164,14 @@ logger = logging.getLogger(__name__)
 # ---- Guardrails: real quota and real money per round. Keep these low until you trust it. ----
 IDEAS_PER_ROUND = int(os.environ.get("IDEAS_PER_ROUND", 8))
 MAX_ROUNDS = int(os.environ.get("MAX_ROUNDS", 5))
+MAX_EXTRA_ROUNDS = int(os.environ.get("MAX_EXTRA_ROUNDS", 10))  # past MAX_ROUNDS, only while nothing is in for today
 MAX_RUNTIME_SECONDS = int(os.environ.get("MAX_RUNTIME_SECONDS", 4 * 60 * 60))  # ~ BRAIN's own session lifetime
 MAX_SUBMISSIONS_PER_DAY = int(os.environ.get("MAX_SUBMISSIONS_PER_DAY", 1))  # BRAIN's own submitter tools cap at 1/day
+RESERVE_TARGET = int(os.environ.get("RESERVE_TARGET", 3))  # kinds of good alpha kept back before a 2nd one a day
+# Strong alphas go in first; one that only clears BRAIN's bar waits until the usual rounds are done.
+STRONG_MIN_SHARPE = float(os.environ.get("STRONG_MIN_SHARPE", 1.6))
+STRONG_MIN_FITNESS = float(os.environ.get("STRONG_MIN_FITNESS", 1.3))
+STRONG_MIN_RETURNS_TO_DRAWDOWN = float(os.environ.get("STRONG_MIN_RETURNS_TO_DRAWDOWN", 1.0))  # 0 turns this part off
 
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
 # Google's own Gemini 3.8 Flash docs name 3.7 Flash as the fully supported alternative.
@@ -160,6 +192,11 @@ CORR_POLL_MAX_SECONDS = int(os.environ.get("CORR_POLL_MAX_SECONDS", 300))
 SUBMIT_POLL_MAX_SECONDS = int(os.environ.get("SUBMIT_POLL_MAX_SECONDS", 600))
 CORRELATION_URL = "https://api.worldquantbrain.com/alphas/{alpha_id}/correlations/self"
 SUBMIT_URL = "https://api.worldquantbrain.com/alphas/{alpha_id}/submit"
+# BRAIN's free 'before and after' check: how your merged performance would change with one more alpha.
+# The address follows WorldQuant's own ACE library; the reply's layout isn't published, so it's only recorded.
+BEFORE_AFTER_URL = "https://api.worldquantbrain.com/users/self/alphas/{alpha_id}/before-and-after-performance"
+BEFORE_AFTER_FILE = os.path.join("logs", "before_after_checks.jsonl")
+BEFORE_AFTER_MAX_SECONDS = int(os.environ.get("BEFORE_AFTER_MAX_SECONDS", 120))
 
 # Auto-flip: a strongly negative Sharpe is a real signal pointing the wrong way, so test its reverse.
 FLIP_SHARPE_AT_OR_BELOW = float(os.environ.get("FLIP_SHARPE_AT_OR_BELOW", -1.0))
@@ -222,15 +259,18 @@ RESULTS_FILE = "alpha_loop_results.csv"  # separate from brain_engine.py's own r
 SESSION_FILE = "session_cookies.json"
 SESSION_MIN_SECONDS = 30 * 60   # reuse a saved BRAIN login only if it has at least this long left
 SESSION_RENEW_SECONDS = 5 * 60  # during a run, log in again this long before the login runs out
-SUBMISSION_LOG_FILE = "submissions_log.json"  # {"YYYY-MM-DD": count} - enforces the daily cap across runs
+SUBMISSION_LOG_FILE = "submissions_log.json"  # {"YYYY-MM-DD": submissions BRAIN took that day} - shared by every run
 HELD_PREFIX = "QUALIFIED_NOT_SUBMITTED"
 HELD_LABEL = f"{HELD_PREFIX} (daily cap reached)"  # cleared the bar, waiting for a free submission slot
+HELD_RETRY_LABEL = f"{HELD_PREFIX} (submit didn't go through - tried again next run)"
+HELD_FOR_STRONGER_LABEL = f"{HELD_PREFIX} (not strong - kept in case a stronger one turns up)"
 REPLACE_ATTEMPTS = 5  # Windows blocks swapping in the updated CSV while another program is reading it
 HELD_CHECK_BUDGET_SECONDS = int(os.environ.get("HELD_CHECK_BUDGET_SECONDS", 300))  # per run, for re-checking held alphas
 
 RESULTS_HEADER = [
     "round", "timestamp", "expression", "rationale", "status", "sharpe", "fitness",
     "turnover", "checks_passed", "checks_total", "alpha_id", "alpha_link", "error", "submitted",
+    "returns", "drawdown",
 ]
 
 
@@ -409,6 +449,16 @@ def as_float(val):
         return None
 
 
+def returns_note(row) -> str:
+    """' returns=... drawdown=...' when BRAIN reported them, flagging an alpha that lost more in its worst
+    stretch than it made over the year."""
+    returns, drawdown = as_float(row.get("returns")), as_float(row.get("drawdown"))
+    if returns is None or drawdown is None:
+        return ""
+    return f" returns={row['returns']} drawdown={row['drawdown']}" + (
+        " RETURNS BELOW DRAWDOWN" if returns <= abs(drawdown) else "")
+
+
 def turnover_note(row) -> str:
     turnover = as_float(row.get("turnover"))
     if turnover is None:
@@ -432,7 +482,7 @@ def summarize_round(rows: list) -> str:
     for r in ranked:
         lines.append(
             f"- {r['expression']} -> sharpe={r['sharpe']} fitness={r['fitness']} "
-            f"turnover={r['turnover']}{turnover_note(r)} checks={r['checks_passed']}/{r['checks_total']} "
+            f"turnover={r['turnover']}{turnover_note(r)}{returns_note(r)} checks={r['checks_passed']}/{r['checks_total']} "
             f"submitted={r.get('submitted', 'NO')}"
             + (f" not_passing=[{r['failing_checks']}]" if r.get("failing_checks") else "")
         )
@@ -538,7 +588,12 @@ def field_types(fields) -> dict:
 
 
 def expression_types(expression: str, type_map: dict) -> set:
-    return {type_map[word] for word in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", expression) if word in type_map}
+    """The data types an expression uses. Basic price/volume data (close, returns, volume...) goes into most
+    formulas as an ingredient, so it only counts when the formula uses nothing else."""
+    words = {w for w in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", expression) if w in type_map}
+    basic = {type_map[b] for b in BASIC_FIELDS if b in type_map}
+    main = {type_map[w] for w in words if w not in BASIC_FIELDS and type_map[w] not in basic}
+    return main or {type_map[w] for w in words}
 
 
 def crowded_types(type_map: dict) -> Counter:
@@ -558,7 +613,23 @@ def per_type_cap(n: int, type_map: dict) -> int:
     return max(MAX_IDEAS_PER_TYPE, math.ceil(n / max(1, len(set(type_map.values())))))
 
 
-def variety_rule(type_map: dict, crowded: Counter, n: int) -> str:
+def type_quota(type_map: dict, crowded: Counter, asked: int) -> dict:
+    """How many of the `asked` ideas to request per data type. Types your submitted or queued alphas already
+    use get MAX_IDEAS_PER_CROWDED_TYPE each; the rest is dealt out over the other types one at a time - types
+    with more fields first, none more than twice its number of fields - so the ideas can fill a round
+    within the per-type limits instead of piling onto one type."""
+    fields_per_type = Counter(type_map.values())
+    order = sorted(fields_per_type, key=lambda t: (t in crowded, -fields_per_type[t], t))
+    room = {t: MAX_IDEAS_PER_CROWDED_TYPE if t in crowded else 2 * fields_per_type[t] for t in order}
+    quota = Counter()
+    while sum(quota.values()) < asked and any(quota[t] < room[t] for t in order):
+        for t in order:
+            if quota[t] < room[t] and sum(quota.values()) < asked:
+                quota[t] += 1
+    return {t: quota[t] for t in order if quota[t]}
+
+
+def variety_rule(type_map: dict, crowded: Counter, n: int, asked: int = 0) -> str:
     all_types = sorted(set(type_map.values()))
     if len(all_types) < 2:
         return ""
@@ -572,8 +643,15 @@ def variety_rule(type_map: dict, crowded: Counter, n: int) -> str:
     fresh = [t for t in all_types if t not in crowded]
     if fresh:
         lines.append(f"- Not used yet - favour these: {', '.join(fresh)}.")
-    lines.append(f"- At most {per_type_cap(n, type_map)} ideas per data type. Carry the shapes that scored well "
-                 f"(operators, windows, grouping, decay) over to other data types instead of repeating the same data.")
+    quota = type_quota(type_map, crowded, asked or n)
+    rest = (asked or n) - sum(quota.values())
+    spread = ", ".join(f"{t} {q}" for t, q in quota.items()) + (f", and {rest} on any type" if rest > 0 else "")
+    lines.append(f"- Write exactly this many ideas per data type: {spread}. Put your best idea for each type first: "
+                 f"only the first {per_type_cap(n, type_map)} of a type"
+                 + (f" ({MAX_IDEAS_PER_CROWDED_TYPE} for the types your alphas already use)" if crowded else "")
+                 + " are sure to be tested, the rest are spares.")
+    lines.append("- Carry the shapes that scored well (operators, windows, grouping, decay) over to other data types "
+                 "instead of repeating the same data.")
     return "\n".join(lines)
 
 
@@ -669,27 +747,49 @@ def label_fields(fields, type_map: dict) -> list:
 
 
 def pick_varied(ideas, type_map: dict, crowded: Counter, n: int, overused_shapes=()) -> list:
-    """Keep up to n ideas, in Gemini's order, without going over the per-type caps or using an
-    overused formula shape more than MAX_IDEAS_PER_CROWDED_SHAPE times."""
+    """Keep up to n ideas, in Gemini's order, without going over the per-type limits or using an overused
+    formula shape more than MAX_IDEAS_PER_CROWDED_SHAPE times. If the limits leave free slots, ideas they held
+    back are let in after all - each data type up to twice its usual limit - rather than run a half-empty round."""
     cap = per_type_cap(n, type_map)
-    used, shapes_used, kept, by_type, by_shape = Counter(), Counter(), [], 0, 0
-    for expression, rationale in ideas:
-        types_used = expression_types(expression, type_map)
-        if any(used[t] >= (MAX_IDEAS_PER_CROWDED_TYPE if t in crowded else cap) for t in types_used):
-            by_type += 1
-            continue
-        shape = skeleton(expression)
-        if shape in overused_shapes and shapes_used[shape] >= MAX_IDEAS_PER_CROWDED_SHAPE:
-            by_shape += 1
-            continue
+
+    def limit(t, stretch=1):
+        return stretch * (MAX_IDEAS_PER_CROWDED_TYPE if t in crowded else cap)
+
+    used, shapes_used, kept, held_back, by_shape = Counter(), Counter(), [], [], 0
+
+    def keep(expression, rationale, types_used, shape):
         kept.append((expression, rationale))
         used.update(types_used)
         shapes_used[shape] += 1
+
+    for expression, rationale in ideas:
         if len(kept) == n:
             break
-    if by_type or by_shape:
-        logger.info("Variety: skipped %d idea(s) leaning on data types already used enough this round and "
-                    "%d repeating an overused formula shape.", by_type, by_shape)
+        types_used = expression_types(expression, type_map)
+        shape = skeleton(expression)
+        if any(used[t] >= limit(t) for t in types_used):
+            held_back.append((expression, rationale, types_used, shape))
+            continue
+        if shape in overused_shapes and shapes_used[shape] >= MAX_IDEAS_PER_CROWDED_SHAPE:
+            by_shape += 1
+            continue
+        keep(expression, rationale, types_used, shape)
+
+    let_in = 0
+    for expression, rationale, types_used, shape in held_back:
+        if len(kept) == n:
+            break
+        if any(used[t] >= limit(t, 2) for t in types_used):
+            continue
+        if shape in overused_shapes and shapes_used[shape] >= MAX_IDEAS_PER_CROWDED_SHAPE:
+            continue
+        keep(expression, rationale, types_used, shape)
+        let_in += 1
+
+    if held_back or by_shape:
+        logger.info("Variety: skipped %d idea(s) leaning on data types already used enough this round%s and %d "
+                    "repeating an overused formula shape.", len(held_back) - let_in,
+                    f" ({let_in} more let in to fill the round)" if let_in else "", by_shape)
     if kept:
         logger.info("This round: %d idea(s) in %d different formula shape(s).", len(kept), len(shapes_used))
     if used:
@@ -711,7 +811,7 @@ def build_feedback(last_round_rows=None) -> str:
                  f"marked [submitted] or [queued] usually comes back too similar to submit."]
         for r in best:
             lines.append(f"- {r['expression']} -> sharpe={r['sharpe']} fitness={r['fitness']} "
-                         f"turnover={r['turnover']}{turnover_note(r)}{pool_tag(r)}")
+                         f"turnover={r['turnover']}{turnover_note(r)}{returns_note(r)}{pool_tag(r)}")
         parts.append("\n".join(lines))
     if last_round_rows:
         parts.append(summarize_round(last_round_rows))
@@ -730,6 +830,8 @@ def generate_ideas(client: genai.Client, model: str, operators, fields, settings
         f"ONLY use these data fields, exactly as named (do not invent others):\n{field_list}\n\n"
         f"BRAIN only accepts an alpha with Sharpe >= {SUBMIT_MIN_SHARPE}, fitness >= {SUBMIT_MIN_FITNESS} "
         f"and turnover between {TURNOVER_MIN} and {TURNOVER_MAX} (1% to 70% of the book traded per day). "
+        f"Only just clearing that bar isn't enough to rank well, though: aim for {strong_note()}, and favour "
+        f"steady signals over ones that only work in one or two years. "
         f"High turnover also drags fitness down, so favour smoother signals: longer lookback windows, "
         f"ts_decay_linear, or hump. Ideas that scored a strongly negative Sharpe are re-tested reversed "
         f"automatically, and promising ideas that trade too much are re-tested smoothed with "
@@ -893,6 +995,103 @@ def is_active_on_brain(session, alpha_id: str) -> bool:
     return be.fetch_alpha(session, alpha_id).get("status") == "ACTIVE"
 
 
+def landed(outcome) -> bool:
+    """Whether a 'submitted' value means BRAIN took the alpha - what counts toward today."""
+    outcome = str(outcome or "")
+    return outcome == "YES" or outcome.startswith("VERDICT_PENDING")
+
+
+# ---- BRAIN's before-and-after check: what this alpha would do to your merged performance ----
+
+def before_after(session, alpha_id: str):
+    """Ask BRAIN's free 'before and after' check, the one its Check Submission screen shows: your merged
+    performance - what the leaderboard's IS Score ranks - with and without this alpha. Waits while BRAIN
+    says it's still working (Retry-After), for up to BEFORE_AFTER_MAX_SECONDS. Returns (status code, reply),
+    or (None, None) if BRAIN couldn't be reached."""
+    url = BEFORE_AFTER_URL.format(alpha_id=alpha_id)
+    deadline = time.time() + BEFORE_AFTER_MAX_SECONDS
+    while True:
+        try:
+            resp = session.get(url, timeout=be.REQUEST_TIMEOUT)
+        except requests.RequestException:
+            return None, None
+        if still_working(resp) and time.time() < deadline:
+            time.sleep(wait_seconds(resp))
+            continue
+        try:
+            return resp.status_code, resp.json()
+        except ValueError:
+            return resp.status_code, (resp.text or "")[:500]
+
+
+def _number(value):
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def before_after_summary(reply) -> str:
+    """'score 5627 -> 5710 (+83); sharpe 2.1 -> 2.14; ...' from whatever BRAIN sent, or the reply's field
+    names if it isn't laid out as before/after pairs - the full reply is kept in BEFORE_AFTER_FILE either way."""
+    if not isinstance(reply, dict):
+        return f"reply saved ({type(reply).__name__})"
+    parts = []
+    score = reply.get("score")
+    if isinstance(score, dict):
+        before, after = _number(score.get("before")), _number(score.get("after"))
+        if before is not None and after is not None:
+            parts.append(f"score {before:g} -> {after:g} ({after - before:+g})")
+    stats = reply.get("stats")
+    if isinstance(stats, dict) and isinstance(stats.get("before"), dict) and isinstance(stats.get("after"), dict):
+        for key in ("sharpe", "fitness", "returns", "turnover", "drawdown", "margin"):
+            before, after = _number(stats["before"].get(key)), _number(stats["after"].get(key))
+            if before is not None and after is not None:
+                parts.append(f"{key} {before:.3g} -> {after:.3g}")
+    if parts:
+        return "; ".join(parts)
+    return "reply saved - its fields: " + (", ".join(sorted(str(k) for k in reply)[:12]) or "none")
+
+
+BEFORE_AFTER_REFUSED = False  # BRAIN said this account may not use the check - don't ask again this run
+
+
+def record_before_after(session, alpha_id: str, when: str):
+    """Record BRAIN's before-and-after check for this alpha: a one-line summary in the log, the full reply
+    appended to BEFORE_AFTER_FILE. Only recorded for now - nothing is decided on it. Never stops the run.
+    If BRAIN refuses it (403: not open to this account), the rest of the run doesn't ask again."""
+    global BEFORE_AFTER_REFUSED
+    if BEFORE_AFTER_REFUSED:
+        return None
+    try:
+        status, reply = before_after(session, alpha_id)
+        if status is None:
+            logger.info("  Couldn't reach BRAIN for the before/after check on %s - carrying on.", alpha_id)
+            return None
+        Path(BEFORE_AFTER_FILE).parent.mkdir(parents=True, exist_ok=True)
+        with open(BEFORE_AFTER_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"time": time.strftime("%Y-%m-%d %H:%M:%S"), "alpha_id": alpha_id, "when": when,
+                                "status": status, "reply": reply}, ensure_ascii=False, default=str) + "\n")
+        if status == 403:
+            BEFORE_AFTER_REFUSED = True
+            detail = reply.get("detail") if isinstance(reply, dict) else reply
+            logger.info("  BRAIN's before/after check isn't open to your account (%s) - not asking again this run.",
+                        str(detail)[:150])
+            return None
+        if status != 200:
+            logger.info("  BRAIN's before/after check on %s answered %s: %s", alpha_id, status, str(reply)[:150])
+            return None
+        logger.info("  Before/after check on %s (%s): %s", alpha_id, when, before_after_summary(reply))
+        return reply
+    except Exception as exc:
+        logger.warning("  The before/after check on %s hit a problem (%s: %s) - carrying on.",
+                       alpha_id, type(exc).__name__, str(exc)[:100])
+        return None
+
+
 _UNCHECKED = object()  # try_submit's default: no self-correlation reading taken yet
 
 
@@ -915,10 +1114,11 @@ def try_submit(session, alpha_id: str, corr=_UNCHECKED) -> str:
     else:
         logger.info("Self-correlation %.2f - under the %.1f limit.", corr, MAX_SELF_CORRELATION)
 
+    record_before_after(session, alpha_id, "before submitting")
     logger.info("Alpha %s qualifies - submitting.", alpha_id)
     state, detail = submit_alpha(session, alpha_id)
-    if state in ("YES", "REJECTED", "VERDICT_PENDING"):
-        record_submission()  # BRAIN processed it, so it counts against today's limit
+    if state in ("YES", "VERDICT_PENDING"):
+        record_submission()  # BRAIN took it, so it counts toward today. A rejection doesn't: the run tries the next one
     if state == "YES":
         try:
             if not is_active_on_brain(session, alpha_id):
@@ -1156,21 +1356,249 @@ def qualifies(metrics: dict, checks: list) -> bool:
     return True
 
 
+# ---- Strong alphas: well over BRAIN's bar, and earning more than they lose in their worst stretch ----
+
+def strong_note() -> str:
+    note = f"Sharpe {STRONG_MIN_SHARPE:g}+, fitness {STRONG_MIN_FITNESS:g}+"
+    if STRONG_MIN_RETURNS_TO_DRAWDOWN == 1:
+        note += ", returns above drawdown"
+    elif STRONG_MIN_RETURNS_TO_DRAWDOWN > 0:
+        note += f", returns over {STRONG_MIN_RETURNS_TO_DRAWDOWN:g}x drawdown"
+    return note
+
+
+def is_strong(sharpe, fitness, returns=None, drawdown=None) -> bool:
+    """Sharpe and fitness at or over the STRONG_ bars and - unless STRONG_MIN_RETURNS_TO_DRAWDOWN is 0 - annual
+    returns above the worst drawdown (times that ratio). Numbers BRAIN didn't report never count as strong."""
+    sharpe, fitness = as_float(sharpe), as_float(fitness)
+    if sharpe is None or fitness is None or sharpe < STRONG_MIN_SHARPE or fitness < STRONG_MIN_FITNESS:
+        return False
+    if STRONG_MIN_RETURNS_TO_DRAWDOWN <= 0:
+        return True
+    returns, drawdown = as_float(returns), as_float(drawdown)
+    if returns is None or drawdown is None:
+        return False
+    return returns > abs(drawdown) * STRONG_MIN_RETURNS_TO_DRAWDOWN
+
+
+def _blank(value):
+    return "" if value is None else value
+
+
+def row_is_strong(row) -> bool:
+    return is_strong(row.get("sharpe"), row.get("fitness"), row.get("returns"), row.get("drawdown"))
+
+
+def strength(row) -> tuple:
+    """Sort key, best first with reverse=True: strong alphas, then fitness, then Sharpe."""
+    return row_is_strong(row), safe_float(row.get("fitness")), safe_float(row.get("sharpe"))
+
+
+# ---- The results file ----
+
+def results_columns():
+    """The results file's own column names - None if it doesn't exist yet or is empty."""
+    try:
+        with open(RESULTS_FILE, encoding="utf-8", newline="") as f:
+            return next(csv.reader(f), None) or None
+    except OSError:
+        return None
+
+
 def append_result(row: dict):
-    is_new = not Path(RESULTS_FILE).exists()
+    """Add one row, in the file's own columns: if an older file couldn't be given the newer columns yet,
+    the row still lines up with its header."""
+    columns = results_columns()
     with open(RESULTS_FILE, "a", newline="", encoding="utf-8") as f:
         # extrasaction="ignore": rows carry in-memory extras (failing_checks) the CSV doesn't store
-        writer = csv.DictWriter(f, fieldnames=RESULTS_HEADER, extrasaction="ignore")
-        if is_new:
+        writer = csv.DictWriter(f, fieldnames=columns or RESULTS_HEADER, extrasaction="ignore")
+        if not columns:
             writer.writeheader()
         writer.writerow(row)
+
+
+def upgrade_results_file():
+    """Give a results file from an older version the newer columns (returns, drawdown), once, keeping every
+    row. Written to a temporary file and swapped in; if Windows won't allow the swap (the file is open in
+    another program), new rows keep the old columns and the next run tries again."""
+    columns = results_columns()
+    if not columns or all(c in columns for c in RESULTS_HEADER):
+        return
+    with open(RESULTS_FILE, encoding="utf-8", newline="") as f:
+        rows = list(csv.DictReader(f))
+    header = columns + [c for c in RESULTS_HEADER if c not in columns]
+    tmp = Path(RESULTS_FILE + ".tmp")
+    with open(tmp, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=header, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+    for attempt in range(REPLACE_ATTEMPTS):
+        try:
+            os.replace(tmp, RESULTS_FILE)
+            logger.info("Added the %s column(s) to %s.", ", ".join(c for c in header if c not in columns),
+                        RESULTS_FILE)
+            return
+        except OSError:
+            if attempt < REPLACE_ATTEMPTS - 1:
+                time.sleep(1)
+    try:
+        tmp.unlink()
+    except OSError:
+        pass
+    logger.warning("Couldn't add the new columns to %s (is it open in another program?) - trying again next run.",
+                   RESULTS_FILE)
+
+
+# ---- Never miss a day: keep good alphas back for the coming days ----
+
+_DATASETS = {"key": None, "map": {}}
+
+
+def field_datasets() -> dict:
+    """{field: BRAIN dataset id} from data_fields_cache.json (written by fetch_fields.py). Read again only
+    when the file changes - it can be several megabytes."""
+    path = Path(FIELDS_CACHE_FILE)
+    try:
+        stat = path.stat()
+    except OSError:
+        return {}
+    key = (str(path.resolve()), stat.st_mtime_ns, stat.st_size)
+    if _DATASETS["key"] != key:
+        found = {}
+        try:
+            for f in json.loads(path.read_text(encoding="utf-8")).get("matrix_fields") or []:
+                dataset = f.get("dataset") if isinstance(f, dict) else None
+                dataset = (dataset.get("id") or dataset.get("name")) if isinstance(dataset, dict) else dataset
+                if dataset and f.get("id"):
+                    found[str(f["id"])] = str(dataset)
+        except (OSError, ValueError, AttributeError):
+            found = {}
+        _DATASETS.update(key=key, map=found)
+    return _DATASETS["map"]
+
+
+PRICE_VOLUME = "price/volume"
+
+
+def alpha_kind(expression: str) -> frozenset:
+    """What an alpha is built on, to tell near-copies apart: the BRAIN dataset of each data field it uses,
+    or - for a field the dataset isn't known for - its name without the numbers (implied_volatility_put_90
+    and implied_volatility_put_180 are one kind). Basic price/volume data is an ingredient of most alphas,
+    so it only counts when there's nothing else. Two alphas sharing any of these usually come back too
+    similar to submit both."""
+    datasets = field_datasets()
+    basic = {datasets.get(name) for name in BASIC_FIELDS} - {None}
+    kinds = set()
+    for _, _, name in data_fields_in(expression or ""):
+        dataset = datasets.get(name)
+        if name in BASIC_FIELDS or dataset in basic:
+            continue
+        kinds.add(dataset or re.sub(r"_+", "_", re.sub(r"\d+", "", name)).strip("_") or name)
+    return frozenset(kinds or {PRICE_VOLUME})
+
+
+def distinct_kinds(kinds) -> int:
+    """How many separate groups these kinds make, joining any two that share something."""
+    groups = []
+    for kind in kinds:
+        merged, apart = set(kind), []
+        for group in groups:
+            if group & merged:
+                merged |= group
+            else:
+                apart.append(group)
+        groups = apart + [merged]
+    return len(groups)
+
+
+class Reserve:
+    """Good alphas waiting for a coming day - ones BRAIN confirmed during this run (every check passed and
+    its similarity check was under the limit) - and the kinds this run has submitted. Counts kinds, not
+    alphas: of two near-copies, only one can ever be submitted, because then the other is too similar."""
+
+    def __init__(self):
+        self.waiting = {}   # alpha_id -> expression
+        self.landed = []    # kind of each alpha submitted during this run
+
+    def keep(self, alpha_id, expression):
+        self.waiting[alpha_id] = expression
+
+    def forget(self, alpha_id):
+        self.waiting.pop(alpha_id, None)
+
+    def note_landed(self, alpha_id, expression):
+        self.forget(alpha_id)
+        self.landed.append(alpha_kind(expression))
+
+    def usable(self, besides=None) -> list:
+        """Waiting alphas still likely to be submittable if `besides` went in now: anything sharing a kind
+        with it, or with what this run already submitted, is left out until BRAIN re-checks it next run."""
+        spent = self.landed + ([alpha_kind(besides)] if besides else [])
+        return [e for e in self.waiting.values() if not any(alpha_kind(e) & kind for kind in spent)]
+
+    def kinds(self, besides=None) -> int:
+        return distinct_kinds(alpha_kind(e) for e in self.usable(besides))
+
+
+RESERVE = Reserve()  # a fresh one for every run
+SETTLING = False      # True once this run has given up waiting for a strong alpha today (settle_for_today)
+
+
+def may_submit(expression, strong=True) -> bool:
+    """Today's first submission: a strong alpha straight away; one that only clears BRAIN's bar once the run
+    settles (no strong one by the end of the usual rounds) - the leaderboard counts days. More, up to
+    MAX_SUBMISSIONS_PER_DAY, only for strong alphas, and only while at least RESERVE_TARGET other kinds of
+    good alpha would still be waiting afterwards, so a day that finds nothing new can still submit."""
+    done = submissions_today()
+    if done >= MAX_SUBMISSIONS_PER_DAY:
+        return False
+    if done == 0:
+        return strong or SETTLING
+    return strong and RESERVE.kinds(besides=expression) >= RESERVE_TARGET
+
+
+def why_held(expression, strong=True) -> str:
+    done = submissions_today()
+    if done >= MAX_SUBMISSIONS_PER_DAY:
+        return f"today's submission limit ({MAX_SUBMISSIONS_PER_DAY}) is used"
+    if not strong:
+        if done == 0:
+            return f"it isn't strong ({strong_note()})"
+        return f"today's submission is in, and only strong alphas ({strong_note()}) go in as an extra"
+    left = RESERVE.kinds(besides=expression)
+    return (f"today's submission is in, and another now would leave only {left} other kind(s) of good alpha "
+            f"for the coming days (keeping {RESERVE_TARGET})")
+
+
+def settle_for_today(session):
+    """No strong alpha has gone in today: from now on the best one that clears BRAIN's bar may, so the day
+    still counts. Submits the best held alpha straight away, if there's one."""
+    global SETTLING
+    if MAX_SUBMISSIONS_PER_DAY < 1 or submissions_today() > 0:
+        return
+    if not SETTLING:
+        SETTLING = True
+        logger.info("No strong alpha has gone in today - from now on the best one that clears BRAIN's bar (Sharpe "
+                    "%s, fitness %s) goes in, so the day still counts.", SUBMIT_MIN_SHARPE, SUBMIT_MIN_FITNESS)
+    submit_held(session)
+
+
+def reserve_note() -> str:
+    usable = RESERVE.usable()
+    note = (f"Reserve for the coming days: {len(usable)} good alpha(s) that BRAIN confirmed this run, "
+            f"{distinct_kinds(alpha_kind(e) for e in usable)} different kind(s)")
+    aside = len(RESERVE.waiting) - len(usable)
+    if aside:
+        note += (f" - plus {aside} on the same data as today's submission, not counted until BRAIN "
+                 f"re-checks them next run")
+    return note + "."
 
 
 # ---- Held alphas: cleared the bar on a day the submission slot was already used ----
 
 def held_candidates() -> list:
-    """Held alphas still waiting, best fitness first (Sharpe breaks ties). An alpha that already
-    has an outcome logged in another row (mark_held's fallback) is left out."""
+    """Held alphas still waiting, best first: strong ones, then by fitness (Sharpe breaks ties). An alpha
+    that already has an outcome logged in another row (mark_held's fallback) is left out."""
     if not Path(RESULTS_FILE).exists():
         return []
     with open(RESULTS_FILE, encoding="utf-8", newline="") as f:
@@ -1186,8 +1614,7 @@ def held_candidates() -> list:
         elif submitted not in ("", "NO"):
             decided.add(alpha_id)
     waiting = [r for alpha_id, r in held.items() if alpha_id not in decided]
-    return sorted(waiting, key=lambda r: (safe_float(r.get("fitness")), safe_float(r.get("sharpe"))),
-                  reverse=True)
+    return sorted(waiting, key=strength, reverse=True)
 
 
 def mark_held(alpha_id: str, outcome: str):
@@ -1229,8 +1656,8 @@ def mark_held(alpha_id: str, outcome: str):
 
 
 def submit_held(session):
-    """Start-of-run step: if today's slot is free, submit the best held alpha. Returns the outcome
-    that used the slot (YES, REJECTED..., VERDICT_PENDING...), or None. Never stops the run."""
+    """Start-of-run step: if today's slot is free, submit the best held alpha. Returns the first outcome
+    BRAIN gave (YES, VERDICT_PENDING..., or REJECTED... if none went in), or None. Never stops the run."""
     try:
         return _submit_held(session)
     except Exception:
@@ -1241,19 +1668,30 @@ def submit_held(session):
 
 def _submit_held(session):
     """Re-check every held alpha with BRAIN - including its free similarity check, which grows stricter
-    as you submit more - so the queue only keeps alphas that could still be submitted. If today's slot
-    is free, the best remaining one (highest fitness) is submitted. Stops after HELD_CHECK_BUDGET_SECONDS;
-    anything not checked yet waits for the next run."""
+    as you submit more - so the queue only keeps alphas that could still be submitted. The ones that pass
+    are counted in the reserve. Then, best first (strong ones, then by fitness, on BRAIN's latest numbers): if
+    nothing is in for today, a strong one is submitted - or the best one once the run settles; more only as
+    may_submit() allows. Checking stops after HELD_CHECK_BUDGET_SECONDS; anything not checked yet waits for
+    the next run."""
     queue = held_candidates()
     if not queue:
         return None
-    slot_free = submissions_today() < MAX_SUBMISSIONS_PER_DAY
-    logger.info("%d held alpha(s) - checking they're still worth submitting. %s", len(queue),
-                "Today's submission slot is free, so the best one goes first." if slot_free else
-                "Today's slot is used, so they wait for BRAIN's next day (3 AM US Eastern).")
+    done = submissions_today()
+    if done >= MAX_SUBMISSIONS_PER_DAY:
+        plan = "Today's limit is used, so they wait for BRAIN's next day (3 AM US Eastern)."
+    elif done == 0 and SETTLING:
+        plan = "Nothing is submitted for today yet, so the best one goes in."
+    elif done == 0:
+        plan = (f"Nothing is submitted for today yet - a strong one ({strong_note()}) goes in now; the others "
+                f"wait until the usual rounds are done, in case a stronger one turns up.")
+    else:
+        plan = (f"Today's submission is in - another goes in only if {RESERVE_TARGET}+ other kinds of good "
+                f"alpha would still be waiting for the coming days.")
+    logger.info("%d held alpha(s) - checking they're still worth submitting. %s", len(queue), plan)
 
+    # 1. Check them all (best first), so the reserve is known before anything is submitted.
     deadline = time.time() + HELD_CHECK_BUDGET_SECONDS
-    first_outcome, submitted, waiting, dropped = None, 0, 0, 0
+    good, waiting, dropped = [], 0, 0
     for index, row in enumerate(queue):
         if time.time() > deadline:
             waiting += len(queue) - index
@@ -1273,6 +1711,7 @@ def _submit_held(session):
         if alpha.get("status") == "ACTIVE":
             logger.info("BRAIN already lists %s as submitted - marking it YES.", alpha_id)
             mark_held(alpha_id, "YES")
+            RESERVE.forget(alpha_id)
             continue
         checks = (alpha.get("is") or {}).get("checks") or []
         if not checks:
@@ -1288,6 +1727,7 @@ def _submit_held(session):
                 logger.warning("Held alpha %s no longer qualifies on BRAIN (%s) - dropping it from the queue.",
                                alpha_id, reason)
                 mark_held(alpha_id, f"NOT_SUBMITTED (no longer qualifies: {reason})")
+                RESERVE.forget(alpha_id)
                 dropped += 1
             else:
                 logger.info("A check on %s isn't settled yet - leaving it queued.", alpha_id)
@@ -1299,23 +1739,47 @@ def _submit_held(session):
             logger.info("Held alpha %s is now too similar to your submitted alphas (self-correlation %.2f) - "
                         "dropping it from the queue.", alpha_id, corr)
             mark_held(alpha_id, f"TOO_CORRELATED (max {corr:.2f})")
+            RESERVE.forget(alpha_id)
             dropped += 1
             continue
-        if submissions_today() >= MAX_SUBMISSIONS_PER_DAY:
-            waiting += 1  # still a good candidate - stays queued for a free slot
-            continue
+        if corr is not None:
+            RESERVE.keep(alpha_id, row["expression"])  # confirmed good today - counts toward the reserve
+        is_stats = alpha.get("is") or {}
+        latest = dict(row, sharpe=metrics.get("sharpe"), fitness=metrics.get("fitness"),
+                      returns=is_stats.get("returns"), drawdown=is_stats.get("drawdown"))
+        good.append((row, corr, latest))
 
+    # 2. Submit, best first, as far as today allows.
+    good.sort(key=lambda g: strength(g[2]), reverse=True)
+    if good and submissions_today() == 0 and not SETTLING and not row_is_strong(good[0][2]):
+        logger.info("None of the held alphas is strong (%s) - they wait until the usual rounds are done, in case "
+                    "a stronger one turns up.", strong_note())
+    first_outcome, submitted, landed_before = None, 0, len(RESERVE.landed)
+    for row, corr, latest in good:
+        alpha_id, expression = row["alpha_id"], row["expression"]
+        if not may_submit(expression, row_is_strong(latest)):
+            waiting += 1  # still a good candidate - stays queued
+            continue
+        if len(RESERVE.landed) > landed_before:
+            corr = _UNCHECKED  # checked before today's submission went in - ask BRAIN again
         outcome = try_submit(session, alpha_id, corr=corr)
         if outcome.startswith("FAILED"):
             logger.warning("Held alpha %s stays queued - the submit didn't go through.", alpha_id)
             waiting += 1
             continue
         mark_held(alpha_id, outcome)
-        submitted += 1  # BRAIN processed it, so it used a slot
-        first_outcome = first_outcome or outcome
+        if landed(outcome):
+            RESERVE.note_landed(alpha_id, expression)
+            submitted += 1
+            first_outcome = outcome if first_outcome is None or not landed(first_outcome) else first_outcome
+        else:  # rejected at submission, or too similar now - not counted toward today, so the next one goes
+            RESERVE.forget(alpha_id)
+            dropped += 1
+            first_outcome = first_outcome or outcome
 
-    logger.info("Held queue: %d submitted, %d dropped (too similar or no longer qualifying), %d still waiting.",
-                submitted, dropped, waiting)
+    logger.info("Held queue: %d submitted, %d dropped (too similar, rejected or no longer qualifying), "
+                "%d still waiting.", submitted, dropped, waiting)
+    logger.info(reserve_note())
     return first_outcome
 
 
@@ -1372,14 +1836,17 @@ def finish_idea(session, row, alpha_id) -> dict:
         logger.warning("  %s finished, but BRAIN didn't send its result.", expression)
         return fail(row, "BRAIN finished the simulation but didn't send its result - open its BRAIN page")
     metrics = be.metrics_from_alpha(alpha_id, alpha)
-    checks = (alpha.get("is") or {}).get("checks") or []
-    row.update(status="COMPLETE", alpha_id=alpha_id, **metrics)
+    is_stats = alpha.get("is") or {}
+    checks = is_stats.get("checks") or []
+    row.update(status="COMPLETE", alpha_id=alpha_id, **metrics,
+               returns=_blank(is_stats.get("returns")), drawdown=_blank(is_stats.get("drawdown")))
     # Kept in memory for the next round's feedback; the CSV doesn't store it.
     row["failing_checks"] = ", ".join(f"{c.get('name')}:{c.get('result')}" for c in checks if c.get("result") != "PASS")
     row["failed_checks"] = [str(c.get("name")) for c in checks if c.get("result") == "FAIL"]
 
     if qualifies(metrics, checks):
-        if submissions_today() >= MAX_SUBMISSIONS_PER_DAY:
+        strong = row_is_strong(row)
+        if not may_submit(expression, strong):
             # Only hold it if it could actually be submitted later: BRAIN's similarity check is free.
             corr = self_correlation_max(session, alpha_id)
             if too_similar(corr):
@@ -1388,12 +1855,25 @@ def finish_idea(session, row, alpha_id) -> dict:
                             alpha_id, corr, MAX_SELF_CORRELATION)
                 row["submitted"] = f"TOO_CORRELATED (max {corr:.2f})"
             else:
-                logger.warning("Alpha %s qualifies%s, but today's submission limit (%d) is used - holding "
-                               "it. The first run with a free slot submits held alphas first.", alpha_id,
-                               "" if corr is None else f" (self-correlation {corr:.2f})", MAX_SUBMISSIONS_PER_DAY)
-                row["submitted"] = HELD_LABEL
+                for_today = not strong and submissions_today() == 0  # may still go in today, if nothing beats it
+                logger.warning("Alpha %s qualifies%s, but %s - %s", alpha_id,
+                               "" if corr is None else f" (self-correlation {corr:.2f})", why_held(expression, strong),
+                               "holding it for now; if no strong alpha turns up in the usual rounds, the best "
+                               "held one goes in." if for_today else
+                               "holding it for a coming day. Each run starts with the held alphas.")
+                row["submitted"] = HELD_FOR_STRONGER_LABEL if for_today else HELD_LABEL
+                if corr is not None:
+                    RESERVE.keep(alpha_id, expression)
+                record_before_after(session, alpha_id, "held for now" if for_today else "held for a coming day")
         else:
-            row["submitted"] = try_submit(session, alpha_id)
+            outcome = try_submit(session, alpha_id)
+            if outcome.startswith("FAILED"):
+                logger.warning("Holding %s so the submit is tried again (before the next extra round, or "
+                               "next run) instead of losing it.", alpha_id)
+                outcome = HELD_RETRY_LABEL
+            elif landed(outcome):
+                RESERVE.note_landed(alpha_id, expression)
+            row["submitted"] = outcome
 
     append_result(row)
     logger.info("  %s -> sharpe=%s fitness=%s turnover=%s checks=%s/%s submitted=%s", expression,
@@ -1411,7 +1891,8 @@ def run_round(session, client, operators, fields, settings, email, password, rou
     type_map = field_types(fields)
     crowded = crowded_types(type_map)
     overused = crowded_shapes()
-    rules = [r for r in (variety_rule(type_map, crowded, IDEAS_PER_ROUND), shape_rule(overused, operators),
+    rules = [r for r in (variety_rule(type_map, crowded, IDEAS_PER_ROUND, IDEAS_PER_ROUND + VARIETY_EXTRA_IDEAS),
+                         shape_rule(overused, operators),
                          avoid_note(rejected, dead)) if r]
     asked = IDEAS_PER_ROUND + (VARIETY_EXTRA_IDEAS if rules else 0)
     prompt_text = "\n\n".join([feedback_text, *rules])
@@ -1805,6 +2286,9 @@ def main(argv=None):
                              "asking Gemini for ideas; wrap each one in double quotes")
     parser.add_argument("--log-dir", metavar="FOLDER",
                         help="also write the log to FOLDER/alpha_loop_YYYY-MM-DD.log (for scheduled runs)")
+    parser.add_argument("--backup", action="store_true",
+                        help="for a second scheduled run later in the day: if today's submission is already in "
+                             "and the reserve is full, stop after re-checking the held alphas")
     args = parser.parse_args(argv)
 
     log_file = add_log_file(args.log_dir) if args.log_dir else None
@@ -1830,7 +2314,12 @@ def main(argv=None):
 
 
 def run(args):
+    global RESERVE, BEFORE_AFTER_REFUSED, SETTLING
+    RESERVE = Reserve()  # the reserve only counts alphas BRAIN confirms during this run
+    BEFORE_AFTER_REFUSED = False
+    SETTLING = False
     email, password = be.get_credentials()
+    upgrade_results_file()
     if args.try_expressions:
         session = get_authenticated_session(email, password)
         submit_held(session)
@@ -1839,6 +2328,7 @@ def run(args):
         except StopLoop as e:
             logger.error("Stopping: %s", e)
             return
+        settle_for_today(session)  # no rounds to wait for: if no strong alpha went in, the best held one does
         logger.info("Done: %d simulation(s), including any automatic flips or smooths. Results are in %s.",
                     len(rows), RESULTS_FILE)
         return
@@ -1860,6 +2350,14 @@ def run(args):
     settings = SETTINGS
     session = get_authenticated_session(email, password)
     submit_held(session)  # before building feedback, so the generator sees the updated outcome
+    if getattr(args, "backup", False) and submissions_today() > 0:
+        spare = RESERVE.kinds()
+        if spare >= RESERVE_TARGET:
+            logger.info("Backup run: today's submission is in and %d kinds of good alpha are waiting for the "
+                        "coming days - nothing more to do.", spare)
+            return
+        logger.info("Backup run: today's submission is in, but only %d kind(s) of good alpha are waiting "
+                    "(aiming for %d) - mining to build the reserve.", spare, RESERVE_TARGET)
     avoid = already_tried()
     try:
         repair_past_near_misses(session, settings, email, password, avoid)
@@ -1873,9 +2371,16 @@ def run(args):
     if past:
         logger.info("Starting from your best results across %d past simulations.", past)
 
-    logger.info("Starting: up to %d rounds x %d ideas (%d max simulations, %d at a time), %ds runtime cap, "
+    logger.info("Starting: up to %d rounds x %d ideas (%d simulations, %d at a time), %ds runtime cap, "
                 "%d submission(s)/day max.", MAX_ROUNDS, IDEAS_PER_ROUND, MAX_ROUNDS * IDEAS_PER_ROUND,
                 PARALLEL_SIMULATIONS, MAX_RUNTIME_SECONDS, MAX_SUBMISSIONS_PER_DAY)
+    if MAX_SUBMISSIONS_PER_DAY > 0:
+        logger.info("Strong alphas (%s) go in first. If none has by the end of the %d rounds, the best one that "
+                    "clears BRAIN's bar goes in, so the day still counts.", strong_note(), MAX_ROUNDS)
+        logger.info("Every day counts: with nothing submitted for today after %d rounds, up to %d more rounds "
+                    "until something lands.%s", MAX_ROUNDS, MAX_EXTRA_ROUNDS,
+                    f" A submission beyond today's first must be strong, with {RESERVE_TARGET}+ other kinds of good "
+                    f"alpha left in reserve." if MAX_SUBMISSIONS_PER_DAY > 1 else "")
     type_map = field_types(fields)
     if type_map:
         logger.info("Variety: your %d fields span %d data types (%s).", len(type_map),
@@ -1888,10 +2393,36 @@ def run(args):
     started = time.time()
     rounds_done = 0
     failures_in_a_row = 0
-    while rounds_done < MAX_ROUNDS:
+    checked_at = None  # the round count the end-of-rounds step last ran for
+    stopped = False    # the login couldn't be renewed - no last call then
+    while True:
         if time.time() - started > MAX_RUNTIME_SECONDS:
             logger.info("Hit MAX_RUNTIME_SECONDS - stopping cleanly.")
             break
+        if rounds_done >= MAX_ROUNDS:
+            if MAX_SUBMISSIONS_PER_DAY < 1 or submissions_today() > 0:
+                break
+            if checked_at != rounds_done:  # once per round, not again after a failed generation
+                checked_at = rounds_done
+                try:
+                    keep_logged_in(session, email, password)
+                except StopLoop as e:
+                    logger.error("Stopping: %s", e)
+                    stopped = True
+                    break
+                settle_for_today(session)  # the best held alpha goes in now, strong or not
+                if submissions_today() > 0:
+                    break
+                if MAX_ROUNDS < 1:
+                    break
+                if rounds_done >= MAX_ROUNDS + MAX_EXTRA_ROUNDS:
+                    logger.warning("Still nothing submitted for today after %d extra round(s) - stopping here.",
+                                   MAX_EXTRA_ROUNDS)
+                    break
+                if rounds_done == MAX_ROUNDS:
+                    logger.info("Nothing submitted for BRAIN day %s yet - carrying on past MAX_ROUNDS until "
+                                "something lands (up to %d more rounds, within the %d-minute runtime cap).",
+                                brain_day(), MAX_EXTRA_ROUNDS, MAX_RUNTIME_SECONDS // 60)
         round_num = rounds_done + 1
         try:
             round_rows = run_round(session, client, operators, fields, settings, email, password,
@@ -1911,13 +2442,22 @@ def run(args):
             continue
         except StopLoop as e:
             logger.error("Stopping: %s", e)
+            stopped = True
             break
         failures_in_a_row = 0
         rounds_done += 1
         feedback_text = build_feedback(round_rows)
         time.sleep(5)
 
-    logger.info("Done: %d round(s) of ideas tested. Full history is in %s.", rounds_done, RESULTS_FILE)
+    if not stopped and not SETTLING:
+        settle_for_today(session)  # ended before the usual rounds were done (runtime cap, Gemini down)
+    extra = max(0, rounds_done - MAX_ROUNDS)
+    logger.info("Done: %d round(s) of ideas tested%s. Full history is in %s.", rounds_done,
+                f" ({extra} of them extra, to get today's submission in)" if extra else "", RESULTS_FILE)
+    if MAX_SUBMISSIONS_PER_DAY > 0 and submissions_today() == 0:
+        logger.warning("Nothing was submitted for BRAIN day %s. A later run before its day ends (3 AM US "
+                       "Eastern) - such as the backup run - will try again.", brain_day())
+    logger.info(reserve_note())
 
 
 if __name__ == "__main__":
