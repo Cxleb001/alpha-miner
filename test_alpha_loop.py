@@ -27,6 +27,13 @@ from google.genai import errors as genai_errors
 # BRAIN's bar counts as strong. The strong-alpha tests set the real thresholds themselves (real_strong_bar).
 al.STRONG_MIN_SHARPE, al.STRONG_MIN_FITNESS = al.SUBMIT_MIN_SHARPE, al.SUBMIT_MIN_FITNESS
 al.STRONG_MIN_RETURNS_TO_DRAWDOWN = 0.0
+# The test world never touches the real internet or the computer's power settings: BRAIN always answers the
+# "are you there?" probe and the power state is unknown. BRAIN's day never ends in the middle of a test either.
+# The tests about lost connections, laptops and the end of the day set these themselves.
+REAL_BRAIN_REACHABLE, REAL_ON_MAINS_POWER = al.brain_reachable, al.on_mains_power
+al.brain_reachable = lambda: True
+al.on_mains_power = lambda: None
+al.SETTLE_BEFORE_DAY_END_MINUTES = 0
 
 
 def fake_response(status_code=200, json_data=None, headers=None, text=""):
@@ -1570,6 +1577,8 @@ SUB_FAIL = [{"name": "LOW_SUB_UNIVERSE_SHARPE", "result": "FAIL"}, {"name": "SEL
 RANKED = f"rank({DIVIDEND})"
 BACKFILLED = "ts_decay_linear(group_rank(ts_delta(ts_backfill(dividend, 120), 180), market), 20)"
 FINER = "ts_decay_linear(group_rank(ts_delta(dividend, 180), subindustry), 20)"
+LIQUID_SPLIT = ("ts_decay_linear(group_rank(ts_delta(dividend, 180), market), 20) * rank(ts_mean(volume * close, 20)) + "
+                "ts_decay_linear(group_rank(ts_delta(dividend, 180), market), 40) * (1 - rank(ts_mean(volume * close, 20)))")
 
 
 def near_miss(checks=None):
@@ -1588,13 +1597,16 @@ def test_strong_alpha_failing_a_fixable_check_is_repaired_right_after(tmp_path):
 
 def test_a_repair_that_passes_is_submitted(tmp_path):
     def run():
-        brain = SlowBrain({DIVIDEND: near_miss(SUB_FAIL), FINER: alpha_json(sharpe=1.5, fitness=1.3, turnover=0.12)})
+        # Without a field list naming cap, the size-bucket fix is skipped, so the second repair queued is the
+        # liquid/illiquid split (the third fix for this check). Both are queued at once, as before.
+        brain = SlowBrain({DIVIDEND: near_miss(SUB_FAIL), FINER: alpha_json(sharpe=1.5, fitness=1.3, turnover=0.12),
+                           LIQUID_SPLIT: calm()})
         brain.session.post.side_effect = lambda url, **kw: (
             fake_response(201, {}, headers={}) if url.endswith("/submit") else brain.post(url, **kw))
         with patch.object(al, "submit_alpha", return_value=("YES", None)), \
              patch.object(al, "is_active_on_brain", return_value=True):
             rows = run_queue(brain, [DIVIDEND], parallel=1)
-        assert {r["expression"]: r["submitted"] for r in rows} == {DIVIDEND: "NO", FINER: "YES"}
+        assert {r["expression"]: r["submitted"] for r in rows} == {DIVIDEND: "NO", FINER: "YES", LIQUID_SPLIT: "NO"}
     in_tmp(tmp_path, run)
 
 
@@ -2583,6 +2595,661 @@ def test_the_generator_is_told_the_strong_targets():
         al.generate_ideas(client, "m", [], [], SETTINGS, "feedback", set(), 3)
     prompt = client.models.generate_content.call_args.kwargs["contents"]
     assert "aim for Sharpe 1.6+, fitness 1.3+, returns above drawdown" in prompt
+
+
+# ---- Riding out a lost connection: wifi dropping, a laptop waking up ----
+
+class Outage:
+    """The connection is down until BRAIN's "are you there?" probe has been asked `probes` times - that probe, and
+    every one after it, gets an answer. A huge number means it never comes back."""
+    def __init__(self, probes=3):
+        self.down, self.left, self.asked = True, probes, 0
+
+    def reachable(self):
+        self.asked += 1
+        self.left -= 1
+        if self.left <= 0:
+            self.down = False
+        return not self.down
+
+
+def cut_off(brain, outage, gets=lambda url: True, posts=lambda url: False):
+    """While the outage lasts, requests the two filters pick fail like a dropped connection."""
+    real_get, real_post = brain.get, brain.post
+
+    def get(url, **kw):
+        if outage.down and gets(url):
+            raise _requests.ConnectionError("wifi dropped")
+        return real_get(url, **kw)
+
+    def post(url, **kw):
+        if outage.down and posts(url):
+            raise _requests.ConnectionError("wifi dropped")
+        return real_post(url, **kw)
+
+    brain.session.get.side_effect = get
+    brain.session.post.side_effect = post
+
+
+def test_brain_counts_as_reachable_on_any_reply_but_not_a_failed_connection():
+    with patch.object(al.requests, "get", return_value=fake_response(401, {"detail": "no"})) as get:
+        assert REAL_BRAIN_REACHABLE() is True                       # "not logged in" is still an answer
+    assert get.call_args.args[0] == be.AUTH_URL and get.call_args.kwargs["timeout"] == al.CONNECTION_PROBE_TIMEOUT
+    with patch.object(al.requests, "get", side_effect=_requests.ConnectionError("no wifi")):
+        assert REAL_BRAIN_REACHABLE() is False
+
+
+def test_waiting_for_the_connection_checks_every_minute_until_brain_answers():
+    outage = Outage(probes=3)
+    before = al.OUTAGE_SECONDS
+    with patch.object(al, "brain_reachable", outage.reachable), patch("time.sleep") as sleep, \
+         captured_logs() as lines:
+        assert al.wait_for_connection("while testing") is True
+    assert [c.args[0] for c in sleep.call_args_list] == [60, 60] and outage.asked == 3
+    assert any("Lost the connection to BRAIN while testing" in line for line in lines)
+    assert any("The connection is back" in line for line in lines)
+    assert al.OUTAGE_SECONDS >= before                                # the wait is set aside from the runtime cap
+    with patch.object(al, "brain_reachable", lambda: True), patch("time.sleep") as sleep:
+        assert al.wait_for_connection("x") is True                    # already connected: no wait at all
+    sleep.assert_not_called()
+
+
+def test_waiting_for_the_connection_gives_up_after_the_limit():
+    outage = Outage(probes=10 ** 6)
+    with patch.object(al, "brain_reachable", outage.reachable), patch.object(al, "WAIT_FOR_CONNECTION_MINUTES", 3), \
+         patch("time.sleep") as sleep:
+        assert al.wait_for_connection("x") is False
+    assert sleep.call_count == 3 and outage.asked == 4                # one look, then one every minute for 3 minutes
+
+
+def test_lost_connection_while_simulations_run_waits_and_keeps_them(tmp_path):
+    def run():
+        brain = SlowBrain({"rank(a)": calm(), "rank(b)": calm()})
+        outage = Outage(probes=3)
+        cut_off(brain, outage, gets=lambda url: url.startswith("sim-"))   # checking on simulations fails
+        with patch.object(al, "brain_reachable", outage.reachable), captured_logs() as lines:
+            rows = run_queue(brain, ["rank(a)", "rank(b)"])
+        assert sorted((r["expression"], r["status"]) for r in rows) == [("rank(a)", "COMPLETE"), ("rank(b)", "COMPLETE")]
+        assert brain.started == ["rank(a)", "rank(b)"]                # nothing dropped, nothing simulated twice
+        assert [r["status"] for r in csv_rows()] == ["COMPLETE", "COMPLETE"]
+        assert any("while checking on simulations" in line for line in lines)
+    in_tmp(tmp_path, run)
+
+
+def test_lost_connection_while_starting_keeps_the_idea_first_in_line(tmp_path):
+    def run():
+        brain = SlowBrain({"rank(a)": calm()})
+        outage = Outage(probes=3)
+        cut_off(brain, outage, gets=lambda url: False, posts=lambda url: url.endswith("/simulations"))
+        with patch.object(al, "brain_reachable", outage.reachable):
+            rows = run_queue(brain, ["rank(a)"])
+        assert [(r["expression"], r["status"]) for r in rows] == [("rank(a)", "COMPLETE")]
+        assert brain.started == ["rank(a)"] and [r["status"] for r in csv_rows()] == ["COMPLETE"]
+    in_tmp(tmp_path, run)
+
+
+def test_lost_connection_while_reading_a_result_reads_it_again(tmp_path):
+    def run():
+        brain = FakeBrain({"a1": calm()})
+        outage = Outage(probes=3)
+        cut_off(brain, outage, gets=lambda url: url.endswith("/alphas/a1"))
+        with patch.object(al, "brain_reachable", outage.reachable):
+            rows = run_one_idea(brain)
+        assert [(r["alpha_id"], r["status"]) for r in rows] == [("a1", "COMPLETE")]
+        assert [r["status"] for r in csv_rows()] == ["COMPLETE"]
+    in_tmp(tmp_path, run)
+
+
+def test_a_connection_that_never_comes_back_stops_cleanly_and_keeps_the_records(tmp_path):
+    def run():
+        brain = SlowBrain({"rank(a)": calm()})
+        outage = Outage(probes=10 ** 6)
+        cut_off(brain, outage, gets=lambda url: url.startswith("sim-"))
+        with patch.object(al, "brain_reachable", outage.reachable), \
+             patch.object(al, "WAIT_FOR_CONNECTION_MINUTES", 2):
+            try:
+                run_queue(brain, ["rank(a)"])
+                assert False, "should have stopped"
+            except al.StopLoop as e:
+                assert "No connection to BRAIN for 2 minutes" in str(e)
+        assert [(r["expression"], r["status"]) for r in csv_rows()] == [("rank(a)", "STOPPED")]
+    in_tmp(tmp_path, run)
+
+
+def test_a_run_waits_for_the_connection_before_logging_in(tmp_path):
+    def run():
+        outage = Outage(probes=3)
+        brain = FakeBrain({"i1": calm()})
+        with patch.object(al, "brain_reachable", outage.reachable):
+            rounds = run_main_rounds(brain, MAX_ROUNDS=1, MAX_EXTRA_ROUNDS=0)
+        assert rounds == 1 and outage.asked >= 3
+    in_tmp(tmp_path, run)
+
+
+def test_no_connection_at_all_stops_before_logging_in(tmp_path):
+    def run():
+        _write_operators()
+        outage = Outage(probes=10 ** 6)
+        with patch.object(al, "brain_reachable", outage.reachable), patch.object(al, "WAIT_FOR_CONNECTION_MINUTES", 2), \
+             patch.object(al, "get_authenticated_session", side_effect=AssertionError("must not log in")), \
+             patch("google.genai.Client"), patch("time.sleep"), captured_logs() as lines:
+            al.main([])
+        assert any("No connection to BRAIN for 2 minutes - stopping before using any quota" in line for line in lines)
+        assert not Path(al.RESULTS_FILE).exists()
+    in_tmp(tmp_path, run)
+
+
+def test_a_login_lost_to_the_connection_waits_and_tries_again(tmp_path):
+    def run():
+        session = MagicMock()
+        outage = Outage(probes=3)
+        logins = iter([False, True])                                  # the first try had no connection
+        with patch.object(al, "brain_reachable", outage.reachable), patch("time.sleep"), \
+             patch.object(be, "authenticate", side_effect=lambda *a: next(logins)) as auth, \
+             patch.object(al, "note_expiry"), patch.object(al, "save_session"):
+            assert al.log_in_again(session, "e@x.com", "pw") is True
+        assert auth.call_count == 2
+    in_tmp(tmp_path, run)
+
+
+def test_a_refused_login_with_brain_answering_is_still_reported_as_verification(tmp_path):
+    def run():
+        session = MagicMock()
+        session.brain_expires_at = _time.time() + 60
+        with patch.object(be, "authenticate", return_value=False), patch("time.sleep") as sleep:
+            try:
+                al.keep_logged_in(session, "e@x.com", "pw")
+                assert False, "should have stopped"
+            except al.StopLoop as e:
+                assert "identity verification" in str(e)
+        sleep.assert_not_called()                                     # BRAIN answered: nothing to wait for
+    in_tmp(tmp_path, run)
+
+
+def test_session_renewal_waits_for_a_lost_connection(tmp_path):
+    def run():
+        brain = SlowBrain({"rank(a)": calm()}, expire_on="rank(a)")
+        outage = Outage(probes=3)
+        cut_off(brain, outage, gets=lambda url: False, posts=lambda url: url == be.AUTH_URL)
+        with patch.object(al, "brain_reachable", outage.reachable):
+            rows = run_queue(brain, ["rank(a)"])
+        assert [(r["expression"], r["status"]) for r in rows] == [("rank(a)", "COMPLETE")]
+        assert "STOPPED" not in [r["status"] for r in csv_rows()]
+    in_tmp(tmp_path, run)
+
+
+def test_gemini_failing_for_lack_of_a_connection_waits_without_counting_failures(tmp_path):
+    def run():
+        _write_operators()
+        outage = Outage(probes=0)
+        outage.down = False                                           # connected when the run starts...
+        calls = {"n": 0}
+
+        def gen(*a, **kw):
+            calls["n"] += 1
+            if calls["n"] == 1:                                       # ...and the wifi drops as Gemini is asked
+                outage.down, outage.left = True, 3
+            if outage.down:
+                raise _httpx.ConnectError("no wifi")
+            return [(f"rank(idea{calls['n']})", "r")]
+
+        brain = FakeBrain({"i1": calm(), "i2": calm()})
+        with patch.object(al, "brain_reachable", outage.reachable), patch.object(al, "MAX_ROUNDS", 2), \
+             patch.object(al, "MAX_EXTRA_ROUNDS", 0), \
+             patch.object(al, "MAX_GENERATION_FAILURES", 1), patch.object(al, "IDEAS_PER_ROUND", 1), \
+             patch.object(al, "generate_with_fallback", side_effect=gen), \
+             patch.object(al, "get_authenticated_session", return_value=brain.session), \
+             patch("google.genai.Client"), patch("time.sleep"), captured_logs() as lines:
+            al.main([])
+        assert [r["round"] for r in csv_rows()] == ["1", "2"]         # one failure allowed, yet both rounds ran
+        assert calls["n"] == 3 and outage.asked == 4                  # login, the failure, then a minute's wait
+        assert any("Lost the connection to BRAIN while asking Gemini for ideas" in line for line in lines)
+    in_tmp(tmp_path, run)
+
+
+def test_the_computer_sleeping_mid_run_is_noticed():
+    clock = {"t": 1000.0}
+
+    def sleep(seconds):
+        clock["t"] += seconds + 3 * 3600                              # lid closed for three hours
+
+    before = al.OUTAGE_SECONDS
+    with patch("time.time", lambda: clock["t"]), patch("time.sleep", sleep), captured_logs() as lines:
+        assert al.nap(5) == 3 * 3600
+    assert al.OUTAGE_SECONDS - before == 3 * 3600
+    assert any("asleep for about 180 minute(s)" in line for line in lines)
+    with patch("time.sleep"):
+        assert al.nap(5) == 0.0                                       # an ordinary pause
+
+
+def test_simulations_still_running_after_a_long_outage_are_not_timed_out(tmp_path):
+    def run():
+        clock = {"t": 1_000_000.0}
+
+        def sleep(seconds):
+            clock["t"] += seconds
+
+        brain = SlowBrain({"rank(a)": calm()}, polls={"rank(a)": 3})      # still running when the wifi comes back
+        outage = Outage(probes=60)                                         # about an hour without a connection
+        cut_off(brain, outage, gets=lambda url: url.startswith("sim-"))
+        with patch.object(al, "brain_reachable", outage.reachable), patch("time.time", lambda: clock["t"]), \
+             patch("time.sleep", sleep), patch.object(al, "PARALLEL_SIMULATIONS", 1):
+            rows = al.process_queue(brain.session, [("rank(a)", "r", "idea")], SETTINGS, "e@x.com", "pw", 1, set())
+        assert [(r["expression"], r["status"]) for r in rows] == [("rank(a)", "COMPLETE")]
+    in_tmp(tmp_path, run)
+
+
+def test_simulations_running_while_the_computer_slept_are_not_timed_out(tmp_path):
+    def run():
+        clock = {"t": 1_000_000.0, "naps": 0}
+
+        def sleep(seconds):
+            clock["naps"] += 1
+            clock["t"] += seconds + (2 * 3600 if clock["naps"] == 1 else 0)   # asleep for 2 hours mid-simulation
+
+        brain = SlowBrain({"rank(a)": calm()}, polls={"rank(a)": 3})
+        with patch("time.time", lambda: clock["t"]), patch("time.sleep", sleep), \
+             patch.object(al, "PARALLEL_SIMULATIONS", 1):
+            rows = al.process_queue(brain.session, [("rank(a)", "r", "idea")], SETTINGS, "e@x.com", "pw", 1, set())
+        assert [(r["expression"], r["status"]) for r in rows] == [("rank(a)", "COMPLETE")]
+    in_tmp(tmp_path, run)
+
+
+def test_time_away_doesnt_count_against_the_runtime_cap(tmp_path):
+    def run():
+        _write_operators()
+        clock = {"t": 1_000_000.0, "away": False}
+
+        def sleep(seconds):
+            clock["t"] += seconds + (3 * 3600 if clock["away"] else 0)
+            clock["away"] = False
+
+        def gen(*a, **kw):
+            clock["away"] = True                                      # each round, the laptop sleeps for 3 hours
+            return [(f"rank(idea{len(csv_rows()) if Path(al.RESULTS_FILE).exists() else 0})", "r")]
+
+        brain = FakeBrain({f"i{n}": calm() for n in range(3)})
+        with patch.object(al, "MAX_ROUNDS", 3), patch.object(al, "MAX_RUNTIME_SECONDS", 3600), \
+             patch.object(al, "MAX_EXTRA_ROUNDS", 0), \
+             patch.object(al, "IDEAS_PER_ROUND", 1), patch.object(al, "generate_with_fallback", side_effect=gen), \
+             patch.object(al, "get_authenticated_session", return_value=brain.session), \
+             patch("google.genai.Client"), patch("time.time", lambda: clock["t"]), patch("time.sleep", sleep):
+            al.main([])
+        assert [r["round"] for r in csv_rows()] == ["1", "2", "3"]   # 9 hours asleep, 0 counted
+    in_tmp(tmp_path, run)
+
+
+# ---- Laptops: stay awake while plugged in ----
+
+def test_the_computer_is_kept_awake_only_while_plugged_in():
+    flags = []
+    al.AWAKE = False
+    with patch.object(al, "set_execution_state", side_effect=lambda f: flags.append(f) or True), \
+         patch.object(al, "on_mains_power", side_effect=[True, True, False, None]):
+        al.keep_awake()                                               # plugged in: stay awake
+        al.keep_awake()                                               # no change: nothing asked
+        al.keep_awake()                                               # unplugged: sleep as usual
+        al.keep_awake()                                               # can't tell: same as on battery
+    assert flags == [al.ES_CONTINUOUS | al.ES_SYSTEM_REQUIRED, al.ES_CONTINUOUS] and al.AWAKE is False
+
+
+def test_a_run_lets_the_computer_sleep_again_when_it_ends(tmp_path):
+    def run():
+        flags = []
+        al.AWAKE = False
+        brain = FakeBrain({"i1": calm()})
+        with patch.object(al, "set_execution_state", side_effect=lambda f: flags.append(f) or True), \
+             patch.object(al, "on_mains_power", return_value=True):
+            run_main_rounds(brain, MAX_ROUNDS=1, MAX_EXTRA_ROUNDS=0)
+        assert flags == [al.ES_CONTINUOUS | al.ES_SYSTEM_REQUIRED, al.ES_CONTINUOUS] and al.AWAKE is False
+    in_tmp(tmp_path, run)
+
+
+def test_plugging_in_mid_run_is_noticed(tmp_path):
+    def run():
+        flags = []
+        al.AWAKE = False
+        power = iter([False, False] + [True] * 50)                    # on battery when the run starts
+        brain = SlowBrain({"rank(idea1)": calm()}, polls={"rank(idea1)": 3})
+        with patch.object(al, "set_execution_state", side_effect=lambda f: flags.append(f) or True), \
+             patch.object(al, "on_mains_power", side_effect=lambda: next(power)), captured_logs() as lines:
+            run_main_rounds(brain, MAX_ROUNDS=1, MAX_EXTRA_ROUNDS=0)
+        assert flags[0] == al.ES_CONTINUOUS | al.ES_SYSTEM_REQUIRED and al.AWAKE is False
+        plugged = next(i for i, line in enumerate(lines) if line.startswith("Plugged in"))
+        assert plugged < next(i for i, line in enumerate(lines) if "rank(idea1) -> sharpe" in line)  # mid-round
+    in_tmp(tmp_path, run)
+
+
+def test_power_helpers_do_nothing_off_windows():
+    if os.name != "nt":
+        assert REAL_ON_MAINS_POWER() is None and al.set_execution_state(al.ES_CONTINUOUS) is False
+
+
+# ---- --catch-up: extra triggers that only act when today isn't covered ----
+
+def test_catch_up_does_nothing_when_today_is_in(tmp_path):
+    def run():
+        al.record_submission()
+        with patch.object(al, "get_authenticated_session", side_effect=AssertionError("must not log in")), \
+             captured_logs() as lines:
+            al.main(["--catch-up"])
+        assert any("today's submission is already in - nothing to do" in line for line in lines)
+    in_tmp(tmp_path, run)
+
+
+def test_catch_up_steps_aside_quietly_for_a_run_already_going(tmp_path):
+    def run():
+        held = al.acquire_run_lock()
+        records = []
+
+        class Grab(_logging.Handler):
+            def emit(self, record):
+                records.append(record)
+
+        grab = Grab()
+        al.logger.addHandler(grab)
+        try:
+            with patch.object(al, "get_authenticated_session", side_effect=AssertionError("must not log in")):
+                al.main(["--catch-up"])
+        finally:
+            al.logger.removeHandler(grab)
+            held.close()
+        assert [r.getMessage() for r in records] == ["Catch-up run: another run is going - leaving today to it."]
+        assert all(r.levelno < _logging.WARNING for r in records)     # expected, so not an error in the log
+    in_tmp(tmp_path, run)
+
+
+def test_catch_up_stops_as_soon_as_todays_submission_lands(tmp_path):
+    def run():
+        brain = FakeBrain({"i1": alpha_json(), "i2": calm(), "i3": calm()})   # round 1's idea qualifies
+        assert run_main_rounds(brain, ["--catch-up"], MAX_ROUNDS=3) == 1
+        assert al.submissions_today() == 1
+    in_tmp(tmp_path, run)
+
+
+def test_catch_up_stops_when_a_held_alpha_covers_today(tmp_path):
+    def run():
+        al.append_result(held_row("held1", 1.3))
+        brain = FakeBrain({"held1": alpha_json(sharpe=1.6, fitness=1.3)})
+        with captured_logs() as lines:
+            assert run_main_rounds(brain, ["--catch-up"], MAX_ROUNDS=3) == 0
+        assert submitted_value("held1") == "YES"
+        assert "Catch-up run: a held alpha covered today - nothing more to do." in lines
+    in_tmp(tmp_path, run)
+
+
+def test_a_normal_run_still_mines_after_todays_submission(tmp_path):
+    def run():
+        brain = FakeBrain({"i1": alpha_json(), "i2": calm(), "i3": calm()})
+        assert run_main_rounds(brain, MAX_ROUNDS=3) == 3
+    in_tmp(tmp_path, run)
+
+
+# ---- The end of BRAIN's day ----
+
+def test_brain_day_ends_at_3am_us_eastern():
+    assert al.brain_day_ends_in(_dt(2026, 10, 14, 6, 30, tzinfo=_tz.utc)).total_seconds() == 30 * 60   # summer time
+    assert al.brain_day_ends_in(_dt(2026, 10, 14, 7, 0, tzinfo=_tz.utc)).total_seconds() == 24 * 3600
+    assert al.brain_day_ends_in(_dt(2026, 12, 1, 7, 30, tzinfo=_tz.utc)).total_seconds() == 30 * 60    # winter time
+    assert al.brain_day_ends_in(_dt(2026, 11, 1, 7, 30, tzinfo=_tz.utc)).total_seconds() == 30 * 60    # clocks go back
+    assert al.brain_day_ends_in(_dt(2026, 3, 8, 6, 30, tzinfo=_tz.utc)).total_seconds() == 30 * 60     # clocks go forward
+
+
+def test_a_run_settles_straight_away_when_brains_day_is_about_to_end(tmp_path):
+    def run():
+        al.append_result(held_row("weak", 1.2))
+        brain = FakeBrain({"weak": weak_json(fitness=1.2), "i1": calm()})
+        from datetime import timedelta as _td
+        with real_strong_bar(), patch.object(al, "SETTLE_BEFORE_DAY_END_MINUTES", 60), \
+             patch.object(al, "brain_day_ends_in", return_value=_td(minutes=30)), captured_logs() as lines:
+            run_main_rounds(brain, MAX_ROUNDS=1)
+        assert submitted_value("weak") == "YES"
+        settled = next(i for i, line in enumerate(lines) if "settling now rather than waiting" in line)
+        assert settled < next(i for i, line in enumerate(lines) if "=== Round 1" in line)   # before any round
+    in_tmp(tmp_path, run)
+
+
+def test_a_new_brain_day_mid_run_goes_back_to_strong_first(tmp_path):
+    def run():
+        from datetime import timedelta as _td
+        state = {"day": _date(2026, 10, 14)}
+
+        def gen(*a, **kw):
+            n = len(csv_rows()) if Path(al.RESULTS_FILE).exists() else 0
+            state["day"] = _date(2026, 10, 15)                        # BRAIN's day rolls over during round 1
+            return [(f"rank(idea{n})", "r")]
+
+        brain = FakeBrain({"i1": calm(), "i2": weak_json()})          # round 2 brings a weak alpha
+        _write_operators()
+        with real_strong_bar(), patch.object(al, "SETTLE_BEFORE_DAY_END_MINUTES", 60), \
+             patch.object(al, "brain_day", side_effect=lambda *a: state["day"]), \
+             patch.object(al, "brain_day_ends_in",
+                          side_effect=lambda *a: _td(minutes=30) if state["day"].day == 14 else _td(hours=20)), \
+             patch.object(al, "MAX_ROUNDS", 2), patch.object(al, "MAX_EXTRA_ROUNDS", 0), \
+             patch.object(al, "IDEAS_PER_ROUND", 1), patch.object(al, "generate_with_fallback", side_effect=gen), \
+             patch.object(al, "get_authenticated_session", return_value=brain.session), \
+             patch("google.genai.Client"), patch("time.sleep"), captured_logs() as lines:
+            al.main([])
+        assert any("BRAIN day 2026-10-15 has started" in line for line in lines)
+        # In the new day the weak alpha is held for a strong one first (not rushed in); the usual end-of-rounds
+        # settling then sends it, as on any day.
+        assert any("Alpha i2 qualifies" in line and "holding it for now" in line for line in lines)
+        assert submitted_value("i2") == "YES"
+    in_tmp(tmp_path, run)
+
+
+# ---- Padding: add(x, 0.0001) ----
+
+IV_RATIO = ("ts_decay_linear(group_rank(divide(implied_volatility_call_180, add(implied_volatility_put_180, 0.0001)), "
+            "sector), 10)")                                            # E5VW6LeK: Sharpe 2.02, failed the sub-universe check
+IV_RATIO_BARE = "ts_decay_linear(group_rank(divide(implied_volatility_call_180, implied_volatility_put_180), sector), 10)"
+
+
+def test_padding_is_taken_out_and_nothing_else():
+    cases = {
+        IV_RATIO: IV_RATIO_BARE,
+        "ts_delta(iv, 30) / add(ts_std_dev(iv, 60), 0.0001)": "ts_delta(iv, 30) / ts_std_dev(iv, 60)",
+        "add(0.0001, x)": "x",
+        "add(add(x, 0.0001), 1e-4)": "x",
+        "rank(x / (ts_std_dev(x, 20) + 0.0001))": "rank(x / (ts_std_dev(x, 20)))",
+        "rank((1e-4 + x) * y)": "rank((x) * y)",
+        "ts_mean(x+0.0001, 20)": "ts_mean(x, 20)",
+        "x * 1e+05 + 0.0001": "x * 1e+05",
+        "group_neutralize(add(x, 0.0001), bucket(rank(cap), range='0, 1, 0.1'))":
+            "group_neutralize(x, bucket(rank(cap), range='0, 1, 0.1'))",
+    }
+    for padded, bare in cases.items():
+        assert al.strip_padding(padded) == bare, padded
+    for untouched in ("add(x, 0.5)", "add(x, y)", "x + 0.0001 * y", "add(x, 0.0001, filter=true)", "x + 0",
+                      "add(x, 0.0001, 0.0001)",
+                      "rank(close - 0.0001)", "group_neutralize(x, bucket(rank(cap), range='0.0001, 1, 0.1'))"):
+        assert al.strip_padding(untouched) == untouched, untouched
+
+
+def test_gemini_ideas_are_tested_without_their_padding(tmp_path):
+    def run():
+        brain = SlowBrain({"rank(divide(a, b))": calm()})
+        with captured_logs() as lines:
+            run_one_idea(brain, "rank(divide(a, add(b, 0.0001)))")
+        assert brain.started == ["rank(divide(a, b))"]
+        assert any("Took the add(x, 0.0001)-style padding out of 1 idea(s)" in line for line in lines)
+    in_tmp(tmp_path, run)
+
+
+def test_an_idea_differing_only_by_padding_counts_as_already_tried(tmp_path):
+    def run():
+        al.append_result(dict(_history_row("rank(divide(a, add(b, 0.0001)))", 0.5, 0.2, 0.1), alpha_id="old"))
+        assert "rank(divide(a, b))" in al.already_tried()
+        avoid = al.already_tried()
+        brain = SlowBrain({})
+        client = MagicMock()
+        client.models.generate_content.return_value = fake_gemini_response(
+            [{"expression": "rank(divide(a, b))", "rationale": "r"}])
+        with patch("time.sleep"):
+            al.run_round(brain.session, client, [], [], SETTINGS, "e@x.com", "pw", 1, "round 1", avoid)
+        assert brain.started == []
+    in_tmp(tmp_path, run)
+
+
+def test_repairs_are_built_without_the_padding_and_skip_fixes_tried_with_it(tmp_path):
+    def run():
+        fixes = al.repair_candidates(IV_RATIO, ["LOW_SUB_UNIVERSE_SHARPE"])
+        assert fixes[0][0] == IV_RATIO_BARE.replace("sector", "subindustry") and "add(" not in fixes[1][0]
+        # Your real history: the subindustry and size-bucket versions were already tried, with the padding.
+        al.append_result(dict(_history_row(IV_RATIO.replace("sector", "subindustry"), 2.03, 1.48, 0.169)))
+        al.append_result(dict(_history_row(f"group_neutralize({IV_RATIO}, bucket(rank(cap), range='0, 1, 0.1'))",
+                                           2.13, 1.66, 0.164)))
+        write_cache({"cap": "Price Volume"})
+        left = al.repair_candidates(IV_RATIO, ["LOW_SUB_UNIVERSE_SHARPE"], al.already_tried())
+        assert [e for e, _ in left] == [
+            "ts_decay_linear(group_rank(divide(implied_volatility_call_180, implied_volatility_put_180), sector), 10)"
+            " * rank(ts_mean(volume * close, 20)) + "
+            "ts_decay_linear(group_rank(divide(implied_volatility_call_180, implied_volatility_put_180), sector), 20)"
+            " * (1 - rank(ts_mean(volume * close, 20)))"]
+        assert left[0][1].startswith("failed LOW_SUB_UNIVERSE_SHARPE; the most traded stocks get a faster version")
+    in_tmp(tmp_path, run)
+
+
+def test_the_generator_is_told_not_to_pad_and_what_the_checks_mean():
+    client = MagicMock()
+    client.models.generate_content.return_value = fake_gemini_response(ONE_IDEA)
+    al.generate_ideas(client, "m", [], [], SETTINGS, "feedback", set(), 3)
+    prompt = client.models.generate_content.call_args.kwargs["contents"]
+    assert "never pad a division with a tiny number like add(x, 0.0001)" in prompt
+    assert "LOW_SUB_UNIVERSE_SHARPE - it must also work among the largest, most liquid stocks" in prompt
+
+
+# ---- Smoothing toward the strong bar ----
+
+def test_a_strong_sharpe_held_back_by_turnover_is_smoothed_toward_the_strong_bar(tmp_path):
+    def run():
+        # Your mLYwwez5's numbers: Sharpe 2.02, fitness 1.29 at 17.6% turnover - at 12.5% it'd be about 1.53.
+        # Tested as given (like --try), padding and all: the smoothed version is built without the padding.
+        results = {IV_RATIO: alpha_json(sharpe=2.02, fitness=1.29, turnover=0.1764, returns=0.0715, drawdown=0.0391),
+                   f"ts_decay_linear({IV_RATIO_BARE}, 10)": strong_json(turnover=0.12)}
+        brain = SlowBrain(results)
+        brain.session.post.side_effect = lambda url, **kw: (
+            fake_response(201, {}, headers={}) if url.endswith("/submit") else brain.post(url, **kw))
+        with real_strong_bar(), patch.object(al, "submit_alpha", return_value=("YES", None)), \
+             patch.object(al, "is_active_on_brain", return_value=True):
+            rows = run_queue(brain, [IV_RATIO], parallel=1)
+        assert [r["expression"] for r in rows] == [IV_RATIO, f"ts_decay_linear({IV_RATIO_BARE}, 10)"]
+        assert "misses the strong bar (1.3)" in rows[1]["rationale"]
+        assert rows[0]["submitted"].startswith(al.HELD_PREFIX) and rows[1]["submitted"] == "YES"
+    in_tmp(tmp_path, run)
+
+
+def test_a_flip_of_a_padded_expression_is_built_without_the_padding(tmp_path):
+    def run():
+        padded = "rank(divide(a, add(b, 0.0001)))"
+        brain = SlowBrain({padded: alpha_json(sharpe=-1.5, checks=[]), "reverse(rank(divide(a, b)))": calm()})
+        rows = run_queue(brain, [padded], parallel=1)
+        assert [r["expression"] for r in rows] == [padded, "reverse(rank(divide(a, b)))"]
+    in_tmp(tmp_path, run)
+
+
+def test_tried_expressions_are_remembered_with_and_without_padding():
+    avoid = set()
+    al.note_tried(avoid, "rank(divide(a, add(b, 0.0001)))")
+    assert avoid == {"rank(divide(a, add(b, 0.0001)))", "rank(divide(a, b))"}
+
+
+def test_smoothing_toward_strong_only_when_it_could_get_there():
+    def row(sharpe=2.02, fitness=1.29, turnover=0.1764, **kw):
+        return dict(dict(sharpe=str(sharpe), fitness=str(fitness), turnover=str(turnover), submitted="NO"), **kw)
+
+    with real_strong_bar():
+        assert al.smoothing_could_make_it_strong(row())
+        assert al.smoothing_could_make_it_strong(row(submitted=al.HELD_FOR_STRONGER_LABEL))
+        assert not al.smoothing_could_make_it_strong(row(sharpe=1.8, fitness=1.0, turnover=0.18))     # 1.2 at best
+        assert not al.smoothing_could_make_it_strong(row(turnover=0.15))                     # trades little already
+        assert not al.smoothing_could_make_it_strong(row(sharpe=1.59))                       # Sharpe isn't strong
+        assert not al.smoothing_could_make_it_strong(row(fitness=1.3))                       # already strong
+        assert not al.smoothing_could_make_it_strong(row(failed_checks=["LOW_SUB_UNIVERSE_SHARPE"]))  # repairs' job
+        for done in ("YES", "VERDICT_PENDING (check with BRAIN in the dashboard)", "TOO_CORRELATED (max 0.91)",
+                     "REJECTED: failed SELF_CORRELATION"):
+            assert not al.smoothing_could_make_it_strong(row(submitted=done)), done
+        assert not al.smoothing_could_make_it_strong(row(sharpe=""))
+
+
+# ---- The third fix for the sub-universe check, and fixes not yet tried ----
+
+def test_the_liquid_split_keeps_the_alphas_own_smoothing_as_its_fast_speed():
+    assert al._liquid_split(DIVIDEND)[0] == LIQUID_SPLIT
+    bare = al._liquid_split("rank(x)")[0]
+    assert bare == ("ts_decay_linear(rank(x), 5) * rank(ts_mean(volume * close, 20)) + "
+                    "ts_decay_linear(rank(x), 10) * (1 - rank(ts_mean(volume * close, 20)))")
+    assert al._liquid_split("hump(rank(x), hump=0.01)")[0] == bare      # hump: its core, default speeds
+
+
+def test_fixes_already_tried_give_way_to_the_next_ones(tmp_path):
+    def run():
+        assert [e for e, _ in al.repair_candidates(DIVIDEND, ["LOW_SUB_UNIVERSE_SHARPE"], {FINER})] == [LIQUID_SPLIT]
+        assert al.repair_candidates(DIVIDEND, ["LOW_SUB_UNIVERSE_SHARPE"], {FINER, LIQUID_SPLIT}) == []
+        assert al.fixable(["LOW_SUB_UNIVERSE_SHARPE"]) and not al.fixable([]) and \
+            not al.fixable(["LOW_SUB_UNIVERSE_SHARPE", "MATCHES_COMPETITION"])
+    in_tmp(tmp_path, run)
+
+
+def test_an_earlier_near_miss_gets_its_next_untried_fix(tmp_path):
+    def run():
+        al.append_result(dict(_history_row(DIVIDEND, 1.35, 1.34, 0.13), alpha_id="div", submitted="NO"))
+        brain = SlowBrain({DIVIDEND: near_miss(SUB_FAIL), LIQUID_SPLIT: calm()}, existing={"div": DIVIDEND})
+        with patch("time.sleep"):
+            rows = al.repair_past_near_misses(brain.session, SETTINGS, "e@x.com", "pw", {DIVIDEND, FINER})
+        assert brain.started == [LIQUID_SPLIT] and rows[0]["round"] == "repair"
+    in_tmp(tmp_path, run)
+
+
+# ---- BRAIN's value and limit for a check that didn't pass ----
+
+LSUS_WITH_NUMBERS = {"name": "LOW_SUB_UNIVERSE_SHARPE", "result": "FAIL", "value": 0.6213, "limit": 0.8746}
+
+
+def test_checks_that_didnt_pass_show_brains_value_and_limit():
+    assert al.check_note(LSUS_WITH_NUMBERS) == "LOW_SUB_UNIVERSE_SHARPE:FAIL (0.62 vs limit 0.87)"
+    assert al.check_note({"name": "SELF_CORRELATION", "result": "PENDING"}) == "SELF_CORRELATION:PENDING"
+    assert al.failed_text([LSUS_WITH_NUMBERS], ["LOW_SUB_UNIVERSE_SHARPE", "OTHER"]) == \
+        "LOW_SUB_UNIVERSE_SHARPE (0.62 vs limit 0.87), OTHER"
+
+
+def test_the_log_and_the_generator_see_the_value_and_limit(tmp_path):
+    def run():
+        checks = [LSUS_WITH_NUMBERS, {"name": "SELF_CORRELATION", "result": "PENDING"}]
+        brain = SlowBrain({DIVIDEND: near_miss(checks), FINER: calm(), LIQUID_SPLIT: calm()})
+        with captured_logs() as lines:
+            rows = run_queue(brain, [DIVIDEND], parallel=1)
+        assert any("failed LOW_SUB_UNIVERSE_SHARPE (0.62 vs limit 0.87) - testing a repaired version" in line
+                   for line in lines), lines
+        assert "LOW_SUB_UNIVERSE_SHARPE:FAIL (0.62 vs limit 0.87)" in al.summarize_round(rows)
+    in_tmp(tmp_path, run)
+
+
+# ---- A time limit on every Gemini request ----
+
+def test_gemini_requests_get_a_time_limit():
+    with patch("google.genai.Client") as client:
+        al.gemini_client()
+    assert client.call_args.kwargs["http_options"].timeout == al.GEMINI_TIMEOUT_SECONDS * 1000 == 300_000
+
+
+def test_a_run_asks_gemini_with_the_time_limit(tmp_path):
+    def run():
+        _write_operators()
+        brain = FakeBrain({})
+        with patch.object(al, "MAX_ROUNDS", 0), patch.object(al, "get_authenticated_session", return_value=brain.session), \
+             patch("google.genai.Client") as client, patch("time.sleep"):
+            al.main([])
+        assert client.call_args.kwargs["http_options"].timeout == 300_000
+    in_tmp(tmp_path, run)
+
+
+def test_an_older_gemini_library_still_works_without_a_time_limit():
+    plain = MagicMock()
+    with patch("google.genai.Client", side_effect=[TypeError("unexpected keyword"), plain]), \
+         captured_logs() as lines:
+        assert al.gemini_client() is plain
+    assert any("can't put a time limit on Gemini requests" in line for line in lines)
 
 
 if __name__ == "__main__":

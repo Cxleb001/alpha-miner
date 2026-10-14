@@ -16,6 +16,11 @@ Run:
                                               # pipeline: simulate, check, submit if they qualify
     python alpha_loop.py --log-dir logs       # also keep the log in logs/alpha_loop_YYYY-MM-DD.log
                                               # (what the daily scheduled run uses)
+    python alpha_loop.py --catch-up --log-dir logs
+                                              # for extra triggers (start-up, wifi back, every few
+                                              # hours): only runs while nothing is in for today
+    To start a run by hand, Start-ScheduledTask -TaskName "Alpha Miner" runs it in the background with
+    its log, the same as the scheduled run - it keeps going if you close the window.
 
 Only one run at a time: a second run started while one is going exits straight away (alpha_loop.lock),
 so a scheduled run and a manual one can never double-submit.
@@ -64,15 +69,19 @@ READ BEFORE YOU RUN THIS:
   SMOOTH_MIN_TURNOVER (default 0.2) - or turnover over BRAIN's 70% limit with Sharpe >= 1.0
   (SMOOTH_MIN_SHARPE_OVER_LIMIT) - the loop also tests
   ts_decay_linear(<expression>, 10) right after it (up to MAX_SMOOTHS_PER_ROUND per round, default 3).
-  Fitness divides by turnover, so trading less can lift it over the bar.
+  Fitness divides by turnover, so trading less can lift it over the bar. The same goes for a strong Sharpe
+  whose fitness misses the strong bar: with no failed check, turnover over SMOOTH_TOWARD_STRONG_MIN_TURNOVER
+  (0.15), and fitness that would reach STRONG_MIN_FITNESS at BRAIN's 12.5% turnover floor with the same returns.
 - Auto-repair: an alpha with Sharpe and fitness over the bar that FAILs one of BRAIN's fixable checks
   gets up to MAX_REPAIRS_PER_ALPHA (default 2) repaired versions tested right after it, at most
   MAX_REPAIRS_PER_ROUND (default 4) per round: CONCENTRATED_WEIGHT -> rank(...) or ts_backfill on its data
-  fields; LOW_SUB_UNIVERSE_SHARPE -> rank within subindustry, or neutralize against market-cap buckets;
+  fields; LOW_SUB_UNIVERSE_SHARPE -> rank within subindustry, neutralize against market-cap buckets, or trade
+  the most liquid stocks on a faster version of the signal and the rest on a slower one;
   LOW_TURNOVER -> drop the outer ts_decay_linear. Repairs follow community write-ups of BRAIN's checks,
-  and BRAIN's own result decides whether each worked. If the original is already too similar to your
+  and BRAIN's own result decides whether each worked. Fixes already tried are skipped, so a near-miss gets
+  the next ones on a later run. If the original is already too similar to your
   submitted alphas, it isn't repaired (the repair would be too). A near-miss failing a check with no
-  automatic fix gets a log line naming that check.
+  automatic fix gets a log line naming that check, with BRAIN's value and limit for it when BRAIN gives them.
 - Auto-sharpen: an alpha with Sharpe >= 1.25 but fitness under 1.0 whose turnover is already under 12.5%
   - where BRAIN's fitness formula stops giving credit for trading less - is re-tested without its outer
   ts_decay_linear/hump (up to MAX_SHARPENS_PER_ROUND, default 3), after the same free similarity check.
@@ -123,9 +132,28 @@ READ BEFORE YOU RUN THIS:
   many are running, the loop carries on with however many it already has going. Results are still
   handled one at a time, so submissions never overlap. Set PARALLEL_SIMULATIONS=1 for the old pace.
 - Network resilience: every request to BRAIN has a 30-second timeout and is retried after a dropped
-  connection (waiting 5s, 15s, 45s). If an idea still can't get through, the loop logs it as
-  "Couldn't reach BRAIN" and moves on to the next one; after MAX_NETWORK_FAILURES (default 3) in a
-  row, it stops cleanly, keeping everything so far. Gemini connection drops are retried the same way.
+  connection (waiting 5s, 15s, 45s), and each Gemini request has a GEMINI_TIMEOUT_SECONDS (300) limit - the
+  library's own default is none, so a dropped connection could freeze a run for hours. When something still
+  can't get through, the loop asks whether BRAIN answers at all. If it does, that one idea is logged as
+  "Couldn't reach BRAIN" and the loop moves on (after MAX_NETWORK_FAILURES, default 3, in a row it stops
+  cleanly). If BRAIN doesn't answer, the connection itself is gone - wifi dropped, a laptop just woke up - so
+  the run waits: it checks every minute for up to WAIT_FOR_CONNECTION_MINUTES (120) and then carries on where
+  it left off, simulations already running on BRAIN included. Logging in waits the same way, and a login
+  that failed only because the connection was down is no longer reported as identity verification. Time
+  spent waiting, or with the computer asleep, doesn't count against MAX_RUNTIME_SECONDS.
+- Laptops: while a run is going and the computer is plugged in, it asks Windows not to sleep (the screen can
+  still turn off). On battery it lets the computer sleep as usual and carries on when it wakes.
+- --catch-up, for extra scheduled triggers (start-up, reconnecting to the internet, every few hours): exits
+  straight away if today's submission is already in, or if another run is going; otherwise it runs like a
+  normal run and stops as soon as today's submission lands.
+- End of BRAIN's day: a run with nothing in yet SETTLE_BEFORE_DAY_END_MINUTES (60) before BRAIN's day ends
+  settles straight away - the best held alpha goes in - instead of waiting for a strong one it may not have
+  time to find.
+- Padding: ideas like divide(x, add(y, 0.0001)) - a tiny number added so a division can't hit zero - are
+  tested without it. Every alpha with it came back with an extra check that didn't PASS (BRAIN's units check:
+  unitHandling is VERIFY, and a plain number has no units), and the loop only submits alphas whose every check
+  passes. Follow-ups and repairs are built on the expression without it, and two expressions that differ only
+  by padding count as the same idea when deciding what was already tried.
 - Memory across runs: every round, the generator sees your best MEMORY_TOP_N (default 10) results
   from all runs so far (read from alpha_loop_results.csv), not just the last round.
 - operators.json holds the full base-tier operator list (66 operators) transcribed from
@@ -181,6 +209,9 @@ RETRY_DELAYS_SECONDS = (10, 20, 40, 80)  # backoff when the main model is busy o
 TRANSIENT_STATUS_CODES = {429, 500, 502, 503, 504}  # worth waiting out; anything else won't fix itself
 MAX_GENERATION_FAILURES = int(os.environ.get("MAX_GENERATION_FAILURES", 3))  # in a row, then stop the run
 GENERATION_COOLDOWN_SECONDS = int(os.environ.get("GENERATION_COOLDOWN_SECONDS", 60))  # pause between failed attempts
+# A time limit on each Gemini request. The library's default is none at all, so a connection that drops
+# mid-request could leave a run waiting for hours - and while it waits, Windows skips the next scheduled run.
+GEMINI_TIMEOUT_SECONDS = int(os.environ.get("GEMINI_TIMEOUT_SECONDS", 300))
 
 # Submission bar - unchanged values, just named once so dashboard.py reads the same numbers.
 SUBMIT_MIN_SHARPE = 1.25
@@ -207,9 +238,28 @@ SMOOTH_DECAY_DAYS = int(os.environ.get("SMOOTH_DECAY_DAYS", 10))
 SMOOTH_MIN_TURNOVER = float(os.environ.get("SMOOTH_MIN_TURNOVER", 0.2))  # below this, decay can barely help fitness
 SMOOTH_MIN_SHARPE_OVER_LIMIT = float(os.environ.get("SMOOTH_MIN_SHARPE_OVER_LIMIT", 1.0))  # turnover over 70%
 MAX_SMOOTHS_PER_ROUND = int(os.environ.get("MAX_SMOOTHS_PER_ROUND", 3))  # caps the extra simulations smoothing adds
+# ...and a strong Sharpe whose fitness misses the strong bar is smoothed too, when it trades more than this and
+# trading at BRAIN's 12.5% fitness floor (same returns) would put fitness over STRONG_MIN_FITNESS.
+SMOOTH_TOWARD_STRONG_MIN_TURNOVER = float(os.environ.get("SMOOTH_TOWARD_STRONG_MIN_TURNOVER", 0.15))
+
+# Padding like add(x, 0.0001) - a tiny number added so a division can't hit zero - changes nothing that matters,
+# but every alpha that had it came back with an extra check that didn't PASS (most likely BRAIN's units check:
+# unitHandling is VERIFY, and a plain number has no units). Gemini's ideas are stripped of numbers up to this size.
+PADDING_MAX = 0.001
 
 # Network resilience: one dropped connection skips that idea; this many in a row stops the run cleanly.
 MAX_NETWORK_FAILURES = int(os.environ.get("MAX_NETWORK_FAILURES", 3))
+# ...unless the connection itself is gone (wifi dropped, laptop just woke up): then the run checks every
+# CONNECTION_CHECK_SECONDS and carries on where it left off once BRAIN answers again, for up to
+# WAIT_FOR_CONNECTION_MINUTES, and only then stops. Time spent waiting doesn't count against MAX_RUNTIME_SECONDS.
+WAIT_FOR_CONNECTION_MINUTES = int(os.environ.get("WAIT_FOR_CONNECTION_MINUTES", 120))
+CONNECTION_CHECK_SECONDS = 60
+CONNECTION_PROBE_TIMEOUT = 15
+SLEEP_GAP_SECONDS = 120  # a pause that ran this much over was the computer asleep (lid closed, Windows sleep)
+
+# A run with nothing in for today this close to the end of BRAIN's day settles straight away (the best held alpha
+# goes in) instead of waiting for a strong one it may not have time to find.
+SETTLE_BEFORE_DAY_END_MINUTES = int(os.environ.get("SETTLE_BEFORE_DAY_END_MINUTES", 60))
 
 # Auto-repair: a strong alpha (Sharpe and fitness over the bar) failing a fixable check gets
 # re-tested with a known fix for that check. Each repair is one extra simulation.
@@ -387,15 +437,164 @@ def keep_logged_in(session, email, password):
         return
     logger.info("BRAIN login runs out in under %d minutes - logging in again now.", SESSION_RENEW_SECONDS // 60)
     session.cookies.clear()
-    if not log_in(session, email, password):
+    if not log_in_again(session, email, password):
         raise StopLoop("BRAIN needs re-authentication (likely identity verification) and no one is here to complete it.")
 
 
+# ---- Riding out a lost connection (wifi dropped, laptop asleep) ----
+
+OUTAGE_SECONDS = 0.0  # this run's time waiting for the connection or asleep - not counted against MAX_RUNTIME_SECONDS
+
+
+def no_connection() -> StopLoop:
+    return StopLoop(f"No connection to BRAIN for {WAIT_FOR_CONNECTION_MINUTES} minutes - stopped cleanly; "
+                    f"everything so far is saved. The next scheduled run carries on.")
+
+
+def brain_reachable() -> bool:
+    """Whether BRAIN answers at all. Any reply counts, even 'not logged in' - only a failed connection doesn't."""
+    try:
+        requests.get(be.AUTH_URL, timeout=CONNECTION_PROBE_TIMEOUT)
+        return True
+    except requests.RequestException:
+        return False
+
+
+def wait_for_connection(what: str) -> bool:
+    """If BRAIN can't be reached, check every CONNECTION_CHECK_SECONDS until it can, for up to
+    WAIT_FOR_CONNECTION_MINUTES. True as soon as BRAIN answers (straight away if it already does)."""
+    global OUTAGE_SECONDS
+    if brain_reachable():
+        return True
+    began = time.time()
+    logger.warning("Lost the connection to BRAIN %s - waiting for it to come back (checking every %ds, for up to "
+                   "%d minutes).", what, CONNECTION_CHECK_SECONDS, WAIT_FOR_CONNECTION_MINUTES)
+    try:
+        for _ in range(max(1, WAIT_FOR_CONNECTION_MINUTES * 60 // CONNECTION_CHECK_SECONDS)):
+            time.sleep(CONNECTION_CHECK_SECONDS)
+            if brain_reachable():
+                logger.info("The connection is back after %d minute(s) - carrying on where the run left off.",
+                            round((time.time() - began) / 60))
+                return True
+        logger.error("Still no connection to BRAIN after %d minutes.", WAIT_FOR_CONNECTION_MINUTES)
+        return False
+    finally:
+        OUTAGE_SECONDS += time.time() - began
+
+
+def nap(seconds) -> float:
+    """time.sleep that notices the computer sleeping through it: a pause that ran SLEEP_GAP_SECONDS or more over
+    was the computer asleep, and that time isn't counted against MAX_RUNTIME_SECONDS. Returns the seconds the
+    computer was away (0 normally)."""
+    global OUTAGE_SECONDS
+    began = time.time()
+    time.sleep(seconds)
+    away = time.time() - began - seconds
+    if away < SLEEP_GAP_SECONDS:
+        return 0.0
+    OUTAGE_SECONDS += away
+    logger.info("The computer seems to have been asleep for about %d minute(s) - carrying on.", round(away / 60))
+    return away
+
+
+def log_in_again(session, email, password) -> bool:
+    """log_in, but a login that failed only because the connection is gone waits for it to come back and tries
+    once more (raising StopLoop if it never does). False means BRAIN itself said no - identity verification
+    nobody is here to answer, or a wrong password."""
+    if log_in(session, email, password):
+        return True
+    if brain_reachable():
+        return False
+    if not wait_for_connection("while logging in again"):
+        raise no_connection()
+    return log_in(session, email, password)
+
+
+def connect(email: str, password: str) -> requests.Session:
+    """Log in for a run - first waiting out a lost connection (a laptop that just woke up, wifi that dropped),
+    and once more if it drops during the login itself."""
+    if not wait_for_connection("before logging in"):
+        raise LoginFailed(f"No connection to BRAIN for {WAIT_FOR_CONNECTION_MINUTES} minutes - stopping before "
+                          f"using any quota. The next scheduled run tries again.")
+    try:
+        return get_authenticated_session(email, password)
+    except LoginFailed:
+        if brain_reachable() or not wait_for_connection("while logging in"):
+            raise
+        return get_authenticated_session(email, password)
+
+
+# ---- Laptops: don't let Windows sleep in the middle of a run while it's plugged in ----
+
+ES_CONTINUOUS, ES_SYSTEM_REQUIRED = 0x80000000, 0x00000001
+AWAKE = False  # whether this run has asked Windows to stay awake
+
+
+def on_mains_power():
+    """True when Windows says the computer is plugged in, False on battery, None when it can't tell
+    (or this isn't Windows)."""
+    try:
+        import ctypes
+
+        class PowerStatus(ctypes.Structure):
+            _fields_ = [("ACLineStatus", ctypes.c_ubyte), ("BatteryFlag", ctypes.c_ubyte),
+                        ("BatteryLifePercent", ctypes.c_ubyte), ("SystemStatusFlag", ctypes.c_ubyte),
+                        ("BatteryLifeTime", ctypes.c_ulong), ("BatteryFullLifeTime", ctypes.c_ulong)]
+
+        status = PowerStatus()
+        if not ctypes.windll.kernel32.GetSystemPowerStatus(ctypes.byref(status)):
+            return None
+        return {0: False, 1: True}.get(status.ACLineStatus)
+    except Exception:
+        return None
+
+
+def set_execution_state(flags: int) -> bool:
+    """Windows' SetThreadExecutionState. False where there's no such thing (not Windows). Its reply is the previous
+    state, which can be 0 the first time, so any call that went through counts as done."""
+    try:
+        import ctypes
+        ctypes.windll.kernel32.SetThreadExecutionState(ctypes.c_uint(flags))
+        return True
+    except Exception:
+        return False
+
+
+def keep_awake():
+    """While a run is going and the computer is plugged in, ask Windows not to sleep (the screen can still turn
+    off). On battery, let it sleep as usual - the run carries on when it wakes. Called every round and every
+    simulation check, so plugging in or unplugging mid-run is noticed. Does nothing on other systems."""
+    global AWAKE
+    want = on_mains_power() is True
+    if want == AWAKE:
+        return
+    if not set_execution_state(ES_CONTINUOUS | (ES_SYSTEM_REQUIRED if want else 0)):
+        return
+    AWAKE = want
+    logger.info("Plugged in - keeping the computer awake until this run is done." if want else
+                "On battery - letting the computer sleep as usual; the run carries on when it wakes.")
+
+
+def let_sleep():
+    """The run is over: Windows may sleep again whenever it likes."""
+    global AWAKE
+    if AWAKE and set_execution_state(ES_CONTINUOUS):
+        AWAKE = False
+
+
 def already_tried() -> set:
+    """Every expression tried so far - each also without its add(x, 0.0001) padding, so an idea that differs from
+    an earlier one only by the padding counts as already tried."""
     if not Path(RESULTS_FILE).exists():
         return set()
     with open(RESULTS_FILE, encoding="utf-8") as f:
-        return {row["expression"] for row in csv.DictReader(f)}
+        tried = {row["expression"] for row in csv.DictReader(f)}
+    return tried | {strip_padding(e) for e in tried}
+
+
+def note_tried(avoid: set, expression: str):
+    avoid.add(expression)
+    avoid.add(strip_padding(expression))
 
 
 def safe_float(val, default=0.0):
@@ -418,6 +617,17 @@ def brain_day(now_utc=None) -> date:
     dst_end = datetime(now_utc.year, 11, nth_sunday(11, 1), 6, tzinfo=timezone.utc)   # 2 AM EDT
     eastern = timedelta(hours=-4) if dst_start <= now_utc < dst_end else timedelta(hours=-5)
     return (now_utc + eastern - timedelta(hours=3)).date()
+
+
+def brain_day_ends_in(now_utc=None) -> timedelta:
+    """How long until BRAIN's day rolls over (3 AM US Eastern: 07:00 UTC in summer time, 08:00 UTC in winter)."""
+    now_utc = now_utc or datetime.now(timezone.utc)
+    following = brain_day(now_utc) + timedelta(days=1)
+    for hour in (7, 8):
+        rollover = datetime(following.year, following.month, following.day, hour, tzinfo=timezone.utc)
+        if brain_day(rollover) == following:
+            return rollover - now_utc
+    return timedelta(days=1)  # unreachable: one of the two hours is always the rollover
 
 
 def submissions_today() -> int:
@@ -818,6 +1028,18 @@ def build_feedback(last_round_rows=None) -> str:
     return "\n\n".join(parts) if parts else "This is round 1 - no prior results yet."
 
 
+CHECKS_EXPLAINED = (
+    "BRAIN's checks, so ideas don't walk into them (feedback lists the ones each result didn't pass): "
+    "LOW_SUB_UNIVERSE_SHARPE - it must also work among the largest, most liquid stocks, not only in small ones; "
+    "CONCENTRATED_WEIGHT - too few stocks get a position, usually sparse data (ts_backfill helps); "
+    "LOW_SHARPE / LOW_FITNESS - under BRAIN's bar; HIGH_TURNOVER / LOW_TURNOVER - trades too much or too little; "
+    "SELF_CORRELATION - too similar to an alpha already submitted; the units check - adds or subtracts things "
+    "measured in different units, such as a plain number added to a data field. So never pad a division with a "
+    "tiny number like add(x, 0.0001) or x + 0.0001 - BRAIN copes with dividing by zero - and only add or subtract "
+    "fields measured in the same units."
+)
+
+
 def generate_ideas(client: genai.Client, model: str, operators, fields, settings, feedback_text, avoid: set, n: int):
     op_list = "\n".join(f"- {o['name']}: {o['usage']}" for o in operators)
     field_list = "\n".join(f"- {f['name']}: {f['description']}" for f in fields)
@@ -836,6 +1058,7 @@ def generate_ideas(client: genai.Client, model: str, operators, fields, settings
         f"ts_decay_linear, or hump. Ideas that scored a strongly negative Sharpe are re-tested reversed "
         f"automatically, and promising ideas that trade too much are re-tested smoothed with "
         f"ts_decay_linear, so don't spend ideas on negating or smoothing past results.\n\n"
+        f"{CHECKS_EXPLAINED}\n\n"
         f"{feedback_text}\n\n"
         f"Propose {n} NEW candidate expressions, genuinely different in shape from each "
         f"other (not the same template with one field swapped). Each needs a one-sentence "
@@ -1153,6 +1376,67 @@ def needs_smoothing(sharpe, fitness, turnover) -> bool:
     return fitness < SUBMIT_MIN_FITNESS
 
 
+def smoothing_could_make_it_strong(row) -> bool:
+    """A strong Sharpe whose fitness misses the strong bar because it trades a lot: over
+    SMOOTH_TOWARD_STRONG_MIN_TURNOVER, and at BRAIN's 12.5% fitness floor with the same returns its fitness would
+    reach STRONG_MIN_FITNESS (fitness grows with the square root of the turnover it sheds). Only for alphas with
+    no failed check (repairs handle those) that aren't already submitted, rejected or too similar."""
+    sharpe, fitness, turnover = (as_float(row.get(k)) for k in ("sharpe", "fitness", "turnover"))
+    if sharpe is None or fitness is None or turnover is None:
+        return False
+    if sharpe < STRONG_MIN_SHARPE or fitness >= STRONG_MIN_FITNESS or turnover <= SMOOTH_TOWARD_STRONG_MIN_TURNOVER:
+        return False
+    if row.get("failed_checks"):
+        return False
+    submitted = str(row.get("submitted") or "NO")
+    if landed(submitted) or submitted.startswith(("TOO_CORRELATED", "REJECTED")):
+        return False
+    return fitness * math.sqrt(turnover / FITNESS_TURNOVER_FLOOR) >= STRONG_MIN_FITNESS
+
+
+# ---- Padding: add(x, 0.0001) and the like ----
+
+_NUMBER = r"(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?"
+
+
+def _is_padding(text: str) -> bool:
+    try:
+        value = float(text.strip())
+    except ValueError:
+        return False
+    return 0 < abs(value) <= PADDING_MAX
+
+
+def strip_padding(expression: str) -> str:
+    """The expression without add(x, 0.0001)-style padding - a tiny number added so a division can't hit zero.
+    It changes nothing that matters, but a plain number added to a data field trips BRAIN's units check.
+    Handles add(x, c), add(c, x), x + c and c + x where c is at most PADDING_MAX; anything else is left alone."""
+    expr = expression
+    changed = True
+    while changed:  # add(...) calls, innermost padding first
+        changed = False
+        for m in re.finditer(r"\badd\s*\(", _blank_quotes(expr)):
+            close = matching_paren(expr, m.end() - 1)
+            if close < 0:
+                continue
+            args = split_top_level(expr[m.end():close])
+            kept = [a for a in args if not _is_padding(a)]
+            if len(args) == 2 and len(kept) == 1:
+                expr = expr[:m.start()] + kept[0].strip() + expr[close + 1:]
+                changed = True
+                break
+    # x + c just before a closing bracket, a comma or the end; c + x just after an opening bracket, a comma or the start
+    for pattern in (rf"\s*\+\s*({_NUMBER})(?=\s*(?:\)|,|$))", rf"(?:(?<=[(,])|^)\s*({_NUMBER})\s*\+\s*"):
+        for m in reversed(list(re.finditer(pattern, _blank_quotes(expr)))):
+            if _is_padding(m.group(1)):
+                expr = expr[:m.start()] + expr[m.end():]
+    return expr
+
+
+def padding_note(expression: str) -> str:
+    return " without its padding" if strip_padding(expression) != expression else ""
+
+
 # ---- Auto-repair: strong alphas that fail one of BRAIN's fixable checks ----
 # Fixes follow community write-ups of BRAIN's checks (rank / ts_backfill for concentrated weight;
 # finer groups / no size tilt for weak sub-universe Sharpe). Each repair is one extra simulation,
@@ -1287,6 +1571,24 @@ def _size_neutral(expr):
             "liquid stocks")
 
 
+LIQUIDITY = "rank(ts_mean(volume * close, 20))"  # 0 for the least traded stocks in dollars, 1 for the most
+
+
+def _liquid_split(expr):
+    """The community fix for LOW_SUB_UNIVERSE_SHARPE: decay the liquid and the illiquid part separately - the most
+    traded stocks on a faster version of the signal, the rest on a slower one. Keeps the alpha's own smoothing as
+    the fast speed (5 days without one) and doubles it for the slow."""
+    call = outer_call(expr)
+    core, fast = expr.strip(), 5
+    if call and call[0] in SMOOTHERS and call[1][0].strip():
+        core = call[1][0].strip()
+        days = _number(call[1][1]) if call[0] == "ts_decay_linear" and len(call[1]) > 1 else None
+        fast = int(days) if days is not None and days >= 1 else fast
+    return (f"ts_decay_linear({core}, {fast}) * {LIQUIDITY} + ts_decay_linear({core}, {2 * fast}) * (1 - {LIQUIDITY})",
+            "the most traded stocks get a faster version of the signal and the rest a slower one, so it holds up "
+            "in the larger, more liquid stocks")
+
+
 def _less_smoothing(expr):
     call = outer_call(expr)
     if not call or call[0] not in ("ts_decay_linear", "hump") or not call[1][0].strip():
@@ -1306,23 +1608,31 @@ def needs_sharpening(row) -> bool:
 
 REPAIRS = {  # check name -> fixes to try, most promising first
     "CONCENTRATED_WEIGHT": (_wrap_in_rank, _backfill_fields),
-    "LOW_SUB_UNIVERSE_SHARPE": (_finer_groups, _size_neutral),
+    "LOW_SUB_UNIVERSE_SHARPE": (_finer_groups, _size_neutral, _liquid_split),
     "LOW_TURNOVER": (_less_smoothing,),
 }
 
 
-def repair_candidates(expression: str, failed_checks) -> list:
-    """(new expression, why) fixes for these failed checks - one per check first, then the next fix for
-    each, up to MAX_REPAIRS_PER_ALPHA. Empty if any failed check isn't one we know how to fix."""
-    failed = [c for c in dict.fromkeys(failed_checks)]
-    if not failed or any(c not in REPAIRS for c in failed):
+def fixable(failed_checks) -> bool:
+    """Whether every one of these failed checks has automatic fixes."""
+    failed = list(failed_checks or [])
+    return bool(failed) and all(c in REPAIRS for c in failed)
+
+
+def repair_candidates(expression: str, failed_checks, avoid=frozenset()) -> list:
+    """(new expression, why) fixes for these failed checks that haven't been tried (aren't in avoid) - one per
+    check first, then the next fix for each, up to MAX_REPAIRS_PER_ALPHA. Built on the expression without its
+    padding. Empty if any failed check isn't one we know how to fix, or every fix was tried."""
+    failed = list(dict.fromkeys(failed_checks))
+    if not fixable(failed):
         return []
-    out, seen = [], {expression.strip()}
+    base = strip_padding(expression)
+    out, seen = [], {expression.strip(), base.strip()}
     for depth in range(max(len(REPAIRS[c]) for c in failed)):
         for check in failed:
             if depth < len(REPAIRS[check]):
-                fix = REPAIRS[check][depth](expression)
-                if fix and fix[0] not in seen:
+                fix = REPAIRS[check][depth](base)
+                if fix and fix[0] not in seen and fix[0] not in avoid:
                     seen.add(fix[0])
                     out.append((fix[0], f"failed {check}; {fix[1]}"))
     return out[:MAX_REPAIRS_PER_ALPHA]
@@ -1330,7 +1640,27 @@ def repair_candidates(expression: str, failed_checks) -> list:
 
 def all_repair_variants(expression: str) -> set:
     """Every repair any fixable check could produce - lets a run skip alphas whose repairs were all tried."""
-    return {fix[0] for fixes in REPAIRS.values() for f in fixes for fix in [f(expression)] if fix}
+    base = strip_padding(expression)
+    return {fix[0] for fixes in REPAIRS.values() for f in fixes for fix in [f(base)] if fix}
+
+
+def failed_text(checks, names) -> str:
+    """The failed checks' names, each with BRAIN's value and limit when it gave them."""
+    by_name = {str(c.get("name")): c for c in checks or [] if isinstance(c, dict)}
+    out = []
+    for name in names:
+        check = by_name.get(name) or {}
+        value, limit = _number(check.get("value")), _number(check.get("limit"))
+        out.append(name + (f" ({value:.2f} vs limit {limit:.2f})" if value is not None and limit is not None else ""))
+    return ", ".join(out)
+
+
+def check_note(check: dict) -> str:
+    """'NAME:RESULT', plus BRAIN's value and limit when it gives them:
+    'LOW_SUB_UNIVERSE_SHARPE:FAIL (0.62 vs limit 0.87)'."""
+    note = f"{check.get('name')}:{check.get('result')}"
+    value, limit = _number(check.get("value")), _number(check.get("limit"))
+    return note + (f" ({value:.2f} vs limit {limit:.2f})" if value is not None and limit is not None else "")
 
 
 def strong_numbers(row) -> bool:
@@ -1798,10 +2128,16 @@ def renew_session(session, email, password, row):
     and raises StopLoop - nobody is here to click the link."""
     logger.warning("Session expired mid-run - attempting one re-auth...")
     session.cookies.clear()
-    if not log_in(session, email, password):
-        row["status"], row["error"] = "STOPPED", "session expired and could not renew unattended"
-        append_result(row)
-        raise StopLoop("BRAIN needs re-authentication (likely identity verification) and no one is here to complete it.")
+    try:
+        if log_in_again(session, email, password):
+            return
+        problem = StopLoop("BRAIN needs re-authentication (likely identity verification) and no one is here to "
+                           "complete it.")
+    except StopLoop as exc:  # the connection never came back
+        problem = exc
+    row["status"], row["error"] = "STOPPED", "session expired and could not renew unattended"
+    append_result(row)
+    raise problem
 
 
 def is_busy(err) -> bool:
@@ -1840,9 +2176,10 @@ def finish_idea(session, row, alpha_id) -> dict:
     checks = is_stats.get("checks") or []
     row.update(status="COMPLETE", alpha_id=alpha_id, **metrics,
                returns=_blank(is_stats.get("returns")), drawdown=_blank(is_stats.get("drawdown")))
-    # Kept in memory for the next round's feedback; the CSV doesn't store it.
-    row["failing_checks"] = ", ".join(f"{c.get('name')}:{c.get('result')}" for c in checks if c.get("result") != "PASS")
+    # Kept in memory for the next round's feedback and the follow-ups; the CSV doesn't store them.
+    row["failing_checks"] = ", ".join(check_note(c) for c in checks if c.get("result") != "PASS")
     row["failed_checks"] = [str(c.get("name")) for c in checks if c.get("result") == "FAIL"]
+    row["checks"] = checks
 
     if qualifies(metrics, checks):
         strong = row_is_strong(row)
@@ -1902,6 +2239,13 @@ def run_round(session, client, operators, fields, settings, email, password, rou
     except Exception as e:
         raise GenerationFailed(short_error(e)) from e
 
+    unpadded = [(strip_padding(e), r) for e, r in ideas]
+    padded = sum(1 for (e, _), (u, _) in zip(ideas, unpadded) if e != u)
+    if padded:
+        logger.info("Took the add(x, 0.0001)-style padding out of %d idea(s) - it only trips BRAIN's units check.",
+                    padded)
+    ideas = unpadded
+
     if blocked:
         usable = [(e, r) for e, r in ideas if not uses_any(e, blocked)]
         if len(usable) < len(ideas):
@@ -1942,6 +2286,23 @@ def process_queue(session, items, settings, email, password, round_num, avoid) -
             raise StopLoop(f"Couldn't reach BRAIN for {counts['network']} ideas in a row - your connection "
                            f"seems to be down. Stopped cleanly; everything so far is saved.")
 
+    def move_clocks(seconds):
+        """Time passed without this run (asleep, or waiting for the connection): simulations kept going at BRAIN,
+        so their time limits - and BRAIN's busy wait - are moved on by that much."""
+        nonlocal busy_since
+        for item in running:
+            item["started"] += seconds
+        if busy_since:
+            busy_since += seconds
+
+    def outage(what):
+        """The connection itself is gone: wait for it to come back (StopLoop if it doesn't), then carry on."""
+        began = time.time()
+        if not wait_for_connection(what):
+            raise no_connection()
+        move_clocks(time.time() - began)
+        counts["network"] = 0
+
     def unexpected(row, exc):  # an unexpected reply shouldn't end the whole run
         logger.error("Unexpected error while testing %s (%s: %s) - skipping it and carrying on.",
                      row["expression"], type(exc).__name__, exc, exc_info=exc)
@@ -1949,6 +2310,7 @@ def process_queue(session, items, settings, email, password, round_num, avoid) -
 
     try:
         while queue or running:
+            keep_awake()
             keep_logged_in(session, email, password)
             # 1. Start ideas while there's a free slot.
             while queue and len(running) < limit:
@@ -1963,13 +2325,16 @@ def process_queue(session, items, settings, email, password, round_num, avoid) -
                 except StopLoop:
                     raise
                 except requests.RequestException as exc:
+                    if not brain_reachable():
+                        outage("while starting a simulation")  # the idea stays first in line
+                        continue
                     queue.popleft()
-                    avoid.add(expression)
+                    note_tried(avoid, expression)
                     network_trouble(row, exc)
                     continue
                 except Exception as exc:
                     queue.popleft()
-                    avoid.add(expression)
+                    note_tried(avoid, expression)
                     unexpected(row, exc)
                     continue
 
@@ -1983,18 +2348,18 @@ def process_queue(session, items, settings, email, password, round_num, avoid) -
                     busy_since = busy_since or time.time()
                     if time.time() - busy_since >= MAX_BUSY_WAIT_SECONDS:
                         queue.popleft()
-                        avoid.add(expression)
+                        note_tried(avoid, expression)
                         busy_since = None
                         rows.append(fail(row, "BRAIN stayed busy for 10 minutes (simulations running "
                                               "elsewhere?) - retry it with --try"))
                         continue
                     logger.info("BRAIN says it's busy - waiting %ds before starting the next idea.",
                                 BUSY_WAIT_SECONDS)
-                    time.sleep(BUSY_WAIT_SECONDS)
+                    move_clocks(nap(BUSY_WAIT_SECONDS))
                     continue
 
                 queue.popleft()
-                avoid.add(expression)
+                note_tried(avoid, expression)
                 busy_since = None
                 counts["network"] = 0
                 if err:
@@ -2007,7 +2372,7 @@ def process_queue(session, items, settings, email, password, round_num, avoid) -
                 continue
 
             # 2. Check each running simulation once.
-            time.sleep(SIM_CHECK_SECONDS)
+            move_clocks(nap(SIM_CHECK_SECONDS))
             if time.time() - last_note >= 60:
                 last_note = time.time()
                 logger.info("  ... %d simulation(s) running, longest for %ds", len(running),
@@ -2017,6 +2382,9 @@ def process_queue(session, items, settings, email, password, round_num, avoid) -
                 try:
                     state, info = be.poll_once(session, item["location"])
                 except requests.RequestException as exc:
+                    if not brain_reachable():
+                        outage("while checking on simulations")  # they carry on at BRAIN meanwhile
+                        break
                     running.remove(item)
                     network_trouble(row, exc)
                     continue
@@ -2047,6 +2415,10 @@ def process_queue(session, items, settings, email, password, round_num, avoid) -
                         renew_session(session, email, password, row)  # raises StopLoop if it can't
                         row = finish_idea(session, row, info)
                 except requests.RequestException as exc:
+                    if not brain_reachable():
+                        running.append(item)  # it finished at BRAIN: its result is read once the connection is back
+                        outage("while reading a result")
+                        break
                     network_trouble(row, exc)
                     continue
                 except Exception as exc:
@@ -2068,35 +2440,47 @@ def queue_followups(session, row, kind, queue, avoid, counts):
     if row["status"] != "COMPLETE":
         return
     expression = row["expression"]
+    base = strip_padding(expression)  # follow-ups are built without add(x, 0.0001)-style padding
     sharpe, fitness, turnover = (as_float(row.get(k)) for k in ("sharpe", "fitness", "turnover"))
 
     # Auto-flip: a strongly negative Sharpe means a real signal pointing the wrong way.
     if (kind == "idea" and sharpe is not None and sharpe <= FLIP_SHARPE_AT_OR_BELOW
-            and counts["flips"] < MAX_FLIPS_PER_ROUND and not expression.startswith("reverse(")):
-        flipped = f"reverse({expression})"
+            and counts["flips"] < MAX_FLIPS_PER_ROUND and not base.startswith("reverse(")):
+        flipped = f"reverse({base})"
         if flipped not in avoid:
             counts["flips"] += 1
-            logger.info("  Sharpe %.2f points the wrong way - testing the flipped version next.", sharpe)
+            logger.info("  Sharpe %.2f points the wrong way - testing the flipped version%s next.", sharpe,
+                        padding_note(expression))
             queue.appendleft((flipped, f"Auto-flip of {expression}, which scored Sharpe {sharpe:.2f}; "
                                        f"reversed, it should score about {-sharpe:.2f}.", "flip"))
 
-    # Auto-smooth: the Sharpe is there, but trading too much is holding it back.
+    # Auto-smooth: the Sharpe is there, but trading too much is holding it back - from BRAIN's bar, or from the
+    # strong bar. A sharpened result isn't smoothed back.
+    harder = needs_smoothing(sharpe, fitness, turnover)
     if (kind not in ("smooth", "sharpen") and counts["smooths"] < MAX_SMOOTHS_PER_ROUND
-            and needs_smoothing(sharpe, fitness, turnover)):  # a sharpened result isn't smoothed back
-        smoothed = f"ts_decay_linear({expression}, {SMOOTH_DECAY_DAYS})"
+            and (harder or smoothing_could_make_it_strong(row))):
+        smoothed = f"ts_decay_linear({base}, {SMOOTH_DECAY_DAYS})"
         if smoothed not in avoid:
             counts["smooths"] += 1
-            logger.info("  Sharpe %.2f is there, but fitness %.2f at %.0f%% turnover isn't - "
-                        "testing a smoothed version next.", sharpe, fitness, turnover * 100)
-            queue.appendleft((smoothed, f"Auto-smooth of {expression}: Sharpe {sharpe:.2f} but fitness "
-                                        f"{fitness:.2f} at {turnover:.0%} turnover; decaying it over "
+            if harder:
+                logger.info("  Sharpe %.2f is there, but fitness %.2f at %.0f%% turnover isn't - "
+                            "testing a smoothed version%s next.", sharpe, fitness, turnover * 100,
+                            padding_note(expression))
+                why = f"Sharpe {sharpe:.2f} but fitness {fitness:.2f} at {turnover:.0%} turnover"
+            else:
+                logger.info("  Sharpe %.2f is strong, but fitness %.2f at %.0f%% turnover misses the strong bar "
+                            "(%g) - testing a smoothed version%s next.", sharpe, fitness, turnover * 100,
+                            STRONG_MIN_FITNESS, padding_note(expression))
+                why = (f"Sharpe {sharpe:.2f} is strong but fitness {fitness:.2f} at {turnover:.0%} turnover misses "
+                       f"the strong bar ({STRONG_MIN_FITNESS:g})")
+            queue.appendleft((smoothed, f"Auto-smooth of {expression}: {why}; decaying it over "
                                         f"{SMOOTH_DECAY_DAYS} days should cut turnover.", "smooth"))
 
     # Auto-sharpen: Sharpe is there, fitness isn't, and turnover is already under the 12.5% floor.
     if (kind not in ("smooth", "sharpen", "repair") and counts["sharpens"] < MAX_SHARPENS_PER_ROUND
             and row.get("submitted", "NO") == "NO" and needs_sharpening(row)):
-        sharper = _less_smoothing(expression)[0]
-        if sharper not in avoid and not too_similar_to_pool(session, row, "sharpening"):
+        sharper = (_less_smoothing(base) or (None,))[0]
+        if sharper and sharper not in avoid and not too_similar_to_pool(session, row, "sharpening"):
             counts["sharpens"] += 1
             logger.info("  Sharpe %.2f but fitness %.2f at only %.1f%% turnover - testing it without the outer "
                         "smoothing next.", sharpe, fitness, turnover * 100)
@@ -2105,13 +2489,13 @@ def queue_followups(session, row, kind, queue, avoid, counts):
     # Auto-repair: strong numbers held back by one of BRAIN's fixable checks.
     if kind != "repair" and row.get("submitted", "NO") == "NO" and strong_numbers(row):
         failed = row.get("failed_checks") or []
-        possible = repair_candidates(expression, failed)
-        if not possible:
+        if not fixable(failed):
             if failed:
-                logger.info("  Strong numbers but failed %s - no automatic fix for that check.", ", ".join(failed))
+                logger.info("  Strong numbers but failed %s - no automatic fix for that check.",
+                            failed_text(row.get("checks"), failed))
             elif row.get("failing_checks"):
                 logger.info("  Strong numbers but not every check passed (%s).", row["failing_checks"])
-        fixes = [f for f in possible if f[0] not in avoid]
+        fixes = repair_candidates(expression, failed, avoid)
         room = MAX_REPAIRS_PER_ROUND - counts["repairs"]
         if fixes and room > 0 and worth_repairing(session, row):
             counts["repairs"] += min(room, len(fixes))
@@ -2139,8 +2523,8 @@ def too_similar_to_pool(session, row, purpose: str) -> bool:
 def worth_repairing(session, row) -> bool:
     if too_similar_to_pool(session, row, "repairing"):
         return False
-    logger.info("  Strong numbers but failed %s - testing a repaired version next.",
-                ", ".join(row.get("failed_checks") or []))
+    logger.info("  Strong numbers but failed %s - testing a repaired version%s next.",
+                failed_text(row.get("checks"), row.get("failed_checks") or []), padding_note(row["expression"]))
     return True
 
 
@@ -2176,8 +2560,8 @@ def repair_past_near_misses(session, settings, email, password, avoid) -> list:
             break
         expression = row["expression"]
         if kind == "sharpen":
-            sharper = _less_smoothing(expression)[0]
-            if sharper in avoid:
+            sharper = (_less_smoothing(strip_padding(expression)) or (None,))[0]
+            if not sharper or sharper in avoid:
                 continue  # already tried
             looked += 1
             logger.info("Earlier near-miss %s (Sharpe %s, fitness %s, turnover %s):", expression,
@@ -2200,20 +2584,21 @@ def repair_past_near_misses(session, settings, email, password, avoid) -> list:
             break
         checks = (alpha.get("is") or {}).get("checks") or []
         row["failed_checks"] = [str(c.get("name")) for c in checks if c.get("result") == "FAIL"]
+        row["checks"] = checks
         label = f"Earlier near-miss {expression} (Sharpe {row.get('sharpe')}, fitness {row.get('fitness')})"
         if not checks:
             logger.info("%s: couldn't read BRAIN's record of it - trying again next run.", label)
             continue
         if not row["failed_checks"]:
-            pending = ", ".join(f"{c.get('name')}:{c.get('result')}" for c in checks
+            pending = ", ".join(check_note(c) for c in checks
                                 if c.get("result") != "PASS" and c.get("name") != "SELF_CORRELATION")
             logger.info("%s: BRAIN lists no failed check%s.", label, f" ({pending})" if pending else "")
             continue
-        possible = repair_candidates(expression, row["failed_checks"])
-        if not possible:
-            logger.info("%s fails %s - no automatic fix for that check.", label, ", ".join(row["failed_checks"]))
+        if not fixable(row["failed_checks"]):
+            logger.info("%s fails %s - no automatic fix for that check.", label,
+                        failed_text(checks, row["failed_checks"]))
             continue
-        fixes = [f for f in possible if f[0] not in avoid]
+        fixes = repair_candidates(expression, row["failed_checks"], avoid)
         if not fixes:
             continue  # its fixes were already tried
         logger.info("%s:", label)
@@ -2289,14 +2674,24 @@ def main(argv=None):
     parser.add_argument("--backup", action="store_true",
                         help="for a second scheduled run later in the day: if today's submission is already in "
                              "and the reserve is full, stop after re-checking the held alphas")
+    parser.add_argument("--catch-up", dest="catch_up", action="store_true",
+                        help="for extra scheduled triggers (start-up, reconnecting, every few hours): does nothing "
+                             "if today's submission is already in or another run is going; otherwise runs until "
+                             "today's submission lands")
     args = parser.parse_args(argv)
 
     log_file = add_log_file(args.log_dir) if args.log_dir else None
     try:
+        if args.catch_up and submissions_today() > 0:
+            logger.info("Catch-up run: today's submission is already in - nothing to do.")
+            return
         lock = acquire_run_lock()
         if lock is None:
-            logger.error("Another alpha_loop run is still going (it holds %s) - not starting a second one. "
-                         "Try again once it prints Done.", LOCK_FILE)
+            if args.catch_up:
+                logger.info("Catch-up run: another run is going - leaving today to it.")
+            else:
+                logger.error("Another alpha_loop run is still going (it holds %s) - not starting a second one. "
+                             "Try again once it prints Done.", LOCK_FILE)
             return
         try:
             run(args)
@@ -2306,6 +2701,7 @@ def main(argv=None):
             logger.exception("The run crashed - the details below show where.")
             raise
         finally:
+            let_sleep()
             lock.close()
     finally:
         if log_file:
@@ -2313,15 +2709,28 @@ def main(argv=None):
             log_file.close()
 
 
+def gemini_client() -> genai.Client:
+    """The Gemini client, with a GEMINI_TIMEOUT_SECONDS limit on each request (the library's default is none)."""
+    key = os.environ["GEMINI_API_KEY"]
+    try:
+        return genai.Client(api_key=key, http_options=types.HttpOptions(timeout=GEMINI_TIMEOUT_SECONDS * 1000))
+    except (TypeError, ValueError, AttributeError) as exc:  # an older google-genai without per-request limits
+        logger.warning("This google-genai can't put a time limit on Gemini requests (%s) - carrying on without "
+                       "one. pip install -U google-genai adds it.", type(exc).__name__)
+        return genai.Client(api_key=key)
+
+
 def run(args):
-    global RESERVE, BEFORE_AFTER_REFUSED, SETTLING
+    global RESERVE, BEFORE_AFTER_REFUSED, SETTLING, OUTAGE_SECONDS
     RESERVE = Reserve()  # the reserve only counts alphas BRAIN confirms during this run
     BEFORE_AFTER_REFUSED = False
     SETTLING = False
+    OUTAGE_SECONDS = 0.0
     email, password = be.get_credentials()
     upgrade_results_file()
+    keep_awake()
     if args.try_expressions:
-        session = get_authenticated_session(email, password)
+        session = connect(email, password)
         submit_held(session)
         try:
             rows = run_try(session, args.try_expressions, SETTINGS, email, password)
@@ -2336,7 +2745,7 @@ def run(args):
     if not os.environ.get("GEMINI_API_KEY"):
         raise RuntimeError("Set GEMINI_API_KEY in your .env file too (same format as WQ_EMAIL/WQ_PASSWORD).")
 
-    client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+    client = gemini_client()
 
     operators, fields = load_reference()
     if len(operators) <= 6:
@@ -2348,8 +2757,12 @@ def run(args):
         )
 
     settings = SETTINGS
-    session = get_authenticated_session(email, password)
+    session = connect(email, password)
     submit_held(session)  # before building feedback, so the generator sees the updated outcome
+    catch_up = getattr(args, "catch_up", False)
+    if catch_up and submissions_today() > 0:
+        logger.info("Catch-up run: a held alpha covered today - nothing more to do.")
+        return
     if getattr(args, "backup", False) and submissions_today() > 0:
         spare = RESERVE.kinds()
         if spare >= RESERVE_TARGET:
@@ -2390,15 +2803,28 @@ def run(args):
         logger.info("Leaving out %d name(s) BRAIN rejected (%s) and %d dead-end field(s) (%s).", len(rejected),
                     ", ".join(sorted(rejected)) or "none", len(dead), ", ".join(sorted(dead)) or "none")
 
-    started = time.time()
+    started, paused_before = time.time(), OUTAGE_SECONDS
     rounds_done = 0
     failures_in_a_row = 0
     checked_at = None  # the round count the end-of-rounds step last ran for
     stopped = False    # the login couldn't be renewed - no last call then
+    day = brain_day()
     while True:
-        if time.time() - started > MAX_RUNTIME_SECONDS:
+        keep_awake()
+        if time.time() - started - (OUTAGE_SECONDS - paused_before) > MAX_RUNTIME_SECONDS:
             logger.info("Hit MAX_RUNTIME_SECONDS - stopping cleanly.")
             break
+        if catch_up and submissions_today() > 0:
+            logger.info("Catch-up run: today's submission is in - stopping here.")
+            break
+        if brain_day() != day:  # the run went past BRAIN's day end: the new day starts strong-first again
+            day, SETTLING = brain_day(), False
+            logger.info("BRAIN day %s has started.", day)
+        if (MAX_SUBMISSIONS_PER_DAY > 0 and not SETTLING and submissions_today() == 0
+                and brain_day_ends_in() <= timedelta(minutes=SETTLE_BEFORE_DAY_END_MINUTES)):
+            logger.info("BRAIN's day ends in %d minutes and nothing is in for it yet - settling now rather than "
+                        "waiting for a strong alpha.", brain_day_ends_in().total_seconds() // 60)
+            settle_for_today(session)
         if rounds_done >= MAX_ROUNDS:
             if MAX_SUBMISSIONS_PER_DAY < 1 or submissions_today() > 0:
                 break
@@ -2428,6 +2854,12 @@ def run(args):
             round_rows = run_round(session, client, operators, fields, settings, email, password,
                                     round_num, feedback_text, avoid)
         except GenerationFailed as e:
+            if not brain_reachable():  # it's the connection, not Gemini: wait for it, without counting a failure
+                if wait_for_connection("while asking Gemini for ideas"):
+                    continue
+                logger.error("Stopping: %s", no_connection())
+                stopped = True
+                break
             failures_in_a_row += 1
             if failures_in_a_row >= MAX_GENERATION_FAILURES:
                 logger.error(
@@ -2438,7 +2870,7 @@ def run(args):
             logger.warning(
                 "Round %d didn't start - idea generation failed (%s). Waiting %ds and trying again; "
                 "this does not use up a round.", round_num, e, GENERATION_COOLDOWN_SECONDS)
-            time.sleep(GENERATION_COOLDOWN_SECONDS)
+            nap(GENERATION_COOLDOWN_SECONDS)
             continue
         except StopLoop as e:
             logger.error("Stopping: %s", e)
@@ -2447,7 +2879,7 @@ def run(args):
         failures_in_a_row = 0
         rounds_done += 1
         feedback_text = build_feedback(round_rows)
-        time.sleep(5)
+        nap(5)
 
     if not stopped and not SETTLING:
         settle_for_today(session)  # ended before the usual rounds were done (runtime cap, Gemini down)
