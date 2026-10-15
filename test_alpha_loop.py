@@ -1663,7 +1663,9 @@ def test_earlier_near_miss_is_repaired_at_the_start_of_a_run(tmp_path):
 
 def test_earlier_near_misses_are_only_looked_at_until_every_fix_was_tried(tmp_path):
     def run():
-        al.append_result(dict(_history_row(DIVIDEND, 1.35, 1.34, 0.13), alpha_id="div", submitted="NO"))
+        # Every fix tried, and its big-stocks numbers on file: nothing left to ask BRAIN about.
+        al.append_result(dict(_history_row(DIVIDEND, 1.35, 1.34, 0.13), alpha_id="div", submitted="NO",
+                              sub_universe_sharpe="0.5", sub_universe_limit="0.58"))
         brain = SlowBrain({}, existing={"div": DIVIDEND})
         tried = set(al.all_repair_variants(DIVIDEND))
         with patch("time.sleep"):
@@ -2467,7 +2469,8 @@ def test_returns_and_drawdown_are_saved_and_shown_to_the_generator(tmp_path):
 
 def test_an_older_results_file_gets_the_new_columns_once(tmp_path):
     def run():
-        old_header = [c for c in al.RESULTS_HEADER if c not in ("returns", "drawdown")]
+        newer = ("returns", "drawdown", "sub_universe_sharpe", "sub_universe_limit")   # an older file has none
+        old_header = [c for c in al.RESULTS_HEADER if c not in newer]
         with open(al.RESULTS_FILE, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=old_header)
             writer.writeheader()
@@ -3222,6 +3225,173 @@ def test_the_log_and_the_generator_see_the_value_and_limit(tmp_path):
         assert any("failed LOW_SUB_UNIVERSE_SHARPE (0.62 vs limit 0.87) - testing a repaired version" in line
                    for line in lines), lines
         assert "LOW_SUB_UNIVERSE_SHARPE:FAIL (0.62 vs limit 0.87)" in al.summarize_round(rows)
+    in_tmp(tmp_path, run)
+
+
+# ---- The big-stocks check: hopeless gaps aren't repaired, and the generator hears which ideas fail it ----
+
+FAR_GAP = [{"name": "LOW_SUB_UNIVERSE_SHARPE", "result": "FAIL", "value": 0.10, "limit": 0.68},   # your seven
+           {"name": "SELF_CORRELATION", "result": "PENDING"}]
+NEAR_GAP = [{"name": "LOW_SUB_UNIVERSE_SHARPE", "result": "FAIL", "value": 0.61, "limit": 0.93},  # the call/put ratio
+            {"name": "SELF_CORRELATION", "result": "PENDING"}]
+
+
+def test_a_big_stocks_gap_out_of_reach_is_not_repaired(tmp_path):
+    def run():
+        brain = SlowBrain({DIVIDEND: near_miss(FAR_GAP)})
+        with captured_logs() as lines:
+            rows = run_queue(brain, [DIVIDEND], parallel=1)
+        assert brain.started == [DIVIDEND] and len(rows) == 1
+        assert any("failed LOW_SUB_UNIVERSE_SHARPE (0.10 vs limit 0.68) - it barely works among the biggest "
+                   "stocks, so no fix can get it through" in line for line in lines), lines
+    in_tmp(tmp_path, run)
+
+
+def test_a_big_stocks_gap_within_reach_is_still_repaired(tmp_path):
+    def run():
+        brain = SlowBrain({DIVIDEND: near_miss(NEAR_GAP), FINER: calm(), LIQUID_SPLIT: calm()})
+        run_queue(brain, [DIVIDEND], parallel=1)
+        assert brain.started == [DIVIDEND, FINER, LIQUID_SPLIT]
+        assert al.out_of_reach(0.31, 0.93) is False and al.out_of_reach(0.30, 0.93) is True   # the line: a third
+        assert al.out_of_reach(None, 0.93) is False and al.out_of_reach(0.1, None) is False
+    in_tmp(tmp_path, run)
+
+
+def test_big_stocks_numbers_are_saved_with_each_result(tmp_path):
+    def run():
+        brain = SlowBrain({DIVIDEND: near_miss(NEAR_GAP), FINER: calm(), LIQUID_SPLIT: calm()})
+        run_queue(brain, [DIVIDEND], parallel=1)
+        saved = {r["expression"]: (r["sub_universe_sharpe"], r["sub_universe_limit"]) for r in csv_rows()}
+        assert saved[DIVIDEND] == ("0.61", "0.93") and saved[FINER] == ("", "")   # calm() reports no such check
+    in_tmp(tmp_path, run)
+
+
+def test_an_earlier_near_miss_out_of_reach_is_noted_once_and_then_left_alone(tmp_path):
+    def run():
+        al.append_result(dict(_history_row(DIVIDEND, 1.35, 1.34, 0.13), alpha_id="div", submitted="NO"))
+        brain = SlowBrain({DIVIDEND: near_miss(FAR_GAP)}, existing={"div": DIVIDEND})
+        with patch("time.sleep"), captured_logs() as lines:
+            assert al.repair_past_near_misses(brain.session, SETTINGS, "e@x.com", "pw", set()) == []
+        assert brain.started == [] and any("barely works among the biggest stocks" in line for line in lines)
+        assert (csv_rows()[0]["sub_universe_sharpe"], csv_rows()[0]["sub_universe_limit"]) == ("0.1", "0.68")
+        brain.session.get.reset_mock()
+        with patch("time.sleep"):
+            al.repair_past_near_misses(brain.session, SETTINGS, "e@x.com", "pw", set())
+        assert not brain.session.get.called                       # known now: BRAIN isn't asked again
+    in_tmp(tmp_path, run)
+
+
+def test_an_earlier_near_miss_gets_its_big_stocks_numbers_filled_in_once(tmp_path):
+    def run():
+        al.append_result(dict(_history_row(DIVIDEND, 1.35, 1.34, 0.13), alpha_id="div", submitted="NO"))
+        brain = SlowBrain({DIVIDEND: near_miss(NEAR_GAP)}, existing={"div": DIVIDEND})
+        tried = set(al.all_repair_variants(DIVIDEND))              # every fix already tried
+        with patch("time.sleep"):
+            assert al.repair_past_near_misses(brain.session, SETTINGS, "e@x.com", "pw", tried) == []
+        assert brain.started == [] and csv_rows()[0]["sub_universe_sharpe"] == "0.61"
+        brain.session.get.reset_mock()
+        with patch("time.sleep"):
+            al.repair_past_near_misses(brain.session, SETTINGS, "e@x.com", "pw", tried)
+        assert not brain.session.get.called
+    in_tmp(tmp_path, run)
+
+
+def test_brain_without_big_stocks_numbers_is_only_asked_once(tmp_path):
+    def run():
+        al.append_result(dict(_history_row(DIVIDEND, 1.35, 1.34, 0.13), alpha_id="div", submitted="NO"))
+        brain = SlowBrain({DIVIDEND: near_miss(CW_FAIL)}, existing={"div": DIVIDEND})   # no big-stocks check listed
+        tried = set(al.all_repair_variants(DIVIDEND))
+        with patch("time.sleep"):
+            al.repair_past_near_misses(brain.session, SETTINGS, "e@x.com", "pw", tried)
+        assert (csv_rows()[0]["sub_universe_sharpe"], csv_rows()[0]["sub_universe_limit"]) == ("-", "-")
+        assert not al.small_stocks_only(csv_rows()[0])
+        brain.session.get.reset_mock()
+        with patch("time.sleep"):
+            al.repair_past_near_misses(brain.session, SETTINGS, "e@x.com", "pw", tried)
+        assert not brain.session.get.called
+    in_tmp(tmp_path, run)
+
+
+def test_filling_in_the_numbers_leaves_a_locked_file_alone(tmp_path):
+    def run():
+        al.append_result(dict(_history_row(DIVIDEND, 1.35, 1.34, 0.13), alpha_id="div"))
+        with patch.object(al.os, "replace", side_effect=PermissionError("open in Excel")), patch("time.sleep"):
+            al.record_sub_universe("div", 0.1, 0.68)
+        assert csv_rows()[0]["sub_universe_sharpe"] == "" and not Path(al.RESULTS_FILE + ".tmp").exists()
+        al.record_sub_universe("div", 0.1, 0.68)
+        al.record_sub_universe("div", 0.5, 0.9)                   # numbers already there are kept
+        assert (csv_rows()[0]["sub_universe_sharpe"], csv_rows()[0]["sub_universe_limit"]) == ("0.1", "0.68")
+    in_tmp(tmp_path, run)
+
+
+def test_every_version_of_an_idea_looks_alike():
+    core = "group_rank(divide(implied_volatility_call_90, implied_volatility_put_90), sector)"
+    versions = [
+        f"ts_decay_linear({core}, 10)",
+        "ts_decay_linear(group_rank(divide(implied_volatility_call_90, add(implied_volatility_put_90, 0.0001)), "
+        "sector), 10)",
+        f"rank(group_neutralize(ts_decay_linear({core}, 10), bucket(rank(cap), range='0, 1, 0.1')))",
+        f"ts_decay_linear(group_neutralize(ts_decay_linear({core}, 10), bucket(rank(cap), range='0, 1, 0.1')), 15) "
+        f"* rank(ts_mean(volume * close, 20)) + ts_decay_linear(group_neutralize(ts_decay_linear({core}, 10), "
+        f"bucket(rank(cap), range='0, 1, 0.1')), 30) * (1 - rank(ts_mean(volume * close, 20)))",
+    ]
+    assert {al.idea_core(v) for v in versions} == {core}
+    assert al.idea_core("ts_delta(dividend, 90)") == "ts_delta(dividend, 90)"
+
+
+def test_the_generator_is_told_which_ideas_only_work_in_small_stocks(tmp_path):
+    def run():
+        def saved(expression, sharpe, value, limit, when):
+            al.append_result(dict(_history_row(expression, sharpe, 1.5, 0.15), timestamp=when,
+                                  sub_universe_sharpe=value, sub_universe_limit=limit))
+
+        saved("ts_decay_linear(group_rank(divide(implied_volatility_call_150, implied_volatility_put_150), "
+              "sector), 10)", 2.04, "0.61", "0.93", "2026-10-15 11:14:16")
+        saved("group_neutralize(ts_decay_linear(group_rank(divide(implied_volatility_call_90, "
+              "implied_volatility_put_90), subindustry), 10), bucket(rank(cap), range='0, 1, 0.1'))",
+              2.13, "0.57", "0.93", "2026-10-15 11:25:27")             # same idea, other maturity and group
+        saved("ts_decay_linear(group_rank(ts_delta(dividend, 90), sector), 20)", 1.4, "0.10", "0.68",
+              "2026-10-15 11:06:49")
+        saved("ts_decay_linear(group_rank(ts_zscore(rel_ret_all, 60), sector), 10)", 1.86, "0.95", "0.80",
+              "2026-10-15 11:30:00")                                   # passed the check: not listed
+        saved("rank(close)", 0.5, "", "", "2026-10-15 11:31:00")       # no numbers: not listed
+        rule = al.small_stocks_rule()
+        assert rule.startswith("ONLY WORKS IN SMALL STOCKS - don't write new versions of these ideas.")
+        assert rule.splitlines()[1:] == [
+            "- group_rank(divide(implied_volatility_call_90, implied_volatility_put_90), subindustry) "
+            "(Sharpe 2.13 overall, 0.57 among the biggest stocks - needs 0.93)",
+            "- group_rank(ts_delta(dividend, 90), sector) (Sharpe 1.4 overall, 0.10 among the biggest stocks - "
+            "needs 0.68)"]
+        feedback = al.build_feedback()
+        assert "fitness=1.5 turnover=0.15 [fails the big-stocks check: 0.57 vs limit 0.93 - only works in small " \
+               "stocks]" in feedback
+        assert "rel_ret_all, 60), sector), 10) -> sharpe=1.86 fitness=1.5 turnover=0.15\n" in feedback + "\n"
+        client = MagicMock()
+        client.models.generate_content.return_value = fake_gemini_response(ONE_IDEA)
+        with patch("time.sleep"):
+            al.run_round(SlowBrain({"rank(close)": calm()}).session, client, [], [], SETTINGS, "e@x.com", "pw", 1,
+                         "round 1", {"rank(close)"})
+        assert "ONLY WORKS IN SMALL STOCKS" in client.models.generate_content.call_args.kwargs["contents"]
+    in_tmp(tmp_path, run)
+
+
+def test_no_small_stocks_rule_until_an_idea_fails_the_check(tmp_path):
+    def run():
+        assert al.small_stocks_rule() == ""
+        al.append_result(dict(_history_row("rank(close)", 1.4, 1.1, 0.1), sub_universe_sharpe="0.7",
+                              sub_universe_limit="0.6"))
+        assert al.small_stocks_rule() == "" and "big-stocks" not in al.build_feedback()
+    in_tmp(tmp_path, run)
+
+
+def test_only_the_most_recent_examples_are_shown(tmp_path):
+    def run():
+        for n in range(al.SMALL_STOCKS_EXAMPLES + 3):
+            al.append_result(dict(_history_row(f"rank(ts_delta(field{chr(97 + n)}, 5))", 1.4, 1.1, 0.1),
+                                  timestamp=f"2026-10-15 11:{n:02d}:00", sub_universe_sharpe="0.1",
+                                  sub_universe_limit="0.6"))
+        lines = al.small_stocks_rule().splitlines()[1:]
+        assert len(lines) == al.SMALL_STOCKS_EXAMPLES and lines[0].startswith("- ts_delta(fieldk, 5) (")   # newest
     in_tmp(tmp_path, run)
 
 

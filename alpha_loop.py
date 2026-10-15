@@ -79,7 +79,9 @@ READ BEFORE YOU RUN THIS:
   the most liquid stocks on a faster version of the signal and the rest on a slower one;
   LOW_TURNOVER -> drop the outer ts_decay_linear. Repairs follow community write-ups of BRAIN's checks,
   and BRAIN's own result decides whether each worked. Fixes already tried are skipped, so a near-miss gets
-  the next ones on a later run. If the original is already too similar to your
+  the next ones on a later run. An alpha whose Sharpe among the biggest stocks is under SUB_UNIVERSE_HOPELESS_SHARE
+  (a third) of what BRAIN needs there isn't repaired at all: the signal barely works there, and no fix closes a
+  gap that size. If the original is already too similar to your
   submitted alphas, it isn't repaired (the repair would be too). A near-miss failing a check with no
   automatic fix gets a log line naming that check, with BRAIN's value and limit for it when BRAIN gives them.
 - Auto-sharpen: an alpha with Sharpe >= 1.25 but fitness under 1.0 whose turnover is already under 12.5%
@@ -149,6 +151,11 @@ READ BEFORE YOU RUN THIS:
 - End of BRAIN's day: a run with nothing in yet SETTLE_BEFORE_DAY_END_MINUTES (60) before BRAIN's day ends
   settles straight away - the best held alpha goes in - instead of waiting for a strong one it may not have
   time to find.
+- Big-stocks check: BRAIN's numbers for it (the alpha's Sharpe among the largest stocks, and the limit there) are
+  saved in the results file (sub_universe_sharpe, sub_universe_limit; an earlier near-miss gets them filled in
+  when it's next looked at). The generator is told which ideas failed it - one example per idea, with every
+  version of it (other windows, maturities, groups, smoothing or fixes) counting as the same idea - and asked to
+  stop writing new versions of them, and those results are marked in the "best results" list it learns from.
 - Padding: ideas like divide(x, add(y, 0.0001)) - a tiny number added so a division can't hit zero - are
   tested without it. Every alpha with it came back with an extra check that didn't PASS (BRAIN's units check:
   unitHandling is VERIFY, and a plain number has no units), and the loop only submits alphas whose every check
@@ -266,6 +273,11 @@ SETTLE_BEFORE_DAY_END_MINUTES = int(os.environ.get("SETTLE_BEFORE_DAY_END_MINUTE
 MAX_REPAIRS_PER_ALPHA = int(os.environ.get("MAX_REPAIRS_PER_ALPHA", 2))
 MAX_REPAIRS_PER_ROUND = int(os.environ.get("MAX_REPAIRS_PER_ROUND", 4))
 MAX_PAST_REPAIRS = int(os.environ.get("MAX_PAST_REPAIRS", 8))  # earlier near-misses re-examined per run
+# BRAIN's big-stocks check (LOW_SUB_UNIVERSE_SHARPE) re-runs an alpha on the largest, most liquid stocks and needs a
+# Sharpe there of about 0.43x its own. One that gets under this share of that limit barely works there at all, and
+# no fix closes a gap that size - so it isn't repaired.
+SUB_UNIVERSE_HOPELESS_SHARE = float(os.environ.get("SUB_UNIVERSE_HOPELESS_SHARE", 1 / 3))
+SMALL_STOCKS_EXAMPLES = 8  # ideas that failed the big-stocks check, shown to the generator as ones not to rework
 # Auto-sharpen: below this turnover BRAIN's fitness formula gets no extra credit, so smoothing an alpha
 # that's already this slow only dampens its returns.
 FITNESS_TURNOVER_FLOOR = 0.125
@@ -320,7 +332,7 @@ HELD_CHECK_BUDGET_SECONDS = int(os.environ.get("HELD_CHECK_BUDGET_SECONDS", 300)
 RESULTS_HEADER = [
     "round", "timestamp", "expression", "rationale", "status", "sharpe", "fitness",
     "turnover", "checks_passed", "checks_total", "alpha_id", "alpha_link", "error", "submitted",
-    "returns", "drawdown",
+    "returns", "drawdown", "sub_universe_sharpe", "sub_universe_limit",
 ]
 
 
@@ -1021,7 +1033,7 @@ def build_feedback(last_round_rows=None) -> str:
                  f"marked [submitted] or [queued] usually comes back too similar to submit."]
         for r in best:
             lines.append(f"- {r['expression']} -> sharpe={r['sharpe']} fitness={r['fitness']} "
-                         f"turnover={r['turnover']}{turnover_note(r)}{returns_note(r)}{pool_tag(r)}")
+                         f"turnover={r['turnover']}{turnover_note(r)}{returns_note(r)}{pool_tag(r)}{big_stocks_tag(r)}")
         parts.append("\n".join(lines))
     if last_round_rows:
         parts.append(summarize_round(last_round_rows))
@@ -1663,6 +1675,123 @@ def check_note(check: dict) -> str:
     return note + (f" ({value:.2f} vs limit {limit:.2f})" if value is not None and limit is not None else "")
 
 
+# ---- BRAIN's big-stocks check (LOW_SUB_UNIVERSE_SHARPE) ----
+
+def sub_universe(checks):
+    """(value, limit, result) of BRAIN's big-stocks check - the alpha's Sharpe among the largest, most liquid
+    stocks, and the least BRAIN accepts there (about 0.43x its overall Sharpe) - or (None, None, None)."""
+    for check in checks or []:
+        if isinstance(check, dict) and check.get("name") == "LOW_SUB_UNIVERSE_SHARPE":
+            return _number(check.get("value")), _number(check.get("limit")), check.get("result")
+    return None, None, None
+
+
+def out_of_reach(value, limit) -> bool:
+    """A Sharpe among the biggest stocks under SUB_UNIVERSE_HOPELESS_SHARE of BRAIN's limit there: the signal
+    barely works there at all, and no fix closes a gap that size."""
+    return value is not None and limit is not None and limit > 0 and value < SUB_UNIVERSE_HOPELESS_SHARE * limit
+
+
+def hopeless_gap(checks) -> str:
+    """'LOW_SUB_UNIVERSE_SHARPE (0.10 vs limit 0.68)' when BRAIN failed the big-stocks check out of reach, else ''."""
+    value, limit, result = sub_universe(checks)
+    if result == "FAIL" and out_of_reach(value, limit):
+        return f"LOW_SUB_UNIVERSE_SHARPE ({value:.2f} vs limit {limit:.2f})"
+    return ""
+
+
+def small_stocks_only(row) -> bool:
+    """A saved result that failed the big-stocks check: its Sharpe among the biggest stocks under the limit."""
+    value, limit = as_float(row.get("sub_universe_sharpe")), as_float(row.get("sub_universe_limit"))
+    return value is not None and limit is not None and value < limit
+
+
+def big_stocks_tag(row) -> str:
+    if not small_stocks_only(row):
+        return ""
+    return (f" [fails the big-stocks check: {as_float(row['sub_universe_sharpe']):.2f} vs limit "
+            f"{as_float(row['sub_universe_limit']):.2f} - only works in small stocks]")
+
+
+def idea_core(expression: str) -> str:
+    """The idea under the follow-ups wrapped around it - padding, smoothing, rank(), size buckets and the
+    liquid/illiquid split come off - so every version of one idea looks alike."""
+    expr = strip_padding(expression).strip()
+    while True:
+        before = expr
+        expr = strip_smoothing(expr)
+        if LIQUIDITY in expr and expr.startswith("ts_decay_linear("):
+            close = matching_paren(expr, len("ts_decay_linear"))
+            if close > 0:
+                expr = split_top_level(expr[len("ts_decay_linear("):close])[0].strip()
+        call = outer_call(expr)
+        if call and call[0] == "rank" and len(call[1]) == 1:
+            expr = call[1][0].strip()
+        elif call and call[0] == "group_neutralize" and len(call[1]) == 2 and "bucket(rank(cap)" in call[1][1]:
+            expr = call[1][0].strip()
+        if expr == before:
+            return expr
+
+
+def small_stocks_rule() -> str:
+    """For the generator: ideas that failed the big-stocks check, one example of each (most recent first), with
+    BRAIN's numbers - so it stops writing new versions of them. '' when there are none."""
+    seen, lines = set(), []
+    rows = sorted((r for r in completed_history() if small_stocks_only(r)),
+                  key=lambda r: r.get("timestamp") or "", reverse=True)
+    for r in rows:
+        core = idea_core(r["expression"])
+        key = (skeleton(core), alpha_kind(core))
+        if key in seen:
+            continue
+        seen.add(key)
+        lines.append(f"- {core} (Sharpe {r.get('sharpe')} overall, {as_float(r['sub_universe_sharpe']):.2f} among "
+                     f"the biggest stocks - needs {as_float(r['sub_universe_limit']):.2f})")
+        if len(lines) == SMALL_STOCKS_EXAMPLES:
+            break
+    if not lines:
+        return ""
+    return ("ONLY WORKS IN SMALL STOCKS - don't write new versions of these ideas. Each scored well overall but "
+            "failed BRAIN's big-stocks check: among the largest, most liquid stocks its Sharpe was far below what "
+            "BRAIN needs. Another window, maturity, group, decay or neutralization of the same idea is still the "
+            "same idea, and fails the same way. Look for ideas that also work in large stocks:\n" + "\n".join(lines))
+
+
+def record_sub_universe(alpha_id: str, value, limit):
+    """Fill in an earlier result's big-stocks numbers, read from BRAIN when the near-miss was looked at again, so
+    the generator hears about it and later runs needn't ask. Written to a temporary file and swapped in; if that
+    isn't possible (the file is open elsewhere), the numbers are simply read again next run."""
+    with open(RESULTS_FILE, encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        fieldnames = reader.fieldnames or []
+        rows = list(reader)
+    if "sub_universe_sharpe" not in fieldnames or "sub_universe_limit" not in fieldnames:
+        return
+    changed = False
+    for r in rows:
+        if r.get("alpha_id") == alpha_id and not (r.get("sub_universe_sharpe") or r.get("sub_universe_limit")):
+            r["sub_universe_sharpe"], r["sub_universe_limit"] = value, limit
+            changed = True
+    if not changed:
+        return
+    tmp = Path(RESULTS_FILE + ".tmp")
+    with open(tmp, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+    for attempt in range(REPLACE_ATTEMPTS):
+        try:
+            os.replace(tmp, RESULTS_FILE)
+            return
+        except OSError:
+            if attempt < REPLACE_ATTEMPTS - 1:
+                time.sleep(1)
+    try:
+        tmp.unlink()
+    except OSError:
+        pass
+
+
 def strong_numbers(row) -> bool:
     sharpe, fitness = as_float(row.get("sharpe")), as_float(row.get("fitness"))
     return (sharpe is not None and fitness is not None
@@ -2174,8 +2303,10 @@ def finish_idea(session, row, alpha_id) -> dict:
     metrics = be.metrics_from_alpha(alpha_id, alpha)
     is_stats = alpha.get("is") or {}
     checks = is_stats.get("checks") or []
+    big_value, big_limit, _ = sub_universe(checks)
     row.update(status="COMPLETE", alpha_id=alpha_id, **metrics,
-               returns=_blank(is_stats.get("returns")), drawdown=_blank(is_stats.get("drawdown")))
+               returns=_blank(is_stats.get("returns")), drawdown=_blank(is_stats.get("drawdown")),
+               sub_universe_sharpe=_blank(big_value), sub_universe_limit=_blank(big_limit))
     # Kept in memory for the next round's feedback and the follow-ups; the CSV doesn't store them.
     row["failing_checks"] = ", ".join(check_note(c) for c in checks if c.get("result") != "PASS")
     row["failed_checks"] = [str(c.get("name")) for c in checks if c.get("result") == "FAIL"]
@@ -2230,7 +2361,8 @@ def run_round(session, client, operators, fields, settings, email, password, rou
     overused = crowded_shapes()
     rules = [r for r in (variety_rule(type_map, crowded, IDEAS_PER_ROUND, IDEAS_PER_ROUND + VARIETY_EXTRA_IDEAS),
                          shape_rule(overused, operators),
-                         avoid_note(rejected, dead)) if r]
+                         avoid_note(rejected, dead),
+                         small_stocks_rule()) if r]
     asked = IDEAS_PER_ROUND + (VARIETY_EXTRA_IDEAS if rules else 0)
     prompt_text = "\n\n".join([feedback_text, *rules])
     try:
@@ -2489,13 +2621,17 @@ def queue_followups(session, row, kind, queue, avoid, counts):
     # Auto-repair: strong numbers held back by one of BRAIN's fixable checks.
     if kind != "repair" and row.get("submitted", "NO") == "NO" and strong_numbers(row):
         failed = row.get("failed_checks") or []
-        if not fixable(failed):
+        gap = hopeless_gap(row.get("checks"))
+        if gap:
+            logger.info("  Strong numbers but failed %s - it barely works among the biggest stocks, so no fix can "
+                        "get it through; not repairing it.", gap)
+        elif not fixable(failed):
             if failed:
                 logger.info("  Strong numbers but failed %s - no automatic fix for that check.",
                             failed_text(row.get("checks"), failed))
             elif row.get("failing_checks"):
                 logger.info("  Strong numbers but not every check passed (%s).", row["failing_checks"])
-        fixes = repair_candidates(expression, failed, avoid)
+        fixes = [] if gap else repair_candidates(expression, failed, avoid)
         room = MAX_REPAIRS_PER_ROUND - counts["repairs"]
         if fixes and room > 0 and worth_repairing(session, row):
             counts["repairs"] += min(room, len(fixes))
@@ -2573,8 +2709,11 @@ def repair_past_near_misses(session, settings, email, password, avoid) -> list:
                                                                 ("sharpe", "fitness", "turnover"))), "sharpen"))
             continue
 
-        if all_repair_variants(expression) <= avoid:
-            continue  # every possible fix was already tried
+        known = bool((row.get("sub_universe_sharpe") or "").strip())  # "-" once BRAIN was asked and had none
+        if known and out_of_reach(as_float(row.get("sub_universe_sharpe")), as_float(row.get("sub_universe_limit"))):
+            continue  # it barely works among the biggest stocks - looked at before, nothing to fix
+        if all_repair_variants(expression) <= avoid and known:
+            continue  # every possible fix was already tried (its big-stocks numbers may still need filling in)
         looked += 1
         try:
             alpha = be.fetch_alpha(session, row["alpha_id"])
@@ -2588,6 +2727,17 @@ def repair_past_near_misses(session, settings, email, password, avoid) -> list:
         label = f"Earlier near-miss {expression} (Sharpe {row.get('sharpe')}, fitness {row.get('fitness')})"
         if not checks:
             logger.info("%s: couldn't read BRAIN's record of it - trying again next run.", label)
+            continue
+        if not known:
+            big_value, big_limit, _ = sub_universe(checks)
+            record_sub_universe(row["alpha_id"], "-" if big_value is None else big_value,
+                                "-" if big_limit is None else big_limit)
+        if all_repair_variants(expression) <= avoid:
+            continue  # its numbers are filled in now; every possible fix was already tried
+        gap = hopeless_gap(checks)
+        if gap:
+            logger.info("%s fails %s - it barely works among the biggest stocks, so no fix can get it through; "
+                        "not repairing it.", label, gap)
             continue
         if not row["failed_checks"]:
             pending = ", ".join(check_note(c) for c in checks
