@@ -106,21 +106,29 @@ READ BEFORE YOU RUN THIS:
   1.0; 0 turns that part off). A strong alpha goes in straight away; one that only clears BRAIN's bar is held
   ("not strong"). Held alphas are ranked strong first, then by fitness, on BRAIN's latest numbers. If nothing
   has gone in by the end of the usual MAX_ROUNDS rounds - or the run stops early, or a --try run ends, or BRAIN's
-  day is about to end - the run settles: the end-of-day pick, the least similar held alpha that clears BRAIN's
-  bar, goes in, so the day still counts. Submissions beyond the day's first must be strong. Returns and drawdown
-  are saved in the results file (an older file gets the two columns added once) and shown to the generator,
-  which is told the strong targets.
+  day is about to end - the run settles: an end-of-day pick from the held alphas that clear BRAIN's bar (see
+  Portfolio check for how it's chosen) goes in, so the day can still count. Submissions beyond the day's first
+  must be strong. Returns and drawdown are saved in the results file (an older file gets the two columns added
+  once) and shown to the generator, which is told the strong targets.
 - Near-copies: BRAIN accepts self-correlation up to 0.7, but every submission except the end-of-day pick must be
   under DAYTIME_MAX_SELF_CORRELATION (default 0.5) - a strong alpha straight away, an extra one, a held one.
   Near-copies of your own alphas add little to a combined score and keep your submissions looking alike. One
   in between - or one whose similarity BRAIN didn't report in time - is held instead, labelled "somewhat
-  similar", and can still be the end-of-day pick, which goes least similar first. So the day's submission never
-  waits on this rule. DAYTIME_MAX_SELF_CORRELATION=0.7 turns it off.
+  similar", and can still be the end-of-day pick. DAYTIME_MAX_SELF_CORRELATION=0.7 turns it off.
+- Portfolio check: the Country Challenge's IS Score is "Combined Portfolio Performance based on an equal weighting
+  of all submitted alphas". So before any alpha goes in, the loop reads the daily PnL of your submitted alphas
+  (BRAIN's list of your ACTIVE alphas - or, failing that, the results file - and the PnL behind each alpha's
+  chart), adds the new alpha's with equal weights, and lets it in only if the combined Sharpe rises. One that would
+  lower it is held, labelled "would lower your combined portfolio", left out of the reserve and checked again each
+  run. The end-of-day pick takes the held alpha that leaves the combined Sharpe highest (least similar breaks ties)
+  and must raise it too - unless END_OF_DAY_MAX_PORTFOLIO_DROP (default 0) allows a small drop to keep the day's
+  streak: 0.02 = up to 2%. If the PnL can't be read, the usual rules decide alone. PORTFOLIO_CHECK=0 turns it off.
 - --backup, for a second scheduled run later in the day: if today's submission is already in and the
   reserve is full, it stops after re-checking the held queue; otherwise it mines like a normal run.
 - Before/after check: before each submission, and for each alpha it holds, the loop asks BRAIN's free
-  "before and after" check - how your merged performance (what the leaderboard's IS Score ranks) would
-  change with that alpha. BRAIN publishes no format for the reply, so for now it's only recorded - a
+  "before and after" check - how your merged performance would change with that alpha - for the competition in
+  BRAIN_COMPETITION, or the only one BRAIN lists for you (each run logs your competitions, with your standing when
+  BRAIN gives it), else for your account. BRAIN publishes no format for the reply, so it's only recorded - a
   one-line summary in the log, the full reply in logs/before_after_checks.jsonl - and decides nothing.
 - Learning what doesn't work: any operator or field BRAIN rejects ('unknown variable/operator') is
   read back from the results file, removed from what the generator sees, and ideas still using it are
@@ -157,7 +165,7 @@ READ BEFORE YOU RUN THIS:
   straight away if today's submission is already in, or if another run is going; otherwise it runs like a
   normal run and stops as soon as today's submission lands.
 - End of BRAIN's day: a run with nothing in yet SETTLE_BEFORE_DAY_END_MINUTES (60) before BRAIN's day ends
-  settles straight away - the best held alpha goes in - instead of waiting for a strong one it may not have
+  settles straight away - the end-of-day pick goes in - instead of waiting for a strong one it may not have
   time to find.
 - Big-stocks check: BRAIN's numbers for it (the alpha's Sharpe among the largest stocks, and the limit there) are
   saved in the results file (sub_universe_sharpe, sub_universe_limit; an earlier near-miss gets them filled in
@@ -187,8 +195,9 @@ import logging
 import math
 import os
 import re
+import statistics
 import time
-from collections import Counter, deque
+from collections import Counter, deque, namedtuple
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -247,6 +256,26 @@ SUBMIT_URL = "https://api.worldquantbrain.com/alphas/{alpha_id}/submit"
 BEFORE_AFTER_URL = "https://api.worldquantbrain.com/users/self/alphas/{alpha_id}/before-and-after-performance"
 BEFORE_AFTER_FILE = os.path.join("logs", "before_after_checks.jsonl")
 BEFORE_AFTER_MAX_SECONDS = int(os.environ.get("BEFORE_AFTER_MAX_SECONDS", 120))
+# The same check for one competition (the Country Challenge is part of one): BRAIN lists yours at COMPETITIONS_URL.
+# The run asks it for the competition in BRAIN_COMPETITION, or the only one you're in, and only records the answer.
+COMPETITIONS_URL = "https://api.worldquantbrain.com/users/self/competitions"
+COMPETITION_BEFORE_AFTER_URL = ("https://api.worldquantbrain.com/competitions/{competition}/alphas/{alpha_id}"
+                                "/before-and-after-performance")
+BRAIN_COMPETITION = os.environ.get("BRAIN_COMPETITION", "").strip()
+
+# Portfolio check. The leaderboard's IS Score is "Combined Portfolio Performance based on an equal weighting of all
+# submitted alphas", so before an alpha goes in, its daily PnL is added to your submitted alphas' (equal weights) and
+# it goes in only if the combined Sharpe rises. PORTFOLIO_CHECK=0 turns this off.
+PORTFOLIO_CHECK = os.environ.get("PORTFOLIO_CHECK", "1").strip().lower() not in ("0", "false", "no", "off")
+# How far the end-of-day pick - the one that keeps the day's streak - may lower that combined Sharpe: 0.02 = by up to
+# 2%. At 0 it must raise it like any other, or the day goes without a submission.
+END_OF_DAY_MAX_PORTFOLIO_DROP = float(os.environ.get("END_OF_DAY_MAX_PORTFOLIO_DROP", 0.0))
+USER_ALPHAS_URL = "https://api.worldquantbrain.com/users/self/alphas"
+PNL_URL = "https://api.worldquantbrain.com/alphas/{alpha_id}/recordsets/pnl"
+PNL_MAX_SECONDS = 120     # per alpha, while BRAIN says its PnL is still being prepared
+PORTFOLIO_MIN_DAYS = 250  # trading days all the alphas must share for a fair comparison (about a year)
+ALPHA_LIST_PAGE = 100
+MAX_ALPHA_LIST_PAGES = 30
 
 # Auto-flip: a strongly negative Sharpe is a real signal pointing the wrong way, so test its reverse.
 FLIP_SHARPE_AT_OR_BELOW = float(os.environ.get("FLIP_SHARPE_AT_OR_BELOW", -1.0))
@@ -276,7 +305,7 @@ CONNECTION_CHECK_SECONDS = 60
 CONNECTION_PROBE_TIMEOUT = 15
 SLEEP_GAP_SECONDS = 120  # a pause that ran this much over was the computer asleep (lid closed, Windows sleep)
 
-# A run with nothing in for today this close to the end of BRAIN's day settles straight away (the best held alpha
+# A run with nothing in for today this close to the end of BRAIN's day settles straight away (the end-of-day pick
 # goes in) instead of waiting for a strong one it may not have time to find.
 SETTLE_BEFORE_DAY_END_MINUTES = int(os.environ.get("SETTLE_BEFORE_DAY_END_MINUTES", 60))
 
@@ -339,6 +368,7 @@ HELD_LABEL = f"{HELD_PREFIX} (daily cap reached)"  # cleared the bar, waiting fo
 HELD_RETRY_LABEL = f"{HELD_PREFIX} (submit didn't go through - tried again next run)"
 HELD_FOR_STRONGER_LABEL = f"{HELD_PREFIX} (not strong - kept in case a stronger one turns up)"
 HELD_SIMILAR_LABEL = f"{HELD_PREFIX} (somewhat similar to your submitted alphas - kept for an end-of-day pick)"
+HELD_PORTFOLIO_LABEL = f"{HELD_PREFIX} (would lower your combined portfolio - kept in case that changes)"
 REPLACE_ATTEMPTS = 5  # Windows blocks swapping in the updated CSV while another program is reading it
 HELD_CHECK_BUDGET_SECONDS = int(os.environ.get("HELD_CHECK_BUDGET_SECONDS", 300))  # per run, for re-checking held alphas
 
@@ -1256,7 +1286,8 @@ def before_after(session, alpha_id: str):
     performance - what the leaderboard's IS Score ranks - with and without this alpha. Waits while BRAIN
     says it's still working (Retry-After), for up to BEFORE_AFTER_MAX_SECONDS. Returns (status code, reply),
     or (None, None) if BRAIN couldn't be reached."""
-    url = BEFORE_AFTER_URL.format(alpha_id=alpha_id)
+    url = (COMPETITION_BEFORE_AFTER_URL.format(competition=ACTIVE_COMPETITION, alpha_id=alpha_id)
+           if ACTIVE_COMPETITION else BEFORE_AFTER_URL.format(alpha_id=alpha_id))
     deadline = time.time() + BEFORE_AFTER_MAX_SECONDS
     while True:
         try:
@@ -1305,6 +1336,42 @@ def before_after_summary(reply) -> str:
 
 
 BEFORE_AFTER_REFUSED = False  # BRAIN said this account may not use the check - don't ask again this run
+ACTIVE_COMPETITION = ""       # the competition the before/after check is asked for this run ("": your account's own)
+
+
+def note_competitions(session):
+    """Log the competitions BRAIN lists for you - with your standing there, when BRAIN includes it - and pick the
+    one BRAIN's before/after check is asked for: BRAIN_COMPETITION, else the only one you're in. Read-only, and
+    never stops the run."""
+    global ACTIVE_COMPETITION
+    ACTIVE_COMPETITION = BRAIN_COMPETITION
+    try:
+        resp = session.get(COMPETITIONS_URL, timeout=be.REQUEST_TIMEOUT)
+        data = resp.json() if resp.status_code == 200 else None
+        found = data.get("results") if isinstance(data, dict) else None
+        if not isinstance(found, list):
+            logger.info("Couldn't read your BRAIN competitions (%s) - carrying on.", resp.status_code)
+            return
+        ids = []
+        for comp in found:
+            if not isinstance(comp, dict) or not comp.get("id"):
+                continue
+            ids.append(str(comp["id"]))
+            board = comp.get("leaderboard") if isinstance(comp.get("leaderboard"), dict) else {}
+            standing = ", ".join(f"{key} {board[key]}" for key in ("rank", "score", "alphas")
+                                 if board.get(key) not in (None, ""))
+            logger.info("Competition %s (%s)%s.", comp["id"], comp.get("name") or "no name",
+                        f" - you: {standing}" if standing else "")
+        if not ACTIVE_COMPETITION and len(ids) == 1:
+            ACTIVE_COMPETITION = ids[0]
+        if ACTIVE_COMPETITION:
+            logger.info("BRAIN's before/after check will be asked for competition %s (recorded only).",
+                        ACTIVE_COMPETITION)
+        elif len(ids) > 1:
+            logger.info("Set BRAIN_COMPETITION in .env to one of %s to record BRAIN's before/after check for it.",
+                        ", ".join(ids))
+    except Exception as exc:  # a nice-to-have: whatever went wrong, the run goes on
+        logger.info("Couldn't read your BRAIN competitions (%s) - carrying on.", type(exc).__name__)
 
 
 def record_before_after(session, alpha_id: str, when: str):
@@ -1322,7 +1389,8 @@ def record_before_after(session, alpha_id: str, when: str):
         Path(BEFORE_AFTER_FILE).parent.mkdir(parents=True, exist_ok=True)
         with open(BEFORE_AFTER_FILE, "a", encoding="utf-8") as f:
             f.write(json.dumps({"time": time.strftime("%Y-%m-%d %H:%M:%S"), "alpha_id": alpha_id, "when": when,
-                                "status": status, "reply": reply}, ensure_ascii=False, default=str) + "\n")
+                                "competition": ACTIVE_COMPETITION or None, "status": status, "reply": reply},
+                               ensure_ascii=False, default=str) + "\n")
         if status == 403:
             BEFORE_AFTER_REFUSED = True
             detail = reply.get("detail") if isinstance(reply, dict) else reply
@@ -1370,6 +1438,221 @@ def daytime_note() -> str:
     """' with self-correlation under 0.5' while the stricter limit is on, '' when it's off."""
     limit = daytime_limit()
     return f" with self-correlation under {limit:g}" if limit < MAX_SELF_CORRELATION else ""
+
+
+# ---- Portfolio check: what an alpha would do to your submitted alphas combined (the leaderboard's IS Score) ----
+
+PortfolioEffect = namedtuple("PortfolioEffect", "before after corr days alphas")
+
+
+def daily_pnl(data) -> dict:
+    """{date: that day's PnL} from BRAIN's PnL recordset - {"schema": {"properties": [...]}, "records": [[date,
+    pnl], ...]} - whose pnl column is the running total (it's what the PnL chart on an alpha's page draws)."""
+    schema = data.get("schema") if isinstance(data, dict) else None
+    props = schema.get("properties") if isinstance(schema, dict) else None
+    names = ([str(p.get("name", "")).lower() if isinstance(p, dict) else str(p).lower() for p in props]
+             if isinstance(props, list) else [str(k).lower() for k in props] if isinstance(props, dict) else [])
+    at_date = names.index("date") if "date" in names else 0
+    at_pnl = names.index("pnl") if "pnl" in names else 1
+    rows = []
+    for rec in (data.get("records") or []) if isinstance(data, dict) else []:
+        if isinstance(rec, (list, tuple)) and len(rec) > max(at_date, at_pnl):
+            total = _number(rec[at_pnl])
+            if rec[at_date] and total is not None:
+                rows.append((str(rec[at_date]), total))
+    rows.sort()
+    return {day: total - prev for (_, prev), (day, total) in zip(rows, rows[1:])}
+
+
+def fetch_daily_pnl(session, alpha_id):
+    """An alpha's daily PnL from BRAIN, or None if BRAIN didn't send it (after waiting while it's prepared)."""
+    url = PNL_URL.format(alpha_id=alpha_id)
+    deadline = time.time() + PNL_MAX_SECONDS
+    try:
+        while True:
+            resp = be.with_retries(lambda: session.get(url, timeout=be.REQUEST_TIMEOUT), "reading an alpha's PnL")
+            if be.looks_like_expired_session(resp):
+                return None
+            busy = resp.status_code == 429 or (still_working(resp) and not resp.text.strip())
+            if busy and time.time() < deadline:
+                time.sleep(wait_seconds(resp))
+                continue
+            if resp.status_code != 200 or not resp.text.strip():
+                return None
+            return daily_pnl(resp.json()) or None
+    except (requests.RequestException, ValueError):
+        return None
+
+
+def submitted_alpha_ids(session):
+    """(ids of your submitted alphas, where they came from): BRAIN's list of your alphas, status ACTIVE - or, if that
+    can't be read, the alphas the results file shows going in."""
+    ids, offset = [], 0
+    try:
+        for _ in range(MAX_ALPHA_LIST_PAGES):
+            params = {"status": "ACTIVE", "limit": ALPHA_LIST_PAGE, "offset": offset}
+            resp = be.with_retries(lambda: session.get(USER_ALPHAS_URL, params=params, timeout=be.REQUEST_TIMEOUT),
+                                   "listing your submitted alphas")
+            data = resp.json() if resp.status_code == 200 else None
+            batch = data.get("results") if isinstance(data, dict) else None
+            if not isinstance(batch, list):
+                raise ValueError(f"BRAIN answered {resp.status_code}")
+            ids += [str(a["id"]) for a in batch if isinstance(a, dict) and a.get("id") and a.get("status") == "ACTIVE"]
+            if len(batch) < ALPHA_LIST_PAGE:
+                return list(dict.fromkeys(ids)), "BRAIN"
+            offset += ALPHA_LIST_PAGE
+        logger.warning("Listed only the first %d of your alphas on BRAIN - any submitted alpha past those is left "
+                       "out of the portfolio check.", MAX_ALPHA_LIST_PAGES * ALPHA_LIST_PAGE)
+        return list(dict.fromkeys(ids)), "BRAIN"
+    except (requests.RequestException, ValueError) as exc:
+        logger.info("Couldn't list your submitted alphas on BRAIN (%s) - using the results file instead.",
+                    str(exc)[:80])
+    found = []
+    if Path(RESULTS_FILE).exists():
+        with open(RESULTS_FILE, encoding="utf-8", newline="") as f:
+            found = [r["alpha_id"].strip() for r in csv.DictReader(f)
+                     if (r.get("alpha_id") or "").strip() and landed(r.get("submitted"))]
+    return list(dict.fromkeys(found)), "the results file"
+
+
+def annual_sharpe(daily) -> float | None:
+    if len(daily) < 2:
+        return None
+    spread = statistics.pstdev(daily)
+    return statistics.fmean(daily) / spread * math.sqrt(252) if spread > 0 else None
+
+
+def shared_days(all_series) -> list:
+    days = set(all_series[0]) if all_series else set()
+    for series in all_series[1:]:
+        days = days.intersection(series)
+    return sorted(days)
+
+
+def combined_sharpe(all_series):
+    """(Sharpe of these daily PnL series combined with equal weights, days they share) - Sharpe None if too few."""
+    days = shared_days(all_series)
+    if len(days) < PORTFOLIO_MIN_DAYS:
+        return None, len(days)
+    return annual_sharpe([sum(s[d] for s in all_series) / len(all_series) for d in days]), len(days)
+
+
+def combined_effect(others, candidate):
+    """PortfolioEffect of adding `candidate` (daily PnL) to `others` (the submitted alphas' daily PnL), all equally
+    weighted, over the days they all share - None if they share fewer than PORTFOLIO_MIN_DAYS."""
+    days = shared_days([candidate, *others])
+    if len(days) < PORTFOLIO_MIN_DAYS:
+        return None
+    new = [candidate[d] for d in days]
+    if not others:
+        return PortfolioEffect(None, annual_sharpe(new), None, len(days), 0)
+    n = len(others)
+    before = [sum(series[d] for series in others) / n for d in days]
+    after = [(b * n + x) / (n + 1) for b, x in zip(before, new)]
+    try:
+        corr = statistics.correlation(new, before)
+    except statistics.StatisticsError:
+        corr = None
+    return PortfolioEffect(annual_sharpe(before), annual_sharpe(after), corr, len(days), n)
+
+
+class Portfolio:
+    """Your submitted alphas' daily PnL, read from BRAIN once per run, the first time an alpha is about to go in.
+    Alphas that go in during the run are added as they land."""
+
+    def __init__(self):
+        self.state = "unread"  # "unread", "ready" or "unavailable" (then the usual rules decide alone)
+        self.daily = {}        # alpha_id -> daily PnL, for your submitted alphas
+        self.checked = {}      # alpha_id -> daily PnL, for alphas checked this run (kept in case they go in)
+        self.blocked = set()   # good alphas this run kept out because they'd lower the combined portfolio
+
+    def ready(self, session) -> bool:
+        if self.state == "unread":
+            self.state = "unavailable"
+            ids, source = submitted_alpha_ids(session)
+            daily = {}
+            for alpha_id in ids:
+                series = fetch_daily_pnl(session, alpha_id) or fetch_daily_pnl(session, alpha_id)
+                if not series:
+                    logger.warning("Couldn't read the PnL of your submitted alpha %s - the portfolio check is off "
+                                   "for this run, so the usual rules decide alone.", alpha_id)
+                    return False
+                daily[alpha_id] = series
+            self.daily, self.state = daily, "ready"
+            sharpe, days = combined_sharpe(list(daily.values()))
+            logger.info("Portfolio check: %d submitted alpha(s), listed from %s%s. An alpha goes in only if it raises "
+                        "their combined Sharpe - the leaderboard's IS Score rates your alphas combined.", len(daily),
+                        source, f", combined Sharpe {sharpe:.2f} over {days} shared days" if sharpe is not None else "")
+        return self.state == "ready"
+
+    def effect(self, session, alpha_id):
+        if not self.ready(session):
+            return None
+        if alpha_id not in self.checked:
+            self.checked[alpha_id] = fetch_daily_pnl(session, alpha_id)
+        if not self.checked[alpha_id]:
+            return None
+        return combined_effect([s for a, s in self.daily.items() if a != alpha_id], self.checked[alpha_id])
+
+    def note_landed(self, alpha_id):
+        """An alpha went in: it's part of the portfolio from now on (read again next time if its PnL wasn't read)."""
+        series = self.checked.pop(alpha_id, None)
+        if self.state == "ready":
+            if series:
+                self.daily[alpha_id] = series
+            else:
+                self.state = "unread"
+
+
+PORTFOLIO = Portfolio()  # a fresh one for every run
+
+
+def portfolio_effect(session, alpha_id):
+    """PORTFOLIO.effect, or None if the check is off or hit a problem (the usual rules then decide alone)."""
+    if not PORTFOLIO_CHECK:
+        return None
+    try:
+        return PORTFOLIO.effect(session, alpha_id)
+    except Exception as exc:
+        logger.warning("The portfolio check on %s hit a problem (%s: %s) - the usual rules decide.",
+                       alpha_id, type(exc).__name__, str(exc)[:100])
+        return None
+
+
+def portfolio_verdict(session, alpha_id):
+    """(may go in, what the check found). It may go in only if adding it raises your submitted alphas' combined
+    Sharpe; the end-of-day pick may lower it by up to END_OF_DAY_MAX_PORTFOLIO_DROP. If the check can't be made
+    (it's off, BRAIN didn't send a PnL, too few shared days), the answer is yes and the usual rules decide alone."""
+    effect = portfolio_effect(session, alpha_id)
+    if effect is None or effect.after is None:
+        return True, ("couldn't be made this time, so the usual rules decide" if PORTFOLIO_CHECK else "")
+    if effect.before is None:
+        return True, f"it would be your first submitted alpha (Sharpe {effect.after:.2f})"
+    allowed = END_OF_DAY_MAX_PORTFOLIO_DROP if end_of_day_pick() else 0.0
+    change = (effect.after - effect.before) / abs(effect.before) if effect.before else 0.0
+    note = (f"your {effect.alphas} submitted alpha(s) combined have Sharpe {effect.before:.2f}, {effect.after:.2f} "
+            f"with it ({change:+.1%})" + (f"; its correlation with them is {effect.corr:.2f}"
+                                          if effect.corr is not None else ""))
+    if effect.after > effect.before - allowed * abs(effect.before):
+        return True, note
+    PORTFOLIO.blocked.add(alpha_id)
+    return False, note + (f" - more than the {allowed:.0%} drop the end-of-day pick may make" if allowed > 0 else "")
+
+
+def end_of_day_rule() -> str:
+    """How the end-of-day pick chooses, in words, for the log."""
+    if not PORTFOLIO_CHECK:
+        return "the least similar good alpha goes in"
+    if END_OF_DAY_MAX_PORTFOLIO_DROP > 0:
+        return (f"the good alpha best for your combined portfolio goes in, if it lowers the combined Sharpe by no more "
+                f"than {END_OF_DAY_MAX_PORTFOLIO_DROP:.0%}")
+    return "the good alpha that raises your combined Sharpe the most goes in - none, if every one would lower it"
+
+
+def end_of_day_portfolio_order(effect) -> tuple:
+    """Sort key: the alpha that leaves the combined Sharpe highest first; ones the check couldn't score last."""
+    known = effect is not None and effect.after is not None
+    return (not known, -effect.after if known else 0.0)
 
 
 def try_submit(session, alpha_id: str, corr=_UNCHECKED) -> str:
@@ -2076,9 +2359,9 @@ def settle_for_today(session):
         return
     if not SETTLING:
         SETTLING = True
-        logger.info("No strong alpha has gone in today - from now on one that clears BRAIN's bar (Sharpe %s, "
-                    "fitness %s) goes in, so the day still counts: the least similar held one first, or else the "
-                    "next good one found.", SUBMIT_MIN_SHARPE, SUBMIT_MIN_FITNESS)
+        logger.info("No strong alpha has gone in today - from now on one that only clears BRAIN's bar (Sharpe %s, "
+                    "fitness %s) may go in too, so the day can still count. End-of-day pick: %s (held ones first, "
+                    "then the next good one found).", SUBMIT_MIN_SHARPE, SUBMIT_MIN_FITNESS, end_of_day_rule())
     submit_held(session)
 
 
@@ -2187,7 +2470,7 @@ def _submit_held(session):
     if done >= MAX_SUBMISSIONS_PER_DAY:
         plan = "Today's limit is used, so they wait for BRAIN's next day (3 AM US Eastern)."
     elif done == 0 and SETTLING:
-        plan = "Nothing is submitted for today yet, so the least similar good one goes in."
+        plan = f"Nothing is submitted for today yet - end-of-day pick: {end_of_day_rule()}."
     elif done == 0:
         plan = (f"Nothing is submitted for today yet - a strong one ({strong_note()}){daytime_note()} goes in now; "
                 f"the others wait until the usual rounds are done, in case a better one turns up.")
@@ -2249,17 +2532,21 @@ def _submit_held(session):
             RESERVE.forget(alpha_id)
             dropped += 1
             continue
-        if corr is not None:
+        if corr is not None and row.get("submitted") != HELD_PORTFOLIO_LABEL:
             RESERVE.keep(alpha_id, row["expression"])  # confirmed good today - counts toward the reserve
         is_stats = alpha.get("is") or {}
         latest = dict(row, sharpe=metrics.get("sharpe"), fitness=metrics.get("fitness"),
                       returns=is_stats.get("returns"), drawdown=is_stats.get("drawdown"))
         good.append((row, corr, latest))
 
-    # 2. Submit, best first, as far as today allows - least similar first for the end-of-day pick.
+    # 2. Submit, best first, as far as today allows. The end-of-day pick goes by what each alpha would do to your
+    #    combined portfolio (best first), then least similar first.
     good.sort(key=lambda g: strength(g[2]), reverse=True)
     if end_of_day_pick():
         good.sort(key=end_of_day_order)
+        if PORTFOLIO_CHECK and good:
+            effects = {row["alpha_id"]: portfolio_effect(session, row["alpha_id"]) for row, _, _ in good}
+            good.sort(key=lambda g: end_of_day_portfolio_order(effects[g[0]["alpha_id"]]))
     if good and submissions_today() == 0 and not SETTLING and not row_is_strong(good[0][2]):
         logger.info("None of the held alphas is strong (%s) - they wait until the usual rounds are done, in case "
                     "a stronger one turns up.", strong_note())
@@ -2278,6 +2565,14 @@ def _submit_held(session):
                         "stays queued: it can still be that pick.", alpha_id, reading, daytime_note())
             waiting += 1
             continue
+        if not too_similar(corr):
+            allowed, note = portfolio_verdict(session, alpha_id)
+            if not allowed:
+                logger.info("Held alpha %s stays queued: %s - it would lower your combined portfolio.", alpha_id, note)
+                waiting += 1
+                continue
+            if note:
+                logger.info("Portfolio check on held alpha %s: %s.", alpha_id, note)
         outcome = try_submit(session, alpha_id, corr=corr)
         if outcome.startswith("FAILED"):
             logger.warning("Held alpha %s stays queued - the submit didn't go through.", alpha_id)
@@ -2286,6 +2581,7 @@ def _submit_held(session):
         mark_held(alpha_id, outcome)
         if landed(outcome):
             RESERVE.note_landed(alpha_id, expression)
+            PORTFOLIO.note_landed(alpha_id)
             submitted += 1
             first_outcome = outcome if first_outcome is None or not landed(first_outcome) else first_outcome
         else:  # rejected at submission, or too similar now - not counted toward today, so the next one goes
@@ -2362,6 +2658,15 @@ def hold_similar(session, row, alpha_id, corr):
     record_before_after(session, alpha_id, "held as somewhat similar")
 
 
+def hold_for_portfolio(session, row, alpha_id, note):
+    """An alpha that could go in now, but adding it would lower your submitted alphas' combined Sharpe: held (not
+    counted in the reserve), and checked again each run, since the portfolio changes as other alphas go in."""
+    logger.info("Alpha %s qualifies, but %s - it would lower your combined portfolio, which the leaderboard's IS Score "
+                "rates. Holding it in case that changes.", alpha_id, note)
+    row["submitted"] = HELD_PORTFOLIO_LABEL
+    record_before_after(session, alpha_id, "held: would lower the combined portfolio")
+
+
 def finish_idea(session, row, alpha_id) -> dict:
     """A simulation finished: read BRAIN's result, log it, and submit the alpha if it qualifies."""
     expression = row["expression"]
@@ -2396,8 +2701,8 @@ def finish_idea(session, row, alpha_id) -> dict:
                 for_today = not strong and submissions_today() == 0  # may still go in today, if nothing beats it
                 logger.warning("Alpha %s qualifies%s, but %s - %s", alpha_id,
                                "" if corr is None else f" (self-correlation {corr:.2f})", why_held(expression, strong),
-                               "holding it for now; if no strong alpha turns up in the usual rounds, the best "
-                               "held one goes in." if for_today else
+                               "holding it for now; if no strong alpha turns up in the usual rounds, the "
+                               "end-of-day pick chooses from the held ones." if for_today else
                                "holding it for a coming day. Each run starts with the held alphas.")
                 row["submitted"] = HELD_FOR_STRONGER_LABEL if for_today else HELD_LABEL
                 if corr is not None:
@@ -2408,14 +2713,22 @@ def finish_idea(session, row, alpha_id) -> dict:
             if similar_for_now(corr):
                 hold_similar(session, row, alpha_id, corr)
             else:
-                outcome = try_submit(session, alpha_id, corr=corr)
-                if outcome.startswith("FAILED"):
-                    logger.warning("Holding %s so the submit is tried again (before the next extra round, or "
-                                   "next run) instead of losing it.", alpha_id)
-                    outcome = HELD_RETRY_LABEL
-                elif landed(outcome):
-                    RESERVE.note_landed(alpha_id, expression)
-                row["submitted"] = outcome
+                # (one BRAIN would turn away as too similar skips the portfolio check: try_submit logs it as such)
+                allowed, note = (True, "") if too_similar(corr) else portfolio_verdict(session, alpha_id)
+                if not allowed:
+                    hold_for_portfolio(session, row, alpha_id, note)
+                else:
+                    if note:
+                        logger.info("Portfolio check on %s: %s.", alpha_id, note)
+                    outcome = try_submit(session, alpha_id, corr=corr)
+                    if outcome.startswith("FAILED"):
+                        logger.warning("Holding %s so the submit is tried again (before the next extra round, or "
+                                       "next run) instead of losing it.", alpha_id)
+                        outcome = HELD_RETRY_LABEL
+                    elif landed(outcome):
+                        RESERVE.note_landed(alpha_id, expression)
+                        PORTFOLIO.note_landed(alpha_id)
+                    row["submitted"] = outcome
 
     append_result(row)
     logger.info("  %s -> sharpe=%s fitness=%s turnover=%s checks=%s/%s submitted=%s", expression,
@@ -2945,8 +3258,9 @@ def gemini_client() -> genai.Client:
 
 
 def run(args):
-    global RESERVE, BEFORE_AFTER_REFUSED, SETTLING, OUTAGE_SECONDS
+    global RESERVE, BEFORE_AFTER_REFUSED, SETTLING, OUTAGE_SECONDS, PORTFOLIO
     RESERVE = Reserve()  # the reserve only counts alphas BRAIN confirms during this run
+    PORTFOLIO = Portfolio()  # your submitted alphas' PnL is read afresh each run
     BEFORE_AFTER_REFUSED = False
     SETTLING = False
     OUTAGE_SECONDS = 0.0
@@ -2955,13 +3269,14 @@ def run(args):
     keep_awake()
     if args.try_expressions:
         session = connect(email, password)
+        note_competitions(session)
         submit_held(session)
         try:
             rows = run_try(session, args.try_expressions, SETTINGS, email, password)
         except StopLoop as e:
             logger.error("Stopping: %s", e)
             return
-        settle_for_today(session)  # no rounds to wait for: if no strong alpha went in, the best held one does
+        settle_for_today(session)  # no rounds to wait for: if no strong alpha went in, the end-of-day pick
         logger.info("Done: %d simulation(s), including any automatic flips or smooths. Results are in %s.",
                     len(rows), RESULTS_FILE)
         return
@@ -2982,6 +3297,7 @@ def run(args):
 
     settings = SETTINGS
     session = connect(email, password)
+    note_competitions(session)
     submit_held(session)  # before building feedback, so the generator sees the updated outcome
     catch_up = getattr(args, "catch_up", False)
     if catch_up and submissions_today() > 0:
@@ -3012,9 +3328,9 @@ def run(args):
                 "%d submission(s)/day max.", MAX_ROUNDS, IDEAS_PER_ROUND, MAX_ROUNDS * IDEAS_PER_ROUND,
                 PARALLEL_SIMULATIONS, MAX_RUNTIME_SECONDS, MAX_SUBMISSIONS_PER_DAY)
     if MAX_SUBMISSIONS_PER_DAY > 0:
-        logger.info("Strong alphas (%s)%s go in first. If none has by the end of the %d rounds, the least similar "
-                    "one that clears BRAIN's bar goes in, so the day still counts.", strong_note(), daytime_note(),
-                    MAX_ROUNDS)
+        logger.info("Strong alphas (%s)%s go in first%s. If none has by the end of the %d rounds, end-of-day pick: %s.",
+                    strong_note(), daytime_note(), ", if they raise your combined portfolio" if PORTFOLIO_CHECK else "",
+                    MAX_ROUNDS, end_of_day_rule())
         logger.info("Every day counts: with nothing submitted for today after %d rounds, up to %d more rounds "
                     "until something lands.%s", MAX_ROUNDS, MAX_EXTRA_ROUNDS,
                     f" A submission beyond today's first must be strong, with {RESERVE_TARGET}+ other kinds of good "
@@ -3061,7 +3377,7 @@ def run(args):
                     logger.error("Stopping: %s", e)
                     stopped = True
                     break
-                settle_for_today(session)  # the best held alpha goes in now, strong or not
+                settle_for_today(session)  # the end-of-day pick goes in now, strong or not
                 if submissions_today() > 0:
                     break
                 if MAX_ROUNDS < 1:
@@ -3114,6 +3430,11 @@ def run(args):
     if MAX_SUBMISSIONS_PER_DAY > 0 and submissions_today() == 0:
         logger.warning("Nothing was submitted for BRAIN day %s. A later run before its day ends (3 AM US "
                        "Eastern) - such as the backup run - will try again.", brain_day())
+        if PORTFOLIO.blocked:
+            logger.warning("%d good alpha(s) were kept out because each would have lowered your combined portfolio. "
+                           "To keep the daily streak at a small cost, set END_OF_DAY_MAX_PORTFOLIO_DROP in .env "
+                           "(0.02 lets the end-of-day pick lower the combined Sharpe by up to 2%%).",
+                           len(PORTFOLIO.blocked))
     logger.info(reserve_note())
 
 

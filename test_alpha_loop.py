@@ -34,6 +34,8 @@ REAL_BRAIN_REACHABLE, REAL_ON_MAINS_POWER = al.brain_reachable, al.on_mains_powe
 al.brain_reachable = lambda: True
 al.on_mains_power = lambda: None
 al.SETTLE_BEFORE_DAY_END_MINUTES = 0
+# The portfolio check reads PnL the fake BRAINs here don't serve; its own tests switch it on (portfolio_on).
+al.PORTFOLIO_CHECK = False
 
 
 def fake_response(status_code=200, json_data=None, headers=None, text=""):
@@ -59,6 +61,8 @@ def in_tmp(tmp_path, fn, *a, **kw):
     cwd = os.getcwd()
     os.chdir(tmp_path)
     al.RESERVE = al.Reserve()  # each test starts with an empty reserve, like each run does
+    al.PORTFOLIO = al.Portfolio()
+    al.ACTIVE_COMPETITION = ""
     al.BEFORE_AFTER_REFUSED = False
     al.SETTLING = False
     try:
@@ -1459,7 +1463,7 @@ def test_submissions_never_overlap_when_several_qualify(tmp_path):
         brain = SlowBrain({"rank(a)": good, "rank(b)": good, "rank(c)": calm()})
         submitted = []
 
-        def fake_try_submit(session, alpha_id):
+        def fake_try_submit(session, alpha_id, corr=None):  # the caller now passes the similarity it just read
             submitted.append(alpha_id)
             al.record_submission()
             return "YES"
@@ -2598,6 +2602,401 @@ def test_the_generator_is_told_the_strong_targets():
         al.generate_ideas(client, "m", [], [], SETTINGS, "feedback", set(), 3)
     prompt = client.models.generate_content.call_args.kwargs["contents"]
     assert "aim for Sharpe 1.6+, fitness 1.3+, returns above drawdown" in prompt
+
+
+# ---- Near-copies: stricter than BRAIN for every submission but the end-of-day pick ----
+
+def test_a_strong_alpha_somewhat_similar_to_yours_is_held_not_submitted(tmp_path):
+    def run():
+        brain = FakeBrain({"a1": alpha_json()}, corr=0.62)               # under BRAIN's 0.7, not under 0.5
+        with captured_logs() as lines:
+            rows = run_one_idea(brain)
+        assert rows[0]["submitted"] == al.HELD_SIMILAR_LABEL
+        assert al.submissions_today() == 0 and submit_posts(brain) == []
+        assert [r["alpha_id"] for r in al.held_candidates()] == ["a1"]   # queued for the end-of-day pick
+        assert al.RESERVE.kinds() == 1 and brain.before_after == ["a1"]  # counted, and checked like any held one
+        assert any("self-correlation is 0.62" in l and "under 0.5 go in before the end-of-day pick" in l
+                   for l in lines), lines
+    in_tmp(tmp_path, run)
+
+
+def test_exactly_at_the_daytime_limit_is_held_just_under_goes_in(tmp_path):
+    def run():
+        assert run_one_idea(FakeBrain({"at": alpha_json()}, corr=0.5))[0]["submitted"] == al.HELD_SIMILAR_LABEL
+        assert run_one_idea(FakeBrain({"under": alpha_json()}, corr=0.49))[0]["submitted"] == "YES"
+    in_tmp(tmp_path, run)
+
+
+def test_a_daytime_limit_of_0_7_turns_the_rule_off(tmp_path):
+    def run():
+        with patch.object(al, "DAYTIME_MAX_SELF_CORRELATION", 0.7):
+            unread = run_one_idea(FakeBrain({"u1": alpha_json()}, corr={"u1": None}))   # as before: in it goes
+            assert unread[0]["submitted"] == "YES"
+            Path(al.SUBMISSION_LOG_FILE).unlink()                                     # a fresh day for the next one
+            assert run_one_idea(FakeBrain({"a1": alpha_json()}, corr=0.62))[0]["submitted"] == "YES"
+            assert al.daytime_note() == ""
+    in_tmp(tmp_path, run)
+
+
+def test_during_the_day_held_alphas_go_by_brains_latest_numbers(tmp_path):
+    def run():
+        al.append_result(held_row("was_best", 1.6))                      # fittest when it was found...
+        al.append_result(held_row("now_best", 1.35))
+        brain = FakeBrain({"was_best": alpha_json(fitness=1.3), "now_best": alpha_json(fitness=1.7)})
+        assert run_held(brain) == "YES"                                  # ...but BRAIN's latest numbers decide
+        assert submit_posts(brain) == ["now_best"]
+    in_tmp(tmp_path, run)
+
+
+def test_once_the_run_settles_a_new_alpha_up_to_0_7_goes_straight_in(tmp_path):
+    def run():
+        al.SETTLING = True                                               # the next good one is the end-of-day pick
+        rows = run_one_idea(FakeBrain({"a1": alpha_json()}, corr=0.66))
+        assert rows[0]["submitted"] == "YES" and al.submissions_today() == 1
+    in_tmp(tmp_path, run)
+
+
+def test_an_extra_submission_must_be_under_the_daytime_limit_even_after_settling(tmp_path):
+    def run():
+        al.record_submission()                                           # today's first is in
+        al.SETTLING = True                                               # only the day's first is the end-of-day pick
+        brain = FakeBrain({"a1": alpha_json()}, corr=0.55)
+        with patch.object(al, "MAX_SUBMISSIONS_PER_DAY", 2), patch.object(al, "RESERVE_TARGET", 0):
+            rows = run_one_idea(brain)
+        assert rows[0]["submitted"] == al.HELD_SIMILAR_LABEL and submit_posts(brain) == []
+        assert al.submissions_today() == 1
+    in_tmp(tmp_path, run)
+
+
+def test_unreadable_similarity_waits_for_the_end_of_day_pick(tmp_path):
+    def run():
+        brain = FakeBrain({"a1": alpha_json()}, corr={"a1": None})       # BRAIN gives no number
+        assert run_one_idea(brain)[0]["submitted"] == al.HELD_SIMILAR_LABEL
+        assert submit_posts(brain) == []                                 # can't be shown to be under 0.5
+        with patch("time.sleep"):
+            al.settle_for_today(brain.session)                           # still no number: in it goes, as before
+        assert submit_posts(brain) == ["a1"] and submitted_value("a1") == "YES"
+    in_tmp(tmp_path, run)
+
+
+def test_held_alphas_need_the_daytime_limit_until_the_end_of_day_pick(tmp_path):
+    def run():
+        al.append_result(held_row("similar", 1.5, sharpe=1.8, submitted=al.HELD_SIMILAR_LABEL))
+        brain = FakeBrain({"similar": alpha_json(sharpe=1.8, fitness=1.5)}, corr=0.61)
+        with captured_logs() as lines:
+            assert run_held(brain) is None                               # strong, but not under 0.5: waits
+        assert submit_posts(brain) == [] and submitted_value("similar") == al.HELD_SIMILAR_LABEL
+        assert any("self-correlation is 0.61" in l and "stays queued" in l for l in lines), lines
+        al.SETTLING = True
+        assert run_held(brain) == "YES"                                  # the end-of-day pick allows up to 0.7
+        assert submit_posts(brain) == ["similar"]
+    in_tmp(tmp_path, run)
+
+
+def test_the_end_of_day_pick_goes_least_similar_first(tmp_path):
+    def run():
+        held = {"strongest": (1.6, 0.64), "unique": (1.1, 0.18), "unknown": (1.4, None), "middling": (1.2, 0.4)}
+        for alpha_id, (fitness, _) in held.items():
+            al.append_result(held_row(alpha_id, fitness))
+        brain = FakeBrain({a: alpha_json(fitness=f) for a, (f, _) in held.items()},
+                          corr={a: c for a, (_, c) in held.items()})
+        al.SETTLING = True
+        assert run_held(brain) == "YES"
+        assert submit_posts(brain) == ["unique"]                         # least similar, though the least fit
+        assert {a: submitted_value(a) for a in ("strongest", "unknown", "middling")} == \
+               dict.fromkeys(("strongest", "unknown", "middling"), al.HELD_LABEL)
+    in_tmp(tmp_path, run)
+
+
+def test_end_of_day_order_least_similar_then_stronger_unreadable_last():
+    items = [("x", 0.64, {"sharpe": "1.9", "fitness": "1.6"}), ("y", 0.18, {"sharpe": "1.3", "fitness": "1.05"}),
+             ("z", None, {"sharpe": "2.0", "fitness": "1.8"}), ("w", 0.18, {"sharpe": "1.4", "fitness": "1.2"})]
+    assert [i[0] for i in sorted(items, key=al.end_of_day_order)] == ["w", "y", "x", "z"]
+
+
+def test_a_day_with_only_somewhat_similar_alphas_still_gets_its_submission(tmp_path):
+    def run():
+        brain = FakeBrain({"r1": alpha_json(), "r2": calm()}, corr={"r1": 0.6})
+        with captured_logs() as lines:
+            asked = run_main_rounds(brain, MAX_ROUNDS=2, MAX_EXTRA_ROUNDS=5)
+        assert asked == 2                                                # no extra rounds needed
+        assert submitted_value("r1") == "YES" and al.submissions_today() == 1
+        assert any("with self-correlation under 0.5 go in first" in l for l in lines), lines   # said at the start
+    in_tmp(tmp_path, run)
+
+
+# ---- Portfolio check: an alpha goes in only if it raises your submitted alphas' combined Sharpe ----
+
+import math as _math
+import random as _random
+from datetime import date as _d, timedelta as _td
+
+
+def pnl_series(seed, sharpe, on_factor=0.0, days=1500):
+    """Daily PnL with roughly this annual Sharpe; on_factor ties it to one shared market factor (so alphas built that
+    way move together, like near-copies do)."""
+    rng, factor = _random.Random(seed), _random.Random(99)
+    shared = [factor.gauss(0, 1) for _ in range(days)]
+    mean = sharpe / _math.sqrt(252)
+    rest = _math.sqrt(1 - on_factor ** 2)
+    return [mean + on_factor * shared[t] + rest * rng.gauss(0, 1) for t in range(days)]
+
+
+def pnl_recordset(daily):
+    """BRAIN's PnL recordset for these daily values: a running total, one row per day."""
+    total, records = 0.0, [[_d(2019, 1, 1).isoformat(), 0.0]]
+    for t, value in enumerate(daily, start=1):
+        total += value
+        records.append([(_d(2019, 1, 1) + _td(t)).isoformat(), total])
+    return {"schema": {"name": "pnl", "title": "PnL", "properties": [{"name": "date", "title": "Date", "type": "date"},
+                                                                     {"name": "pnl", "title": "PnL", "type": "amount"}]},
+            "records": records}
+
+
+# Three submitted alphas built on the same market factor; COPY is one more like them, only weaker; FRESH is unrelated;
+# MEH is unrelated too, but weaker than FRESH - it still raises the combined Sharpe, just by less.
+MINE = {f"mine{i}": pnl_series(i, 1.5, on_factor=0.8) for i in (1, 2, 3)}
+COPY, FRESH, MEH = pnl_series(11, 0.8, on_factor=0.95), pnl_series(12, 2.0), pnl_series(13, 1.3)
+
+
+class PortfolioBrain(FakeBrain):
+    """FakeBrain that also lists your submitted alphas, serves each alpha's PnL and lists your competitions."""
+    def __init__(self, alphas, pnl, listed=(), competitions=None, pnl_status=200, **kw):
+        super().__init__(alphas, **kw)
+        self.pnl, self.listed, self.competitions, self.pnl_status = pnl, list(listed), competitions, pnl_status
+        self.pnl_asked, self.list_params = [], []
+
+    def get(self, url, **kw):
+        if url == al.USER_ALPHAS_URL:
+            params = kw.get("params") or {}
+            self.list_params.append(dict(params))
+            mine = self.listed + sorted(self.submitted - set(self.listed))
+            everyone = [{"id": a, "status": "ACTIVE"} for a in mine] + [{"id": "draft", "status": "UNSUBMITTED"}]
+            start = params.get("offset", 0)
+            return fake_response(200, {"count": len(everyone), "results": everyone[start:start + params.get("limit")]})
+        if url.endswith("/recordsets/pnl"):
+            alpha_id = url.split("/")[-3]
+            self.pnl_asked.append(alpha_id)
+            if self.pnl_status != 200 or alpha_id not in self.pnl:
+                return fake_response(self.pnl_status if self.pnl_status != 200 else 404, {"detail": "no"}, text="no")
+            return fake_response(200, pnl_recordset(self.pnl[alpha_id]), text="pnl")
+        if url == al.COMPETITIONS_URL:
+            if self.competitions is None:
+                return fake_response(404, {"detail": "no"}, text="no")
+            return fake_response(200, {"count": len(self.competitions), "next": None, "results": self.competitions})
+        return super().get(url, **kw)
+
+
+@contextlib.contextmanager
+def portfolio_on(**settings):
+    with patch.object(al, "PORTFOLIO_CHECK", True), contextlib.ExitStack() as stack:
+        for name, value in settings.items():
+            stack.enter_context(patch.object(al, name, value))
+        yield
+
+
+def mine_and(candidates, corr=0.3, **kw):
+    """A PortfolioBrain where MINE are your submitted alphas and `candidates` ({id: daily PnL}) are new ones."""
+    return PortfolioBrain({a: alpha_json() for a in candidates}, dict(MINE, **candidates), listed=MINE, corr=corr, **kw)
+
+
+def test_daily_pnl_turns_brains_running_total_into_daily_changes():
+    data = {"schema": {"properties": [{"name": "date"}, {"name": "pnl"}]},
+            "records": [["2019-01-03", 150.0], ["2019-01-02", 100.0], ["2019-01-04", None], ["2019-01-07", 120.0]]}
+    assert al.daily_pnl(data) == {"2019-01-03": 50.0, "2019-01-07": -30.0}    # sorted by date; a blank day skipped
+    flipped = {"schema": {"properties": {"pnl": {}, "date": {}}}, "records": [[100.0, "2019-01-02"], [90.0, "2019-01-03"]]}
+    assert al.daily_pnl(flipped) == {"2019-01-03": -10.0}                     # columns found by name
+    assert al.daily_pnl({}) == {} and al.daily_pnl("junk") == {}
+
+
+def test_fetching_a_pnl_waits_while_brain_prepares_it_and_gives_up_cleanly():
+    session = MagicMock()
+    session.get.side_effect = [fake_response(200, None, headers={"Retry-After": "1.5"}, text=""),
+                               fake_response(429, {"detail": "slow down"}, headers={"Retry-After": "2.0"}, text="x"),
+                               fake_response(200, pnl_recordset([5.0, -2.0]), text="pnl")]
+    with patch("time.sleep") as sleep:
+        assert al.fetch_daily_pnl(session, "a1") == {"2019-01-02": 5.0, "2019-01-03": -2.0}
+    assert [c.args[0] for c in sleep.call_args_list] == [1.5, 2.0]
+    assert session.get.call_args.args[0] == "https://api.worldquantbrain.com/alphas/a1/recordsets/pnl"
+    session.get.side_effect = [fake_response(500, {"detail": "oops"}, text="oops")]
+    assert al.fetch_daily_pnl(session, "a1") is None
+
+
+def test_your_submitted_alphas_are_listed_page_by_page_or_read_from_the_results_file(tmp_path):
+    def run():
+        brain = PortfolioBrain({}, {}, listed=[f"s{i}" for i in range(150)])
+        with patch("time.sleep"):
+            ids, source = al.submitted_alpha_ids(brain.session)
+        assert (len(ids), source, ids[0], "draft" in ids) == (150, "BRAIN", "s0", False)   # only ACTIVE ones
+        assert [(p["status"], p["offset"]) for p in brain.list_params] == [("ACTIVE", 0), ("ACTIVE", 100)]
+        al.append_result(held_row("in1", 1.3, submitted="YES"))
+        al.append_result(held_row("held1", 1.3))
+        broken = MagicMock()
+        broken.get.return_value = fake_response(500, {"detail": "down"}, text="down")
+        with patch("time.sleep"):
+            assert al.submitted_alpha_ids(broken) == (["in1"], "the results file")
+    in_tmp(tmp_path, run)
+
+
+def test_combined_effect_compares_your_portfolio_with_and_without_the_alpha():
+    mine = [dict(zip(map(str, range(300)), MINE["mine1"]))]
+    same = al.combined_effect(mine, mine[0])
+    assert abs(same.after - same.before) < 1e-9 and abs(same.corr - 1) < 1e-9 and (same.days, same.alphas) == (300, 1)
+    first = al.combined_effect([], dict(zip(map(str, range(300)), FRESH)))
+    assert first.before is None and first.after > 0
+    assert al.combined_effect(mine, {str(i): 1.0 for i in range(200)}) is None      # too few shared days
+    days = lambda s: {(_d(2019, 1, 1) + _td(t + 1)).isoformat(): v for t, v in enumerate(s)}
+    assert al.combined_effect([days(s) for s in MINE.values()], days(COPY)).after < 1.7 < \
+           al.combined_effect([days(s) for s in MINE.values()], days(FRESH)).after
+
+
+def test_an_alpha_that_would_lower_your_combined_portfolio_is_held(tmp_path):
+    def run():
+        brain = mine_and({"copy": COPY})
+        with portfolio_on(), captured_logs() as lines:
+            rows = run_one_idea(brain)
+        assert rows[0]["submitted"] == al.HELD_PORTFOLIO_LABEL and submit_posts(brain) == []
+        assert al.submissions_today() == 0 and al.RESERVE.kinds() == 0              # not counted as a reserve
+        assert al.PORTFOLIO.blocked == {"copy"} and brain.before_after == ["copy"]
+        assert any("3 submitted alpha(s), listed from BRAIN, combined Sharpe 1.80" in l for l in lines), lines
+        assert any("Sharpe 1.80, 1.64 with it (-8.7%); its correlation with them is 0.87" in l
+                   and "would lower your combined portfolio" in l for l in lines), lines
+    in_tmp(tmp_path, run)
+
+
+def test_an_alpha_that_raises_it_goes_in_and_joins_the_portfolio(tmp_path):
+    def run():
+        brain = mine_and({"fresh": FRESH, "copy": COPY})
+        with portfolio_on(), captured_logs() as lines:
+            assert run_one_idea(brain)[0]["submitted"] == "YES"
+            assert set(al.PORTFOLIO.daily) == {"mine1", "mine2", "mine3", "fresh"}     # part of it from now on
+            asked = len(brain.pnl_asked)
+            effect = al.portfolio_effect(brain.session, "copy")
+        assert any("Portfolio check on fresh: your 3 submitted alpha(s) combined have Sharpe 1.80, 2.50" in l
+                   for l in lines), lines
+        assert effect.alphas == 4 and brain.pnl_asked[asked:] == ["copy"]              # the portfolio isn't re-read
+    in_tmp(tmp_path, run)
+
+
+def test_the_portfolio_check_steps_aside_when_brain_wont_send_a_pnl(tmp_path):
+    def run():
+        brain = mine_and({"copy": COPY}, pnl_status=500)
+        with portfolio_on(), captured_logs() as lines:
+            assert run_one_idea(brain)[0]["submitted"] == "YES"                         # the usual rules decide
+        assert any("Couldn't read the PnL of your submitted alpha mine1" in l for l in lines), lines
+        assert al.PORTFOLIO.state == "unavailable"
+    in_tmp(tmp_path, run)
+
+
+def test_your_first_alpha_passes_the_portfolio_check(tmp_path):
+    def run():
+        brain = PortfolioBrain({"first": alpha_json()}, {"first": COPY}, listed=[])
+        with portfolio_on():
+            assert run_one_idea(brain)[0]["submitted"] == "YES"
+    in_tmp(tmp_path, run)
+
+
+def test_with_the_portfolio_check_off_no_pnl_is_read(tmp_path):
+    def run():
+        brain = mine_and({"copy": COPY})
+        assert run_one_idea(brain)[0]["submitted"] == "YES" and brain.pnl_asked == []
+    in_tmp(tmp_path, run)
+
+
+def test_the_end_of_day_pick_goes_best_for_the_portfolio_first(tmp_path):
+    def run():
+        al.append_result(held_row("meh", 1.4))
+        al.append_result(held_row("fresh", 1.2))
+        brain = mine_and({"meh": MEH, "fresh": FRESH}, corr={"meh": 0.2, "fresh": 0.3})   # both raise it; meh less
+        al.SETTLING = True
+        with portfolio_on():
+            assert run_held(brain) == "YES"
+        assert submit_posts(brain) == ["fresh"] and submitted_value("meh") == al.HELD_LABEL
+    in_tmp(tmp_path, run)
+
+
+def test_an_alpha_whose_pnl_couldnt_be_read_goes_in_and_the_portfolio_is_read_again(tmp_path):
+    def run():
+        brain = PortfolioBrain({"nopnl": alpha_json(), "copy": alpha_json()}, dict(MINE, copy=COPY), listed=MINE)
+        with portfolio_on():
+            assert run_one_idea(brain)[0]["submitted"] == "YES"                 # the check couldn't be made
+            assert al.PORTFOLIO.state == "unread"                               # so it's read again next time...
+            listed = len(brain.list_params)
+            al.portfolio_effect(brain.session, "copy")
+        assert len(brain.list_params) > listed and "nopnl" in brain.pnl_asked[-2:]   # ...now with nopnl in it
+    in_tmp(tmp_path, run)
+
+
+def test_the_end_of_day_pick_lowers_the_portfolio_only_as_far_as_allowed(tmp_path):
+    def run():
+        al.append_result(held_row("copy", 1.4))
+        brain = mine_and({"copy": COPY})
+        al.SETTLING = True
+        with portfolio_on(), captured_logs() as lines:
+            assert run_held(brain) is None                                  # -8.7%: no submission rather than that
+        assert submit_posts(brain) == [] and al.PORTFOLIO.blocked == {"copy"}
+        assert any("stays queued" in l and "would lower your combined portfolio" in l for l in lines), lines
+        with portfolio_on(END_OF_DAY_MAX_PORTFOLIO_DROP=0.05), captured_logs() as lines:
+            assert run_held(brain) is None                                  # more than the 5% allowed
+        assert any("more than the 5% drop the end-of-day pick may make" in l for l in lines), lines
+        with portfolio_on(END_OF_DAY_MAX_PORTFOLIO_DROP=0.1):
+            assert run_held(brain) == "YES"                                 # within 10%: the streak goes on
+        assert submit_posts(brain) == ["copy"]
+    in_tmp(tmp_path, run)
+
+
+def test_during_the_day_the_end_of_day_allowance_doesnt_apply(tmp_path):
+    def run():
+        brain = mine_and({"copy": COPY})
+        with portfolio_on(END_OF_DAY_MAX_PORTFOLIO_DROP=0.5):
+            assert run_one_idea(brain)[0]["submitted"] == al.HELD_PORTFOLIO_LABEL
+    in_tmp(tmp_path, run)
+
+
+def test_held_alphas_that_would_lower_the_portfolio_dont_count_as_a_reserve(tmp_path):
+    def run():
+        al.append_result(held_row("copy", 1.4, submitted=al.HELD_PORTFOLIO_LABEL))
+        al.append_result(held_row("other", 1.3))
+        al.record_submission()                                              # today's is in: just re-checked
+        with portfolio_on():
+            run_held(mine_and({"copy": COPY, "other": FRESH}))
+        assert list(al.RESERVE.waiting) == ["other"]
+    in_tmp(tmp_path, run)
+
+
+def test_a_day_the_portfolio_kept_out_ends_with_a_hint(tmp_path):
+    def run():
+        brain = PortfolioBrain({"r1": alpha_json(), "r2": calm()}, dict(MINE, r1=COPY), listed=MINE)
+        with portfolio_on(), captured_logs() as lines:
+            run_main_rounds(brain, MAX_ROUNDS=1, MAX_EXTRA_ROUNDS=1)
+        assert al.submissions_today() == 0 and submitted_value("r1") == al.HELD_PORTFOLIO_LABEL
+        assert any("1 good alpha(s) were kept out" in l and "END_OF_DAY_MAX_PORTFOLIO_DROP" in l for l in lines), lines
+    in_tmp(tmp_path, run)
+
+
+def test_competitions_are_logged_and_the_before_after_check_asks_for_yours(tmp_path):
+    def run():
+        challenge = {"id": "challenge", "name": "Challenge", "leaderboard": {"rank": 1484, "score": 0.27, "user": "me"}}
+        brain = PortfolioBrain({"a1": alpha_json()}, {}, competitions=[challenge])
+        with captured_logs() as lines:
+            al.note_competitions(brain.session)
+        assert al.ACTIVE_COMPETITION == "challenge"
+        assert any("Competition challenge (Challenge) - you: rank 1484, score 0.27" in l for l in lines), lines
+        with patch("time.sleep"):
+            al.record_before_after(brain.session, "a1", "test")
+        asked = [c.args[0] for c in brain.session.get.call_args_list if c.args[0].endswith("before-and-after-performance")]
+        assert asked == ["https://api.worldquantbrain.com/competitions/challenge/alphas/a1/before-and-after-performance"]
+        assert json.loads(Path(al.BEFORE_AFTER_FILE).read_text().splitlines()[-1])["competition"] == "challenge"
+        two = PortfolioBrain({}, {}, competitions=[challenge, {"id": "IQC2026", "name": "IQC"}])
+        with captured_logs() as lines:
+            al.note_competitions(two.session)
+        assert al.ACTIVE_COMPETITION == "" and any("Set BRAIN_COMPETITION" in l for l in lines), lines
+        with patch.object(al, "BRAIN_COMPETITION", "IQC2026"):
+            al.note_competitions(two.session)
+        assert al.ACTIVE_COMPETITION == "IQC2026"
+        al.note_competitions(PortfolioBrain({}, {}).session)              # BRAIN won't say: the account's own check
+        assert al.ACTIVE_COMPETITION == ""
+    in_tmp(tmp_path, run)
 
 
 # ---- Riding out a lost connection: wifi dropping, a laptop waking up ----
