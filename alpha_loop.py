@@ -49,7 +49,8 @@ READ BEFORE YOU RUN THIS:
   qualifies when Sharpe >= 1.25, fitness >= 1.0 and every check passes, except SELF_CORRELATION
   while it reads PENDING: BRAIN only works that one out during submission, so it shows PENDING
   on every unsubmitted alpha. Before submitting, the loop asks BRAIN's free pre-submit
-  self-correlation check and skips anything at 0.7 or above, so the daily slot isn't wasted.
+  self-correlation check and skips anything at 0.7 or above, so the daily slot isn't wasted - and, except
+  for the end-of-day pick, holds anything at DAYTIME_MAX_SELF_CORRELATION (0.5) or above (see Near-copies).
   After submitting, it waits for BRAIN's verdict and only logs "YES" once BRAIN lists the
   alpha as ACTIVE. Anything unclear is logged as VERDICT_PENDING - confirm those with the
   dashboard's Check with BRAIN button. The submit and correlation endpoints follow community
@@ -59,8 +60,8 @@ READ BEFORE YOU RUN THIS:
   otherwise it's held as QUALIFIED_NOT_SUBMITTED. Every run (--try included) starts by re-checking
   every held alpha, slot free or not, since similarity grows as you submit more: one BRAIN already
   lists as submitted is marked YES, one where a check now FAILs is marked NOT_SUBMITTED, one that's
-  become too similar is marked TOO_CORRELATED. If today's slot is free, the best remaining one
-  (highest fitness) is submitted. If BRAIN can't be reached or the submit itself fails, the alpha stays
+  become too similar is marked TOO_CORRELATED. If today's slot is free, the best remaining one goes in,
+  as the rules below allow. If BRAIN can't be reached or the submit itself fails, the alpha stays
   queued for the next run. Re-checking stops after HELD_CHECK_BUDGET_SECONDS (default 300) per run.
 - Auto-flip: when an alpha scores Sharpe -1.0 or worse, the loop also tests reverse(<expression>)
   right after it (up to MAX_FLIPS_PER_ROUND per round, default 3), since a strongly negative signal
@@ -104,10 +105,17 @@ READ BEFORE YOU RUN THIS:
   fitness >= STRONG_MIN_FITNESS (1.3) and annual returns above its worst drawdown (STRONG_MIN_RETURNS_TO_DRAWDOWN,
   1.0; 0 turns that part off). A strong alpha goes in straight away; one that only clears BRAIN's bar is held
   ("not strong"). Held alphas are ranked strong first, then by fitness, on BRAIN's latest numbers. If nothing
-  has gone in by the end of the usual MAX_ROUNDS rounds - or the run stops early, or a --try run ends - the run
-  settles: the best held alpha that clears BRAIN's bar goes in, so the day still counts. Submissions beyond the
-  day's first must be strong. Returns and drawdown are saved in the results file (an older file gets the two
-  columns added once) and shown to the generator, which is told the strong targets.
+  has gone in by the end of the usual MAX_ROUNDS rounds - or the run stops early, or a --try run ends, or BRAIN's
+  day is about to end - the run settles: the end-of-day pick, the least similar held alpha that clears BRAIN's
+  bar, goes in, so the day still counts. Submissions beyond the day's first must be strong. Returns and drawdown
+  are saved in the results file (an older file gets the two columns added once) and shown to the generator,
+  which is told the strong targets.
+- Near-copies: BRAIN accepts self-correlation up to 0.7, but every submission except the end-of-day pick must be
+  under DAYTIME_MAX_SELF_CORRELATION (default 0.5) - a strong alpha straight away, an extra one, a held one.
+  Near-copies of your own alphas add little to a combined score and keep your submissions looking alike. One
+  in between - or one whose similarity BRAIN didn't report in time - is held instead, labelled "somewhat
+  similar", and can still be the end-of-day pick, which goes least similar first. So the day's submission never
+  waits on this rule. DAYTIME_MAX_SELF_CORRELATION=0.7 turns it off.
 - --backup, for a second scheduled run later in the day: if today's submission is already in and the
   reserve is full, it stops after re-checking the held queue; otherwise it mines like a normal run.
 - Before/after check: before each submission, and for each alpha it holds, the loop asks BRAIN's free
@@ -226,6 +234,10 @@ SUBMIT_MIN_FITNESS = 1.0
 # BRAIN's accepted turnover range: 1% to 70% of the book traded per day (reported as 0.01 to 0.70).
 TURNOVER_MIN, TURNOVER_MAX = 0.01, 0.70
 MAX_SELF_CORRELATION = 0.7  # BRAIN rejects a submission this correlated with your already-submitted alphas
+# Stricter than BRAIN: every submission except the end-of-day pick (the one that keeps the day's streak) must be
+# under this. Near-copies of your own alphas add little to a combined score and keep your alphas looking alike.
+# One between this and 0.7 is held - it can still be an end-of-day pick, least similar first. 0.7 turns it off.
+DAYTIME_MAX_SELF_CORRELATION = float(os.environ.get("DAYTIME_MAX_SELF_CORRELATION", 0.5))
 CORR_POLL_MAX_SECONDS = int(os.environ.get("CORR_POLL_MAX_SECONDS", 300))
 SUBMIT_POLL_MAX_SECONDS = int(os.environ.get("SUBMIT_POLL_MAX_SECONDS", 600))
 CORRELATION_URL = "https://api.worldquantbrain.com/alphas/{alpha_id}/correlations/self"
@@ -326,6 +338,7 @@ HELD_PREFIX = "QUALIFIED_NOT_SUBMITTED"
 HELD_LABEL = f"{HELD_PREFIX} (daily cap reached)"  # cleared the bar, waiting for a free submission slot
 HELD_RETRY_LABEL = f"{HELD_PREFIX} (submit didn't go through - tried again next run)"
 HELD_FOR_STRONGER_LABEL = f"{HELD_PREFIX} (not strong - kept in case a stronger one turns up)"
+HELD_SIMILAR_LABEL = f"{HELD_PREFIX} (somewhat similar to your submitted alphas - kept for an end-of-day pick)"
 REPLACE_ATTEMPTS = 5  # Windows blocks swapping in the updated CSV while another program is reading it
 HELD_CHECK_BUDGET_SECONDS = int(os.environ.get("HELD_CHECK_BUDGET_SECONDS", 300))  # per run, for re-checking held alphas
 
@@ -1334,6 +1347,31 @@ def too_similar(corr) -> bool:
     return corr is not None and corr >= MAX_SELF_CORRELATION
 
 
+def daytime_limit() -> float:
+    return min(DAYTIME_MAX_SELF_CORRELATION, MAX_SELF_CORRELATION)
+
+
+def end_of_day_pick() -> bool:
+    """Whether the submission being decided now is the end-of-day pick: today's first, once the run has settled
+    (no strong alpha went in during the usual rounds, or BRAIN's day is about to end). That one keeps the streak."""
+    return SETTLING and submissions_today() == 0
+
+
+def similar_for_now(corr) -> bool:
+    """Under BRAIN's limit, but not under DAYTIME_MAX_SELF_CORRELATION, which every submission except the end-of-day
+    pick must be - or unreadable while that limit applies, since then it can't be shown to be under it. Such an
+    alpha is held rather than submitted now: it can still be an end-of-day pick."""
+    if too_similar(corr) or daytime_limit() >= MAX_SELF_CORRELATION or end_of_day_pick():
+        return False
+    return corr is None or corr >= daytime_limit()
+
+
+def daytime_note() -> str:
+    """' with self-correlation under 0.5' while the stricter limit is on, '' when it's off."""
+    limit = daytime_limit()
+    return f" with self-correlation under {limit:g}" if limit < MAX_SELF_CORRELATION else ""
+
+
 def try_submit(session, alpha_id: str, corr=_UNCHECKED) -> str:
     """Pre-check self-correlation (unless the caller just did), submit, wait for the verdict.
     Returns the CSV 'submitted' value."""
@@ -2030,15 +2068,17 @@ def why_held(expression, strong=True) -> str:
 
 
 def settle_for_today(session):
-    """No strong alpha has gone in today: from now on the best one that clears BRAIN's bar may, so the day
-    still counts. Submits the best held alpha straight away, if there's one."""
+    """No strong alpha has gone in today: from now on any good one that clears BRAIN's bar may, so the day
+    still counts - the end-of-day pick, held to BRAIN's own similarity limit only. Submits the least similar
+    held alpha straight away, if there's one."""
     global SETTLING
     if MAX_SUBMISSIONS_PER_DAY < 1 or submissions_today() > 0:
         return
     if not SETTLING:
         SETTLING = True
-        logger.info("No strong alpha has gone in today - from now on the best one that clears BRAIN's bar (Sharpe "
-                    "%s, fitness %s) goes in, so the day still counts.", SUBMIT_MIN_SHARPE, SUBMIT_MIN_FITNESS)
+        logger.info("No strong alpha has gone in today - from now on one that clears BRAIN's bar (Sharpe %s, "
+                    "fitness %s) goes in, so the day still counts: the least similar held one first, or else the "
+                    "next good one found.", SUBMIT_MIN_SHARPE, SUBMIT_MIN_FITNESS)
     submit_held(session)
 
 
@@ -2074,6 +2114,14 @@ def held_candidates() -> list:
             decided.add(alpha_id)
     waiting = [r for alpha_id, r in held.items() if alpha_id not in decided]
     return sorted(waiting, key=strength, reverse=True)
+
+
+def end_of_day_order(item) -> tuple:
+    """Sort key for the end-of-day pick, from a (row, self-correlation, latest numbers) entry: the least similar
+    to your submitted alphas first, an unreadable reading last, the stronger alpha first between equals."""
+    _, corr, latest = item
+    strong, fitness, sharpe = strength(latest)
+    return corr is None, corr if corr is not None else 0.0, not strong, -fitness, -sharpe
 
 
 def mark_held(alpha_id: str, outcome: str):
@@ -2129,9 +2177,9 @@ def _submit_held(session):
     """Re-check every held alpha with BRAIN - including its free similarity check, which grows stricter
     as you submit more - so the queue only keeps alphas that could still be submitted. The ones that pass
     are counted in the reserve. Then, best first (strong ones, then by fitness, on BRAIN's latest numbers): if
-    nothing is in for today, a strong one is submitted - or the best one once the run settles; more only as
-    may_submit() allows. Checking stops after HELD_CHECK_BUDGET_SECONDS; anything not checked yet waits for
-    the next run."""
+    nothing is in for today, a strong one under DAYTIME_MAX_SELF_CORRELATION is submitted - or, once the run
+    settles, the least similar one (the end-of-day pick); more only as may_submit() and that limit allow.
+    Checking stops after HELD_CHECK_BUDGET_SECONDS; anything not checked yet waits for the next run."""
     queue = held_candidates()
     if not queue:
         return None
@@ -2139,13 +2187,13 @@ def _submit_held(session):
     if done >= MAX_SUBMISSIONS_PER_DAY:
         plan = "Today's limit is used, so they wait for BRAIN's next day (3 AM US Eastern)."
     elif done == 0 and SETTLING:
-        plan = "Nothing is submitted for today yet, so the best one goes in."
+        plan = "Nothing is submitted for today yet, so the least similar good one goes in."
     elif done == 0:
-        plan = (f"Nothing is submitted for today yet - a strong one ({strong_note()}) goes in now; the others "
-                f"wait until the usual rounds are done, in case a stronger one turns up.")
+        plan = (f"Nothing is submitted for today yet - a strong one ({strong_note()}){daytime_note()} goes in now; "
+                f"the others wait until the usual rounds are done, in case a better one turns up.")
     else:
-        plan = (f"Today's submission is in - another goes in only if {RESERVE_TARGET}+ other kinds of good "
-                f"alpha would still be waiting for the coming days.")
+        plan = (f"Today's submission is in - another goes in only if it's strong{daytime_note()} and "
+                f"{RESERVE_TARGET}+ other kinds of good alpha would still be waiting for the coming days.")
     logger.info("%d held alpha(s) - checking they're still worth submitting. %s", len(queue), plan)
 
     # 1. Check them all (best first), so the reserve is known before anything is submitted.
@@ -2208,8 +2256,10 @@ def _submit_held(session):
                       returns=is_stats.get("returns"), drawdown=is_stats.get("drawdown"))
         good.append((row, corr, latest))
 
-    # 2. Submit, best first, as far as today allows.
+    # 2. Submit, best first, as far as today allows - least similar first for the end-of-day pick.
     good.sort(key=lambda g: strength(g[2]), reverse=True)
+    if end_of_day_pick():
+        good.sort(key=end_of_day_order)
     if good and submissions_today() == 0 and not SETTLING and not row_is_strong(good[0][2]):
         logger.info("None of the held alphas is strong (%s) - they wait until the usual rounds are done, in case "
                     "a stronger one turns up.", strong_note())
@@ -2220,7 +2270,14 @@ def _submit_held(session):
             waiting += 1  # still a good candidate - stays queued
             continue
         if len(RESERVE.landed) > landed_before:
-            corr = _UNCHECKED  # checked before today's submission went in - ask BRAIN again
+            corr = self_correlation_max(session, alpha_id)  # checked before today's submission went in - ask again
+        if similar_for_now(corr):
+            reading = (f"its self-correlation is {corr:.2f}" if corr is not None
+                       else "its self-correlation couldn't be read")
+            logger.info("Held alpha %s could go in, but %s - only alphas%s go in before the end-of-day pick. It "
+                        "stays queued: it can still be that pick.", alpha_id, reading, daytime_note())
+            waiting += 1
+            continue
         outcome = try_submit(session, alpha_id, corr=corr)
         if outcome.startswith("FAILED"):
             logger.warning("Held alpha %s stays queued - the submit didn't go through.", alpha_id)
@@ -2292,6 +2349,19 @@ def fail(row, error) -> dict:
     return row
 
 
+def hold_similar(session, row, alpha_id, corr):
+    """An alpha that could go in now, but whose self-correlation is under BRAIN's limit and not under
+    DAYTIME_MAX_SELF_CORRELATION (or couldn't be read): held, so it can still be an end-of-day pick."""
+    reading = f"its self-correlation is {corr:.2f}" if corr is not None else "its self-correlation couldn't be read"
+    logger.info("Alpha %s qualifies, but %s - only alphas%s go in before the end-of-day pick. Holding it: it can "
+                "still be that pick (BRAIN's own limit is %.1f).", alpha_id, reading, daytime_note(),
+                MAX_SELF_CORRELATION)
+    row["submitted"] = HELD_SIMILAR_LABEL
+    if corr is not None:
+        RESERVE.keep(alpha_id, row["expression"])
+    record_before_after(session, alpha_id, "held as somewhat similar")
+
+
 def finish_idea(session, row, alpha_id) -> dict:
     """A simulation finished: read BRAIN's result, log it, and submit the alpha if it qualifies."""
     expression = row["expression"]
@@ -2334,14 +2404,18 @@ def finish_idea(session, row, alpha_id) -> dict:
                     RESERVE.keep(alpha_id, expression)
                 record_before_after(session, alpha_id, "held for now" if for_today else "held for a coming day")
         else:
-            outcome = try_submit(session, alpha_id)
-            if outcome.startswith("FAILED"):
-                logger.warning("Holding %s so the submit is tried again (before the next extra round, or "
-                               "next run) instead of losing it.", alpha_id)
-                outcome = HELD_RETRY_LABEL
-            elif landed(outcome):
-                RESERVE.note_landed(alpha_id, expression)
-            row["submitted"] = outcome
+            corr = self_correlation_max(session, alpha_id)  # the same free check try_submit makes first
+            if similar_for_now(corr):
+                hold_similar(session, row, alpha_id, corr)
+            else:
+                outcome = try_submit(session, alpha_id, corr=corr)
+                if outcome.startswith("FAILED"):
+                    logger.warning("Holding %s so the submit is tried again (before the next extra round, or "
+                                   "next run) instead of losing it.", alpha_id)
+                    outcome = HELD_RETRY_LABEL
+                elif landed(outcome):
+                    RESERVE.note_landed(alpha_id, expression)
+                row["submitted"] = outcome
 
     append_result(row)
     logger.info("  %s -> sharpe=%s fitness=%s turnover=%s checks=%s/%s submitted=%s", expression,
@@ -2938,8 +3012,9 @@ def run(args):
                 "%d submission(s)/day max.", MAX_ROUNDS, IDEAS_PER_ROUND, MAX_ROUNDS * IDEAS_PER_ROUND,
                 PARALLEL_SIMULATIONS, MAX_RUNTIME_SECONDS, MAX_SUBMISSIONS_PER_DAY)
     if MAX_SUBMISSIONS_PER_DAY > 0:
-        logger.info("Strong alphas (%s) go in first. If none has by the end of the %d rounds, the best one that "
-                    "clears BRAIN's bar goes in, so the day still counts.", strong_note(), MAX_ROUNDS)
+        logger.info("Strong alphas (%s)%s go in first. If none has by the end of the %d rounds, the least similar "
+                    "one that clears BRAIN's bar goes in, so the day still counts.", strong_note(), daytime_note(),
+                    MAX_ROUNDS)
         logger.info("Every day counts: with nothing submitted for today after %d rounds, up to %d more rounds "
                     "until something lands.%s", MAX_ROUNDS, MAX_EXTRA_ROUNDS,
                     f" A submission beyond today's first must be strong, with {RESERVE_TARGET}+ other kinds of good "
