@@ -14,6 +14,9 @@ Run from the alpha-miner folder (it uses the same .env and saved session as alph
                                          # next to someone on the default, so you work on different data
                                          # and your alphas don't come out as near-copies of each other
     --per-dataset N and --min-users N change those two limits (0 turns either off), with or without --least-used.
+    python fetch_fields.py --least-used --leave-out option8,option9,news18
+                                         # leave whole datasets out (ids as the last line of each run lists them):
+                                         # for data whose alphas keep failing BRAIN's big-stocks check
     To go back, run it again without --least-used, or copy operators.json.bak over operators.json.
 
 It writes three files:
@@ -114,8 +117,9 @@ def describe(field):
     return f"{text} [{source}]" if source else text
 
 
-def usable_fields(matrix, min_coverage, min_users=0):
-    return [f for f in matrix if (f.get("coverage") or 0) >= min_coverage and popularity(f)[0] >= min_users]
+def usable_fields(matrix, min_coverage, min_users=0, leave_out=()):
+    return [f for f in matrix if (f.get("coverage") or 0) >= min_coverage and popularity(f)[0] >= min_users
+            and dataset_of(f).lower() not in leave_out]
 
 
 def least_used_first(fields):
@@ -148,13 +152,14 @@ def spread_over_datasets(ordered, top, per_dataset):
     return taken + held[:top - len(taken)]
 
 
-def select_fields(matrix, groups, top, min_coverage, skip=0, least_used=False, per_dataset=0, min_users=0):
+def select_fields(matrix, groups, top, min_coverage, skip=0, least_used=False, per_dataset=0, min_users=0,
+                  leave_out=()):
     """Most-used fields first: popular fields are well understood and well covered. skip leaves out that
     many of the most-used ones first, so the selection is the fields ranked skip+1 to skip+top.
     least_used turns the order round: the fields fewest people use first (skip then leaves out that many of
     the least-used). per_dataset caps how many come from one dataset; min_users leaves out fields fewer
-    people than that have used."""
-    usable = usable_fields(matrix, min_coverage, min_users)
+    people than that have used; leave_out (lower-case dataset ids) leaves whole datasets out."""
+    usable = usable_fields(matrix, min_coverage, min_users, leave_out)
     ordered = least_used_first(usable) if least_used else sorted(usable, key=popularity, reverse=True)
     chosen = spread_over_datasets(ordered[skip:], top, per_dataset)
     names = {f["id"] for f in chosen}
@@ -170,7 +175,7 @@ def select_fields(matrix, groups, top, min_coverage, skip=0, least_used=False, p
     return entries
 
 
-def selection_note(top, skip=0, least_used=False, per_dataset=0, min_users=0) -> str:
+def selection_note(top, skip=0, least_used=False, per_dataset=0, min_users=0, leave_out=()) -> str:
     """How the fields were picked, in words, for operators.json's _fields_note."""
     if least_used:
         which = f"the {top} least-used fields" + (f" after the {skip} least-used" if skip else "")
@@ -183,6 +188,8 @@ def selection_note(top, skip=0, least_used=False, per_dataset=0, min_users=0) ->
         which += f", at most {per_dataset} from any one dataset"
     if min_users > 0:
         which += f", each used by at least {min_users} people"
+    if leave_out:
+        which += f", leaving out the datasets {', '.join(sorted(leave_out))}"
     return which
 
 
@@ -210,13 +217,13 @@ def current_field_names(path=None) -> list:
 
 
 def usage_summary(names, matrix):
-    """(fewest users, most users, datasets) over these fields, leaving out the basics - None if BRAIN listed none."""
+    """(fewest users, most users, dataset ids) over these fields, leaving out the basics - None if BRAIN listed none."""
     by_id = {f.get("id"): f for f in matrix}
     found = [by_id[n] for n in names if n in by_id and n not in ALWAYS_INCLUDE]
     if not found:
         return None
     users = [popularity(f)[0] for f in found]
-    return min(users), max(users), len({dataset_of(f) for f in found})
+    return min(users), max(users), sorted({dataset_of(f) for f in found})
 
 
 def fetch_everything(session):
@@ -246,7 +253,11 @@ def main(argv=None):
     parser.add_argument("--min-users", type=int, default=None, metavar="N",
                         help=f"leave out fields fewer than N people have used (default {MIN_USERS} with --least-used, "
                              f"0 otherwise)")
+    parser.add_argument("--leave-out", default="", metavar="DATASETS",
+                        help="dataset ids to leave out, comma-separated - e.g. option8,option9,news18 (each run's last "
+                             "lines name the datasets it used)")
     args = parser.parse_args(argv)
+    leave_out = {d.strip().lower() for d in args.leave_out.split(",") if d.strip()}
     per_dataset = args.per_dataset if args.per_dataset is not None else (MAX_PER_DATASET if args.least_used else 0)
     min_users = args.min_users if args.min_users is not None else (MIN_USERS if args.least_used else 0)
 
@@ -267,7 +278,11 @@ def main(argv=None):
         {"fetched_at": f"{datetime.now():%Y-%m-%d %H:%M:%S}", "scope": SCOPE,
          "matrix_fields": matrix, "group_fields": groups}, ensure_ascii=False), encoding="utf-8")
 
-    usable = len(usable_fields(matrix, args.min_coverage, min_users))
+    known = {dataset_of(f).lower() for f in matrix}
+    for name in sorted(leave_out - known):
+        logger.warning("No dataset called %s among the fields BRAIN lists for you - check the spelling. Datasets: %s.",
+                       name, ", ".join(sorted(known)))
+    usable = len(usable_fields(matrix, args.min_coverage, min_users, leave_out))
     if args.skip > 0 and usable <= args.skip:
         logger.error("Only %d fields have coverage >= %s%s on this account, so --skip %d leaves none. "
                      "operators.json is unchanged - try a smaller --skip.", usable, args.min_coverage,
@@ -275,12 +290,14 @@ def main(argv=None):
         sys.exit(1)
     before = usage_summary(current_field_names(), matrix)
     entries = select_fields(matrix, groups, args.top, args.min_coverage, args.skip,
-                            least_used=args.least_used, per_dataset=per_dataset, min_users=min_users)
+                            least_used=args.least_used, per_dataset=per_dataset, min_users=min_users,
+                            leave_out=leave_out)
     if not entries:
         logger.error("BRAIN returned no usable fields. operators.json is unchanged.")
         sys.exit(1)
     write_operators(entries, args.top, args.min_coverage, skip=args.skip,
-                    which=selection_note(args.top, args.skip, args.least_used, per_dataset, min_users))
+                    which=selection_note(args.top, args.skip, args.least_used, per_dataset, min_users,
+                                         leave_out & known))
     if args.skip > 0 and args.least_used:
         logger.info("Left out the %d least-used fields.", args.skip)
     elif args.skip > 0:
@@ -291,8 +308,9 @@ def main(argv=None):
     after = usage_summary([e["name"] for e in entries if not e["description"].startswith("group field")], matrix)
     if after:
         logger.info("The new fields come from %d dataset(s), and %s-%s people have used each of them%s.",
-                    after[2], f"{after[0]:,}", f"{after[1]:,}",
+                    len(after[2]), f"{after[0]:,}", f"{after[1]:,}",
                     f" (the previous list: {before[0]:,}-{before[1]:,})" if before else "")
+        logger.info("Datasets: %s.", ", ".join(after[2]))
     logger.info("First few: %s", ", ".join(e["name"] for e in entries[:12]))
 
 

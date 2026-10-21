@@ -2012,6 +2012,30 @@ def test_round_leaves_out_rejected_names_and_dead_ends(tmp_path):
     in_tmp(tmp_path, run)
 
 
+def test_ideas_using_fields_off_your_list_are_skipped(tmp_path):
+    def run():
+        Path(al.FIELDS_CACHE_FILE).write_text(json.dumps({"matrix_fields": [
+            {"id": name, "dataset": {"id": dataset}} for name, dataset in
+            (("sales", "fundamental6"), ("assets", "fundamental6"), ("implied_volatility_call_90", "option8"),
+             ("cap", "pv1"))]}), encoding="utf-8")
+        returned = [{"expression": "rank(divide(implied_volatility_call_90, assets))", "rationale": "r"},  # remembered
+                    {"expression": "rank(divide(sales, assets))", "rationale": "r"},
+                    {"expression": "group_rank(divide(sales, cap), sector)", "rationale": "r"}]     # cap: basic data
+        client = MagicMock()
+        client.models.generate_content.return_value = fake_gemini_response(returned)
+        brain = SlowBrain({"rank(divide(sales, assets))": calm(), "group_rank(divide(sales, cap), sector)": calm()})
+        operators = [{"name": n, "usage": f"{n}(...)"} for n in ("rank", "divide", "group_rank")]
+        fields = [{"name": n, "description": "d"} for n in ("sales", "assets")]
+        with patch("time.sleep"), captured_logs() as lines:
+            rows = al.run_round(brain.session, client, operators, fields, SETTINGS, "e@x.com", "pw", 1, "round 1", set())
+        assert [r["expression"] for r in rows] == ["rank(divide(sales, assets))", "group_rank(divide(sales, cap), sector)"]
+        assert any("Skipped 1 idea(s) using fields that aren't on your field list (implied_volatility_call_90)" in l
+                   for l in lines), lines
+        Path(al.FIELDS_CACHE_FILE).unlink()          # without BRAIN's field list nothing can be told apart
+        assert al.off_list_fields("rank(divide(implied_volatility_call_90, assets))", {"sales"}) == set()
+    in_tmp(tmp_path, run)
+
+
 # ---- Auto-sharpen slow near-misses; log the checks we can't fix ----
 
 import contextlib

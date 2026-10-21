@@ -180,6 +180,40 @@ def test_main_least_used_writes_the_rarest_says_so_and_compares_usage():
     assert any("10-14 people have used each" in s and "previous list: 1,026-1,029" in s for s in said), said
 
 
+def test_leave_out_drops_whole_datasets_but_keeps_the_basics():
+    matrix = ([field(f"o{i}", users=10 + i, dataset="option8") for i in range(3)]
+              + [field(f"a{i}", users=50 + i, dataset="analyst4") for i in range(3)]
+              + [field("close", users=60000, dataset="pv1")])
+    names = [e["name"] for e in ff.select_fields(matrix, [], top=3, min_coverage=0.8, least_used=True,
+                                                 leave_out={"option8", "pv1"})]
+    assert names == ["a0", "a1", "a2", "close"]               # no option8 field; close stays as a basic
+    assert len(ff.usable_fields(matrix, 0.8, leave_out={"option8"})) == 4
+
+
+def test_main_leave_out_says_so_names_the_datasets_and_flags_typos():
+    fields = ([field(f"o{i}", users=10 + i, dataset="option8") for i in range(5)]
+              + [field(f"n{i}", users=20 + i, dataset="news18") for i in range(5)]
+              + [field(f"a{i}", users=30 + i, dataset="analyst4") for i in range(5)] + [field("close", users=60000)])
+    with tempfile.TemporaryDirectory() as d:
+        shutil.copyfile(HERE / "operators.json", Path(d) / "operators.json")
+        cwd = os.getcwd()
+        os.chdir(d)
+        try:
+            with patch.object(al, "get_authenticated_session", return_value=paged_session(fields)), \
+                 patch("time.sleep"), patch.object(ff.logger, "info") as info, patch.object(ff.logger, "warning") as warn:
+                ff.main(["--top", "4", "--least-used", "--leave-out", "Option8, news18,optoin9"])
+            ref = json.loads(Path("operators.json").read_text(encoding="utf-8"))
+        finally:
+            os.chdir(cwd)
+    names = [f["name"] for f in ref["fields"]]
+    assert names[:4] == ["a0", "a1", "a2", "a3"]               # case and spaces don't matter
+    assert "leaving out the datasets news18, option8" in ref["_fields_note"]
+    said = [c.args[0] % c.args[1:] for c in info.call_args_list]
+    assert "Datasets: analyst4." in said, said
+    warned = [c.args[0] % c.args[1:] for c in warn.call_args_list]
+    assert any("No dataset called optoin9" in w and "analyst4, news18, option8, pv1" in w for w in warned), warned
+
+
 def test_the_usual_most_used_list_has_no_per_dataset_limit():
     fields = [field(f"m{i}", users=100 + i) for i in range(20)] + [field("close")]   # all one dataset
     with tempfile.TemporaryDirectory() as d:

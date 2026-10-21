@@ -134,7 +134,9 @@ READ BEFORE YOU RUN THIS:
   read back from the results file, removed from what the generator sees, and ideas still using it are
   dropped before they cost a simulation. Fields tried DEAD_END_MIN_TRIES (default 8) times without
   fitness reaching DEAD_END_MAX_FITNESS (default 0.5) are left out the same way; basic price/volume
-  fields (close, volume, returns...) are exempt.
+  fields (close, volume, returns...) are exempt. Ideas using a data field BRAIN offers you that your field list
+  (operators.json) leaves out are skipped too - usually old fields the generator remembers from your best past
+  results; it needs data_fields_cache.json (from fetch_fields.py) to tell fields from other words.
 - Variety: alphas built on the same kind of data usually come back too correlated to submit. Each
   field is labelled with its data type - BRAIN's own category from data_fields_cache.json (written by
   fetch_fields.py), or the dataset name in operators.json without it. The generator is told which types
@@ -1856,6 +1858,15 @@ def data_fields_in(expression: str) -> list:
     return found
 
 
+def off_list_fields(expression: str, listed) -> set:
+    """Data fields BRAIN offers you (data_fields_cache.json) that this expression uses although your field list
+    (`listed`, from operators.json) leaves them out. Basic price/volume fields always count as listed; without the
+    cache file nothing can be told apart, so nothing is reported."""
+    known = field_datasets()
+    return {name for _, _, name in data_fields_in(expression)
+            if name in known and name not in listed and name not in BASIC_FIELDS}
+
+
 def field_exists(name: str) -> bool:
     """Whether BRAIN listed this data field for your account (data_fields_cache.json from fetch_fields.py)."""
     try:
@@ -2770,6 +2781,17 @@ def run_round(session, client, operators, fields, settings, email, password, rou
         if len(usable) < len(ideas):
             logger.info("Skipped %d idea(s) using names BRAIN rejected or dead-end fields.", len(ideas) - len(usable))
         ideas = usable
+    listed, strays, on_list = {f.get("name") for f in fields}, Counter(), []
+    for expression, rationale in ideas:
+        off = off_list_fields(expression, listed)
+        strays.update(off)
+        if not off:
+            on_list.append((expression, rationale))
+    if strays:
+        logger.info("Skipped %d idea(s) using fields that aren't on your field list (%s) - old data the generator "
+                    "remembers from past results.", len(ideas) - len(on_list),
+                    ", ".join(name for name, _ in strays.most_common(4)))
+    ideas = on_list
     if rules:
         fresh_ideas = []
         for expression, rationale in ideas:
