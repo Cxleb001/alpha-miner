@@ -73,23 +73,26 @@ READ BEFORE YOU RUN THIS:
   Fitness divides by turnover, so trading less can lift it over the bar. The same goes for a strong Sharpe
   whose fitness misses the strong bar: with no failed check, turnover over SMOOTH_TOWARD_STRONG_MIN_TURNOVER
   (0.15), and fitness that would reach STRONG_MIN_FITNESS at BRAIN's 12.5% turnover floor with the same returns.
-- Auto-repair: an alpha with Sharpe and fitness over the bar that FAILs one of BRAIN's fixable checks
-  gets up to MAX_REPAIRS_PER_ALPHA (default 2) repaired versions tested right after it, at most
-  MAX_REPAIRS_PER_ROUND (default 4) per round: CONCENTRATED_WEIGHT -> rank(...) or ts_backfill on its data
-  fields; LOW_SUB_UNIVERSE_SHARPE -> rank within subindustry, neutralize against market-cap buckets, or trade
-  the most liquid stocks on a faster version of the signal and the rest on a slower one;
-  LOW_TURNOVER -> drop the outer ts_decay_linear. Repairs follow community write-ups of BRAIN's checks,
-  and BRAIN's own result decides whether each worked. Fixes already tried are skipped, so a near-miss gets
-  the next ones on a later run. An alpha whose Sharpe among the biggest stocks is under SUB_UNIVERSE_HOPELESS_SHARE
-  (a third) of what BRAIN needs there isn't repaired at all: the signal barely works there, and no fix closes a
-  gap that size. If the original is already too similar to your
-  submitted alphas, it isn't repaired (the repair would be too). A near-miss failing a check with no
-  automatic fix gets a log line naming that check, with BRAIN's value and limit for it when BRAIN gives them.
+- Auto-blend: an alpha with Sharpe >= 1.25 that misses only on fitness - usually a fast signal that trades too
+  much - is re-tested added to one of your best slow alphas built on other data: rank(<expression>) + rank(<slow>).
+  Two unrelated signals added together trade about half as much and usually beat both on Sharpe and fitness. A slow
+  partner is one of your results that cleared BRAIN's bar with every check but similarity passed, passed the
+  big-stocks check on BRAIN's numbers and trades under BLEND_PARTNER_MAX_TURNOVER (15%), using data from datasets on
+  your field list; the best Sharpe goes first, one per kind of data. Up to MAX_BLENDS_PER_ALPHA (default 2) blends
+  per alpha and MAX_BLENDS_PER_ROUND (default 4) per round, after the free similarity check: an original that's
+  already too similar to your submitted alphas isn't blended. An alpha that failed the big-stocks check isn't
+  blended either - a partner doesn't make a small-stocks idea work in big ones. (This replaced the old auto-repair:
+  its 307 tests on your account - finer groups, size buckets, the liquid/illiquid split, rank or ts_backfill - never
+  produced an alpha that passed every check, and repairs of repairs grew past BRAIN's 64-operator limit.)
+  A strong alpha failing a check still gets a log line naming it, with BRAIN's value and limit when BRAIN gives them.
 - Auto-sharpen: an alpha with Sharpe >= 1.25 but fitness under 1.0 whose turnover is already under 12.5%
   - where BRAIN's fitness formula stops giving credit for trading less - is re-tested without its outer
   ts_decay_linear/hump (up to MAX_SHARPENS_PER_ROUND, default 3), after the same free similarity check.
-- Each normal run starts by re-examining up to MAX_PAST_REPAIRS (default 8) earlier near-misses whose
-  repairs or sharpening haven't been tried.
+- Each normal run starts with earlier near-misses: up to MAX_PAST_BLENDS (default 3) that missed only on fitness
+  (with BRAIN's big-stocks numbers on file and passing) get the blends not tried yet, best Sharpe first, and up to
+  MAX_PAST_SHARPENS (default 3) slow ones get sharpened.
+- Operator limit: BRAIN refuses an expression with more than 64 operators (every function call and every
+  + - * / or comparison counts). Longer ideas are skipped before they're sent.
 - Never miss a day (the Gold leaderboard counts the days you submitted on): a normal run that still has
   nothing submitted for today after MAX_ROUNDS keeps going - up to MAX_EXTRA_ROUNDS (default 10) more rounds,
   within the MAX_RUNTIME_SECONDS cap - and stops as soon as one lands. Before each extra round the held
@@ -133,7 +136,8 @@ READ BEFORE YOU RUN THIS:
 - Learning what doesn't work: any operator or field BRAIN rejects ('unknown variable/operator') is
   read back from the results file, removed from what the generator sees, and ideas still using it are
   dropped before they cost a simulation. Fields tried DEAD_END_MIN_TRIES (default 8) times without
-  fitness reaching DEAD_END_MAX_FITNESS (default 0.5) are left out the same way; basic price/volume
+  fitness reaching DEAD_END_MAX_FITNESS (default 0.5) are left out the same way - not counting results that failed
+  the big-stocks check, so data whose only good scores come from small stocks is left out too; basic price/volume
   fields (close, volume, returns...) are exempt. Ideas using a data field BRAIN offers you that your field list
   (operators.json) leaves out are skipped too - usually old fields the generator remembers from your best past
   results; it needs data_fields_cache.json (from fetch_fields.py) to tell fields from other words.
@@ -170,17 +174,21 @@ READ BEFORE YOU RUN THIS:
   settles straight away - the end-of-day pick goes in - instead of waiting for a strong one it may not have
   time to find.
 - Big-stocks check: BRAIN's numbers for it (the alpha's Sharpe among the largest stocks, and the limit there) are
-  saved in the results file (sub_universe_sharpe, sub_universe_limit; an earlier near-miss gets them filled in
-  when it's next looked at). The generator is told which ideas failed it - one example per idea, with every
+  saved in the results file (sub_universe_sharpe, sub_universe_limit). The generator is told which ideas failed it - one example per idea, with every
   version of it (other windows, maturities, groups, smoothing or fixes) counting as the same idea - and asked to
   stop writing new versions of them, and those results are marked in the "best results" list it learns from.
 - Padding: ideas like divide(x, add(y, 0.0001)) - a tiny number added so a division can't hit zero - are
   tested without it. Every alpha with it came back with an extra check that didn't PASS (BRAIN's units check:
   unitHandling is VERIFY, and a plain number has no units), and the loop only submits alphas whose every check
-  passes. Follow-ups and repairs are built on the expression without it, and two expressions that differ only
+  passes. Follow-ups and blends are built on the expression without it, and two expressions that differ only
   by padding count as the same idea when deciding what was already tried.
 - Memory across runs: every round, the generator sees your best MEMORY_TOP_N (default 10) results
-  from all runs so far (read from alpha_loop_results.csv), not just the last round.
+  from all runs so far (read from alpha_loop_results.csv), not just the last round. Results that failed the
+  big-stocks check aren't among them - they're listed separately as ideas not to rework.
+- What works: the generator is also shown which BRAIN datasets have produced alphas that passed every check on
+  your account, out of how many tests, which never have after DATA_SCORECARD_MIN_TESTS (10) tests, and the
+  recipes behind your best alphas: size groups, change measured against its usual size, 15-20 day smoothing,
+  fast-plus-slow blends.
 - operators.json holds the full base-tier operator list (66 operators) transcribed from
   your BRAIN account. Its "fields" list is still the small 8-field starter set - add the
   data fields your account can use to widen what the generator can propose.
@@ -311,25 +319,27 @@ SLEEP_GAP_SECONDS = 120  # a pause that ran this much over was the computer asle
 # goes in) instead of waiting for a strong one it may not have time to find.
 SETTLE_BEFORE_DAY_END_MINUTES = int(os.environ.get("SETTLE_BEFORE_DAY_END_MINUTES", 60))
 
-# Auto-repair: a strong alpha (Sharpe and fitness over the bar) failing a fixable check gets
-# re-tested with a known fix for that check. Each repair is one extra simulation.
-MAX_REPAIRS_PER_ALPHA = int(os.environ.get("MAX_REPAIRS_PER_ALPHA", 2))
-MAX_REPAIRS_PER_ROUND = int(os.environ.get("MAX_REPAIRS_PER_ROUND", 4))
-MAX_PAST_REPAIRS = int(os.environ.get("MAX_PAST_REPAIRS", 8))  # earlier near-misses re-examined per run
-# BRAIN's big-stocks check (LOW_SUB_UNIVERSE_SHARPE) re-runs an alpha on the largest, most liquid stocks and needs a
-# Sharpe there of about 0.43x its own. One that gets under this share of that limit barely works there at all, and
-# no fix closes a gap that size - so it isn't repaired.
-SUB_UNIVERSE_HOPELESS_SHARE = float(os.environ.get("SUB_UNIVERSE_HOPELESS_SHARE", 1 / 3))
+# Auto-blend: a good Sharpe held back only by fitness - usually a fast signal that trades too much - is re-tested
+# added to one of your best slow alphas on other data, rank(alpha) + rank(slow). Each blend is one extra simulation.
+MAX_BLENDS_PER_ALPHA = int(os.environ.get("MAX_BLENDS_PER_ALPHA", 2))
+MAX_BLENDS_PER_ROUND = int(os.environ.get("MAX_BLENDS_PER_ROUND", 4))
+MAX_PAST_BLENDS = int(os.environ.get("MAX_PAST_BLENDS", 3))  # earlier near-misses blended at the start of each run
+MAX_PAST_SHARPENS = int(os.environ.get("MAX_PAST_SHARPENS", 3))  # ...and earlier slow ones sharpened
+BLEND_PARTNER_MAX_TURNOVER = float(os.environ.get("BLEND_PARTNER_MAX_TURNOVER", 0.15))  # what counts as slow
+BLEND_FIXES = {"LOW_FITNESS", "HIGH_TURNOVER"}  # failed checks a blend can fix; any other failure rules it out
+# BRAIN refuses an expression with more operators than this: every function call and every + - * / or comparison.
+MAX_OPERATORS = 64
 SMALL_STOCKS_EXAMPLES = 8  # ideas that failed the big-stocks check, shown to the generator as ones not to rework
 # Auto-sharpen: below this turnover BRAIN's fitness formula gets no extra credit, so smoothing an alpha
 # that's already this slow only dampens its returns.
 FITNESS_TURNOVER_FLOOR = 0.125
 MAX_SHARPENS_PER_ROUND = int(os.environ.get("MAX_SHARPENS_PER_ROUND", 3))
-BACKFILL_DAYS = 120
 
 # Learning what doesn't work: names BRAIN rejected, and fields that never got close.
 DEAD_END_MIN_TRIES = int(os.environ.get("DEAD_END_MIN_TRIES", 8))
 DEAD_END_MAX_FITNESS = float(os.environ.get("DEAD_END_MAX_FITNESS", 0.5))
+# What works: datasets with at least this many tests are scored for the generator (alphas passing every check).
+DATA_SCORECARD_MIN_TESTS = int(os.environ.get("DATA_SCORECARD_MIN_TESTS", 10))
 BASIC_FIELDS = ("open", "high", "low", "close", "vwap", "volume", "returns", "adv20", "cap")  # never dropped
 
 # Variety: alphas built on the same kind of data tend to be too correlated to submit together.
@@ -795,16 +805,19 @@ def rejected_names() -> set:
 
 
 def dead_end_fields() -> dict:
-    """{field: (simulations, best fitness)} for fields tried DEAD_END_MIN_TRIES+ times without fitness
-    ever reaching DEAD_END_MAX_FITNESS. Basic price/volume fields are exempt - they're ingredients."""
+    """{field: (simulations, best fitness)} for fields tried DEAD_END_MIN_TRIES+ times without fitness ever reaching
+    DEAD_END_MAX_FITNESS - not counting results that failed the big-stocks check, so a field whose only good scores
+    came from small stocks is a dead end too (its best fitness is then None). Basic price/volume fields are exempt -
+    they're ingredients."""
     stats = {}
     for r in completed_history():
-        fitness = as_float(r.get("fitness"))
+        fitness = None if small_stocks_only(r) else as_float(r.get("fitness"))
         for name in {n for _, _, n in data_fields_in(r["expression"])}:
-            tries, best = stats.get(name, (0, fitness))
-            stats[name] = (tries + 1, max(best, fitness))
+            tries, best = stats.get(name, (0, None))
+            stats[name] = (tries + 1, best if fitness is None else fitness if best is None else max(best, fitness))
     return {name: (tries, best) for name, (tries, best) in stats.items()
-            if name not in BASIC_FIELDS and tries >= DEAD_END_MIN_TRIES and best < DEAD_END_MAX_FITNESS}
+            if name not in BASIC_FIELDS and tries >= DEAD_END_MIN_TRIES
+            and (best is None or best < DEAD_END_MAX_FITNESS)}
 
 
 def uses_any(expression: str, names) -> bool:
@@ -818,8 +831,9 @@ def avoid_note(rejected, dead: dict) -> str:
                      + ", ".join(sorted(rejected)) + ". (Write comparisons with >, <, == instead.)")
     if dead:
         lines.append(f"These fields were tried {DEAD_END_MIN_TRIES}+ times and never reached fitness "
-                     f"{DEAD_END_MAX_FITNESS}, so they're left out: "
-                     + ", ".join(f"{n} ({t} tries, best {b:.2f})" for n, (t, b) in sorted(dead.items())) + ".")
+                     f"{DEAD_END_MAX_FITNESS} outside small stocks, so they're left out: "
+                     + ", ".join(f"{n} ({t} tries, " + ("only small-stock results" if b is None else f"best {b:.2f}")
+                                 + ")" for n, (t, b) in sorted(dead.items())) + ".")
     return ("DON'T USE:\n" + "\n".join(f"- {line}" for line in lines)) if lines else ""
 
 
@@ -1067,12 +1081,16 @@ def pick_varied(ideas, type_map: dict, crowded: Counter, n: int, overused_shapes
 def build_feedback(last_round_rows=None) -> str:
     """What the generator sees each round: your best results across ALL runs so far, so a new run
     builds on what already worked instead of starting from scratch, plus how the last round went."""
-    history = completed_history()
+    history, datasets = completed_history(), listed_datasets()
+    # Small-stock results are listed apart, as ideas not to rework; data left off the field list can't be used.
+    usable = [r for r in history if not small_stocks_only(r) and on_listed_data(r["expression"], datasets)]
+    best = sorted(usable, key=lambda r: as_float(r["fitness"]), reverse=True)[:MEMORY_TOP_N]
     parts = []
-    if history:
-        best = sorted(history, key=lambda r: as_float(r["fitness"]), reverse=True)[:MEMORY_TOP_N]
+    if best:
         lines = [f"Your best results so far, out of {len(history)} simulated alphas across all runs "
-                 f"(best fitness first). Learn from what works here - the operators, lookback windows, "
+                 f"(best fitness first; ones that only worked in small stocks, or use data left off your field "
+                 f"list, are left out). "
+                 f"Learn from what works here - the operators, lookback windows, "
                  f"grouping and decay that score well, and what's holding each one back (usually fitness or "
                  f"turnover). But don't keep reusing the same data: a new alpha on the same data as one "
                  f"marked [submitted] or [queued] usually comes back too similar to submit."]
@@ -1113,8 +1131,9 @@ def generate_ideas(client: genai.Client, model: str, operators, fields, settings
         f"steady signals over ones that only work in one or two years. "
         f"High turnover also drags fitness down, so favour smoother signals: longer lookback windows, "
         f"ts_decay_linear, or hump. Ideas that scored a strongly negative Sharpe are re-tested reversed "
-        f"automatically, and promising ideas that trade too much are re-tested smoothed with "
-        f"ts_decay_linear, so don't spend ideas on negating or smoothing past results.\n\n"
+        f"automatically, promising ideas that trade too much are re-tested smoothed with "
+        f"ts_decay_linear, and ones that miss only on fitness are re-tested added to your best slow alphas, "
+        f"so don't spend ideas on negating, smoothing or blending past results.\n\n"
         f"{CHECKS_EXPLAINED}\n\n"
         f"{feedback_text}\n\n"
         f"Propose {n} NEW candidate expressions, genuinely different in shape from each "
@@ -1715,7 +1734,7 @@ def smoothing_could_make_it_strong(row) -> bool:
     """A strong Sharpe whose fitness misses the strong bar because it trades a lot: over
     SMOOTH_TOWARD_STRONG_MIN_TURNOVER, and at BRAIN's 12.5% fitness floor with the same returns its fitness would
     reach STRONG_MIN_FITNESS (fitness grows with the square root of the turnover it sheds). Only for alphas with
-    no failed check (repairs handle those) that aren't already submitted, rejected or too similar."""
+    no failed check (smoothing wouldn't fix those) that aren't already submitted, rejected or too similar."""
     sharpe, fitness, turnover = (as_float(row.get(k)) for k in ("sharpe", "fitness", "turnover"))
     if sharpe is None or fitness is None or turnover is None:
         return False
@@ -1772,14 +1791,10 @@ def padding_note(expression: str) -> str:
     return " without its padding" if strip_padding(expression) != expression else ""
 
 
-# ---- Auto-repair: strong alphas that fail one of BRAIN's fixable checks ----
-# Fixes follow community write-ups of BRAIN's checks (rank / ts_backfill for concentrated weight;
-# finer groups / no size tilt for weak sub-universe Sharpe). Each repair is one extra simulation,
-# and BRAIN's own result decides whether it worked.
+# ---- Reading expressions ----
 
 _QUOTED = re.compile(r"'[^']*'|\"[^\"]*\"")
 _WORD = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
-COARSE_GROUPS = ("market", "sector", "industry")
 NOT_FIELDS = {"true", "false", "nan", "inf"}
 
 
@@ -1867,70 +1882,18 @@ def off_list_fields(expression: str, listed) -> set:
             if name in known and name not in listed and name not in BASIC_FIELDS}
 
 
-def field_exists(name: str) -> bool:
-    """Whether BRAIN listed this data field for your account (data_fields_cache.json from fetch_fields.py)."""
-    try:
-        cache = json.loads(Path(FIELDS_CACHE_FILE).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return False
-    return any(f.get("id") == name for f in cache.get("matrix_fields") or [] if isinstance(f, dict))
+def operator_count(expression: str) -> int:
+    """How many operators BRAIN counts in an expression: every function call and every + - * / or comparison.
+    (Matches the counts in BRAIN's own "Expression with N operators exceeds limit of 64" errors.)"""
+    plain = _blank_quotes(expression or "")
+    return len(re.findall(r"[A-Za-z_]\w*\s*\(", plain)) + len(re.findall(r"==|!=|<=|>=|[-+*/<>]", plain))
 
 
-def _wrap_in_rank(expr):
-    call = outer_call(expr)
-    if call and call[0] == "rank":
-        return None
-    return (f"rank({expr.strip()})",
-            "rank() spreads the weight evenly across stocks instead of a few big bets")
+def too_long(expression: str) -> bool:
+    return operator_count(expression) > MAX_OPERATORS
 
 
-def _backfill_fields(expr):
-    fields = data_fields_in(expr)
-    if not fields or "ts_backfill(" in expr:
-        return None
-    for start, end, name in reversed(fields):
-        expr = expr[:start] + f"ts_backfill({name}, {BACKFILL_DAYS})" + expr[end:]
-    return (expr.strip(), f"ts_backfill fills gaps in sparse data (up to {BACKFILL_DAYS} days), so more stocks "
-                          f"get a position")
-
-
-def _finer_groups(expr):
-    changed = False
-    for start, end in sorted(_group_calls(expr), reverse=True):
-        arg = expr[start:end]
-        if arg.strip() in COARSE_GROUPS:
-            expr = expr[:start] + arg[:len(arg) - len(arg.lstrip())] + "subindustry" + expr[end:]
-            changed = True
-    if not changed:
-        return None
-    return (expr.strip(), "ranking within subindustries removes the size and sector tilts that weaken it in "
-                          "the larger, more liquid stocks")
-
-
-def _size_neutral(expr):
-    if "bucket(rank(cap)" in expr or not field_exists("cap"):
-        return None
-    return (f"group_neutralize({expr.strip()}, bucket(rank(cap), range='0, 1, 0.1'))",
-            "neutralizing against market-cap buckets removes the size tilt that weakens it in the more "
-            "liquid stocks")
-
-
-LIQUIDITY = "rank(ts_mean(volume * close, 20))"  # 0 for the least traded stocks in dollars, 1 for the most
-
-
-def _liquid_split(expr):
-    """The community fix for LOW_SUB_UNIVERSE_SHARPE: decay the liquid and the illiquid part separately - the most
-    traded stocks on a faster version of the signal, the rest on a slower one. Keeps the alpha's own smoothing as
-    the fast speed (5 days without one) and doubles it for the slow."""
-    call = outer_call(expr)
-    core, fast = expr.strip(), 5
-    if call and call[0] in SMOOTHERS and call[1][0].strip():
-        core = call[1][0].strip()
-        days = _number(call[1][1]) if call[0] == "ts_decay_linear" and len(call[1]) > 1 else None
-        fast = int(days) if days is not None and days >= 1 else fast
-    return (f"ts_decay_linear({core}, {fast}) * {LIQUIDITY} + ts_decay_linear({core}, {2 * fast}) * (1 - {LIQUIDITY})",
-            "the most traded stocks get a faster version of the signal and the rest a slower one, so it holds up "
-            "in the larger, more liquid stocks")
+LIQUIDITY = "rank(ts_mean(volume * close, 20))"  # the old repair's liquid/illiquid split - read in earlier results
 
 
 def _less_smoothing(expr):
@@ -1950,42 +1913,105 @@ def needs_sharpening(row) -> bool:
             and _less_smoothing(row.get("expression") or "") is not None)
 
 
-REPAIRS = {  # check name -> fixes to try, most promising first
-    "CONCENTRATED_WEIGHT": (_wrap_in_rank, _backfill_fields),
-    "LOW_SUB_UNIVERSE_SHARPE": (_finer_groups, _size_neutral, _liquid_split),
-    "LOW_TURNOVER": (_less_smoothing,),
-}
+# ---- Auto-blend: a good Sharpe held back only by fitness, added to one of your best slow alphas ----
+
+def listed_datasets():
+    """The BRAIN datasets of the data fields on your field list (operators.json), or None when that can't be told
+    (no field list, or no data_fields_cache.json) - then blends aren't limited by it. Leaving a dataset out of the
+    field list (fetch_fields.py --leave-out) keeps it out of blends too."""
+    known = field_datasets()
+    if not known:
+        return None
+    try:
+        _, fields = load_reference()
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    found = {known[f.get("name")] for f in fields or []
+             if isinstance(f, dict) and f.get("name") in known and f.get("name") not in BASIC_FIELDS}
+    return found or None
 
 
-def fixable(failed_checks) -> bool:
-    """Whether every one of these failed checks has automatic fixes."""
-    failed = list(failed_checks or [])
-    return bool(failed) and all(c in REPAIRS for c in failed)
+def on_listed_data(expression: str, datasets) -> bool:
+    return datasets is None or alpha_kind(expression) <= set(datasets) | {PRICE_VOLUME}
 
 
-def repair_candidates(expression: str, failed_checks, avoid=frozenset()) -> list:
-    """(new expression, why) fixes for these failed checks that haven't been tried (aren't in avoid) - one per
-    check first, then the next fix for each, up to MAX_REPAIRS_PER_ALPHA. Built on the expression without its
-    padding. Empty if any failed check isn't one we know how to fix, or every fix was tried."""
-    failed = list(dict.fromkeys(failed_checks))
-    if not fixable(failed):
-        return []
-    base = strip_padding(expression)
-    out, seen = [], {expression.strip(), base.strip()}
-    for depth in range(max(len(REPAIRS[c]) for c in failed)):
-        for check in failed:
-            if depth < len(REPAIRS[check]):
-                fix = REPAIRS[check][depth](base)
-                if fix and fix[0] not in seen and fix[0] not in avoid:
-                    seen.add(fix[0])
-                    out.append((fix[0], f"failed {check}; {fix[1]}"))
-    return out[:MAX_REPAIRS_PER_ALPHA]
+def top_level_sum(expression: str) -> bool:
+    """Whether the expression is two or more signals added or subtracted at its outermost level, like a blend."""
+    plain, depth = _blank_quotes(expression or "").strip(), 0
+    for i, ch in enumerate(plain):
+        depth += ch == "("
+        depth -= ch == ")"
+        if depth == 0 and ch in "+-" and i > 0 and plain[:i].strip() and plain[:i].rstrip()[-1] not in "(,*/<>=+-":
+            return True
+    return False
 
 
-def all_repair_variants(expression: str) -> set:
-    """Every repair any fixable check could produce - lets a run skip alphas whose repairs were all tried."""
-    base = strip_padding(expression)
-    return {fix[0] for fixes in REPAIRS.values() for f in fixes for fix in [f(base)] if fix}
+def blend_worthy(row) -> bool:
+    """Sharpe over BRAIN's bar and fitness under it, with nothing else known to be wrong: the big-stocks check isn't
+    failed (BRAIN's numbers, when there are any), no check FAILed apart from fitness or turnover (when BRAIN's checks
+    are at hand), and turnover a blend - which trades about 1/sqrt(2) as much - can bring under BRAIN's 70%."""
+    sharpe, fitness, turnover = (as_float(row.get(k)) for k in ("sharpe", "fitness", "turnover"))
+    if sharpe is None or fitness is None or turnover is None:
+        return False
+    if sharpe < SUBMIT_MIN_SHARPE or fitness >= SUBMIT_MIN_FITNESS or turnover / math.sqrt(2) > TURNOVER_MAX:
+        return False
+    if small_stocks_only(row):
+        return False
+    return not set(row.get("failed_checks") or ()) - BLEND_FIXES
+
+
+def passed_every_check(row) -> bool:
+    """Cleared BRAIN's bar with every check passing, similarity aside: submitted, held, or turned away as too similar."""
+    submitted = (row.get("submitted") or "").strip()
+    return (submitted == "YES" or submitted.startswith(("VERDICT_PENDING", "TOO_CORRELATED", HELD_PREFIX)))
+
+
+def blend_partners(expression: str) -> list:
+    """(partner expression, its row) - your slow alphas worth adding to `expression`, best Sharpe first, one per kind
+    of data: cleared BRAIN's bar with every check but similarity passing, passed the big-stocks check on BRAIN's
+    numbers, trade under BLEND_PARTNER_MAX_TURNOVER, built on other data than `expression`, using datasets on your
+    field list, short enough that the blend stays under BRAIN's operator limit, and not blends themselves."""
+    kind, datasets = alpha_kind(expression), listed_datasets()
+    room = MAX_OPERATORS - operator_count(expression) - 3  # rank() twice and the +
+    rows = sorted(completed_history(), key=lambda r: as_float(r.get("sharpe")) or 0.0, reverse=True)
+    out, kinds_taken = [], []
+    for r in rows:
+        partner = strip_padding(r["expression"]).strip()
+        if top_level_sum(partner) or (r.get("rationale") or "").startswith("Auto-blend"):
+            continue  # a blend already carries a fast signal - adding it would double that up
+        turnover = as_float(r.get("turnover"))
+        big, limit = as_float(r.get("sub_universe_sharpe")), as_float(r.get("sub_universe_limit"))
+        passed, total = as_float(r.get("checks_passed")), as_float(r.get("checks_total"))
+        cleared = strong_numbers(r) and (passed_every_check(r) or (passed is not None and total is not None
+                                                                     and passed >= total - 1))
+        if not cleared or turnover is None or not TURNOVER_MIN <= turnover <= BLEND_PARTNER_MAX_TURNOVER:
+            continue
+        if big is None or limit is None or big < limit:
+            continue
+        partner_kind = alpha_kind(partner)
+        if partner_kind & kind or any(partner_kind & taken for taken in kinds_taken):
+            continue
+        if not on_listed_data(partner, datasets) or operator_count(partner) > room:
+            continue
+        kinds_taken.append(partner_kind)
+        out.append((partner, r))
+    return out
+
+
+def blend_candidates(expression: str, avoid=frozenset()) -> list:
+    """(blend, why) for `expression` with each of its blend_partners() not tried yet, up to MAX_BLENDS_PER_ALPHA.
+    rank() on both sides puts them on the same scale, so neither drowns the other out."""
+    base, out = strip_padding(expression).strip(), []
+    for partner, r in blend_partners(base):
+        blended = f"rank({base}) + rank({partner})"
+        if blended in avoid or too_long(blended):
+            continue
+        out.append((blended, f"added to your slow alpha {partner} (Sharpe {r.get('sharpe')}, turnover "
+                             f"{as_float(r.get('turnover')):.1%}) - two unrelated signals trade about half as much "
+                             f"together and usually beat both on Sharpe and fitness"))
+        if len(out) == MAX_BLENDS_PER_ALPHA:
+            break
+    return out
 
 
 def failed_text(checks, names) -> str:
@@ -2016,20 +2042,6 @@ def sub_universe(checks):
         if isinstance(check, dict) and check.get("name") == "LOW_SUB_UNIVERSE_SHARPE":
             return _number(check.get("value")), _number(check.get("limit")), check.get("result")
     return None, None, None
-
-
-def out_of_reach(value, limit) -> bool:
-    """A Sharpe among the biggest stocks under SUB_UNIVERSE_HOPELESS_SHARE of BRAIN's limit there: the signal
-    barely works there at all, and no fix closes a gap that size."""
-    return value is not None and limit is not None and limit > 0 and value < SUB_UNIVERSE_HOPELESS_SHARE * limit
-
-
-def hopeless_gap(checks) -> str:
-    """'LOW_SUB_UNIVERSE_SHARPE (0.10 vs limit 0.68)' when BRAIN failed the big-stocks check out of reach, else ''."""
-    value, limit, result = sub_universe(checks)
-    if result == "FAIL" and out_of_reach(value, limit):
-        return f"LOW_SUB_UNIVERSE_SHARPE ({value:.2f} vs limit {limit:.2f})"
-    return ""
 
 
 def small_stocks_only(row) -> bool:
@@ -2087,6 +2099,65 @@ def small_stocks_rule() -> str:
             "failed BRAIN's big-stocks check: among the largest, most liquid stocks its Sharpe was far below what "
             "BRAIN needs. Another window, maturity, group, decay or neutralization of the same idea is still the "
             "same idea, and fails the same way. Look for ideas that also work in large stocks:\n" + "\n".join(lines))
+
+
+RECIPES = (
+    "WHAT HAS WORKED ON THIS ACCOUNT - build on these patterns:\n"
+    "- Compare like with like: rank within an industry or sector (group_rank(x, industry)) and take out the size "
+    "tilt with group_neutralize(x, bucket(rank(cap), range='0, 1, 0.1')). Your best analyst-estimate alphas use both.\n"
+    "- Measure a change against how much that number usually moves: ts_delta(x, 90) / ts_std_dev(x, 180) beats the "
+    "raw level or the raw change.\n"
+    "- Smooth slow data (analyst estimates, fundamentals) with ts_decay_linear(..., 15) or 20: it costs little Sharpe "
+    "and lifts fitness.\n"
+    "- Fast plus slow: a fast price signal with a high Sharpe that trades a lot (for example "
+    "reverse(group_rank(close / vwap, sector)), the day's close against its average price), added to a slow signal "
+    "on other data as rank(fast) + rank(slow), trades about half as much and usually beats both on Sharpe and "
+    "fitness. Promising fast ideas are also blended with your best slow alphas automatically.\n"
+    f"- BRAIN refuses an expression with more than {MAX_OPERATORS} operators (every function call and every "
+    "+ - * / counts) - keep each idea well under that."
+)
+
+
+def data_scorecard() -> str:
+    """For the generator: which BRAIN datasets on your field list have produced alphas that passed every check on your
+    account, out of how many tests, and which never have after DATA_SCORECARD_MIN_TESTS+ tests - with example field
+    names, since the generator knows data by its field names. '' when nothing has been tested enough."""
+    tests, passes, fields = Counter(), Counter(), {}
+    for r in completed_history():
+        names = [n for _, _, n in data_fields_in(r["expression"]) if n not in BASIC_FIELDS]
+        for kind in alpha_kind(r["expression"]):
+            tests[kind] += 1
+            passed = passed_every_check(r)
+            passes[kind] += passed
+            fields.setdefault(kind, [Counter(), Counter()])[0 if passed else 1].update(names)
+
+    def examples(kind):
+        good, tried = fields.get(kind, [Counter(), Counter()])
+        return ", ".join(n for n, _ in (good or tried).most_common(3))
+
+    def label(kind):
+        return "price/volume data only" if kind == PRICE_VOLUME else dataset_name(kind)
+
+    datasets = listed_datasets()
+    scored = [k for k in tests if tests[k] >= DATA_SCORECARD_MIN_TESTS
+              and (datasets is None or k in datasets or k == PRICE_VOLUME)]
+    working = sorted((k for k in scored if passes[k]), key=lambda k: passes[k] / tests[k], reverse=True)
+    never = sorted((k for k in scored if not passes[k]), key=lambda k: tests[k], reverse=True)
+    lines = []
+    if working:
+        lines.append("Data that has produced alphas passing every check here (passed / tested):")
+        lines += [f"- {label(k)}: {passes[k]} of {tests[k]}" + (f" (e.g. {examples(k)})" if examples(k) else "")
+                  for k in working]
+    if never:
+        lines.append(f"Data that never has, after {DATA_SCORECARD_MIN_TESTS}+ tests - only use it with a clear reason "
+                     f"it would also work in large stocks:")
+        lines += [f"- {label(k)}: 0 of {tests[k]}" + (f" (e.g. {examples(k)})" if examples(k) else "") for k in never]
+    return "\n".join(lines)
+
+
+def what_works_rule() -> str:
+    card = data_scorecard()
+    return RECIPES + ("\n\n" + card if card else "")
 
 
 def record_sub_universe(alpha_id: str, value, limit):
@@ -2242,7 +2313,7 @@ def upgrade_results_file():
 
 # ---- Never miss a day: keep good alphas back for the coming days ----
 
-_DATASETS = {"key": None, "map": {}}
+_DATASETS = {"key": None, "map": {}, "names": {}}
 
 
 def field_datasets() -> dict:
@@ -2255,17 +2326,26 @@ def field_datasets() -> dict:
         return {}
     key = (str(path.resolve()), stat.st_mtime_ns, stat.st_size)
     if _DATASETS["key"] != key:
-        found = {}
+        found, names = {}, {}
         try:
             for f in json.loads(path.read_text(encoding="utf-8")).get("matrix_fields") or []:
-                dataset = f.get("dataset") if isinstance(f, dict) else None
-                dataset = (dataset.get("id") or dataset.get("name")) if isinstance(dataset, dict) else dataset
+                info = f.get("dataset") if isinstance(f, dict) else None
+                dataset = (info.get("id") or info.get("name")) if isinstance(info, dict) else info
                 if dataset and f.get("id"):
                     found[str(f["id"])] = str(dataset)
+                    if isinstance(info, dict) and info.get("name"):
+                        names[str(dataset)] = str(info["name"])
         except (OSError, ValueError, AttributeError):
-            found = {}
-        _DATASETS.update(key=key, map=found)
+            found, names = {}, {}
+        _DATASETS.update(key=key, map=found, names=names)
     return _DATASETS["map"]
+
+
+def dataset_name(dataset: str) -> str:
+    """BRAIN's own name for a dataset id ('Analyst Estimate Data for Equity' for analyst4), when the cache has it."""
+    field_datasets()
+    name = _DATASETS["names"].get(dataset)
+    return f"{name} ({dataset})" if name and name != dataset else dataset
 
 
 PRICE_VOLUME = "price/volume"
@@ -2762,7 +2842,7 @@ def run_round(session, client, operators, fields, settings, email, password, rou
                          avoid_note(rejected, dead),
                          small_stocks_rule()) if r]
     asked = IDEAS_PER_ROUND + (VARIETY_EXTRA_IDEAS if rules else 0)
-    prompt_text = "\n\n".join([feedback_text, *rules])
+    prompt_text = "\n\n".join([feedback_text, *rules, what_works_rule()])
     try:
         ideas = generate_with_fallback(client, operators, label_fields(fields, type_map), settings,
                                        prompt_text, avoid, asked)
@@ -2782,16 +2862,25 @@ def run_round(session, client, operators, fields, settings, email, password, rou
             logger.info("Skipped %d idea(s) using names BRAIN rejected or dead-end fields.", len(ideas) - len(usable))
         ideas = usable
     listed, strays, on_list = {f.get("name") for f in fields}, Counter(), []
+    known = field_datasets()
+    datasets = {known[n] for n in listed if n in known}
     for expression, rationale in ideas:
-        off = off_list_fields(expression, listed)
+        # A field your list doesn't name is fine when its dataset is on the list (a proven one the generator
+        # remembers); one from a dataset you left out isn't.
+        off = {n for n in off_list_fields(expression, listed) if known.get(n) not in datasets}
         strays.update(off)
         if not off:
             on_list.append((expression, rationale))
     if strays:
-        logger.info("Skipped %d idea(s) using fields that aren't on your field list (%s) - old data the generator "
+        logger.info("Skipped %d idea(s) using data your field list leaves out (%s) - old data the generator "
                     "remembers from past results.", len(ideas) - len(on_list),
                     ", ".join(name for name, _ in strays.most_common(4)))
     ideas = on_list
+    short = [(e, r) for e, r in ideas if not too_long(e)]
+    if len(short) < len(ideas):
+        logger.info("Skipped %d idea(s) with more than %d operators - BRAIN refuses them.", len(ideas) - len(short),
+                    MAX_OPERATORS)
+    ideas = short
     if rules:
         fresh_ideas = []
         for expression, rationale in ideas:
@@ -2812,7 +2901,7 @@ def process_queue(session, items, settings, email, password, round_num, avoid) -
     queue = deque(items)
     running = []  # each: {"row", "kind", "location", "started"}
     rows = []
-    counts = {"flips": 0, "smooths": 0, "repairs": 0, "sharpens": 0, "network": 0}
+    counts = {"flips": 0, "smooths": 0, "blends": 0, "sharpens": 0, "network": 0}
     limit = PARALLEL_SIMULATIONS
     busy_since = None
     last_note = time.time()
@@ -2859,6 +2948,11 @@ def process_queue(session, items, settings, email, password, round_num, avoid) -
                 if expression in avoid:
                     queue.popleft()
                     logger.info("Skipping duplicate: %s", expression)
+                    continue
+                if too_long(expression):
+                    queue.popleft()
+                    logger.info("Skipping %s - it has %d operators, and BRAIN refuses more than %d.", expression,
+                                operator_count(expression), MAX_OPERATORS)
                     continue
                 row = new_row(expression, rationale, round_num)
                 try:
@@ -2977,7 +3071,7 @@ def process_queue(session, items, settings, email, password, round_num, avoid) -
 
 
 def queue_followups(session, row, kind, queue, avoid, counts):
-    """Flip, smooth or repair a finished alpha when that could rescue it. Goes to the front of the queue."""
+    """Flip, smooth, sharpen or blend a finished alpha when that could rescue it. Goes to the front of the queue."""
     if row["status"] != "COMPLETE":
         return
     expression = row["expression"]
@@ -3018,7 +3112,7 @@ def queue_followups(session, row, kind, queue, avoid, counts):
                                         f"{SMOOTH_DECAY_DAYS} days should cut turnover.", "smooth"))
 
     # Auto-sharpen: Sharpe is there, fitness isn't, and turnover is already under the 12.5% floor.
-    if (kind not in ("smooth", "sharpen", "repair") and counts["sharpens"] < MAX_SHARPENS_PER_ROUND
+    if (kind not in ("smooth", "sharpen", "blend") and counts["sharpens"] < MAX_SHARPENS_PER_ROUND
             and row.get("submitted", "NO") == "NO" and needs_sharpening(row)):
         sharper = (_less_smoothing(base) or (None,))[0]
         if sharper and sharper not in avoid and not too_similar_to_pool(session, row, "sharpening"):
@@ -3027,25 +3121,24 @@ def queue_followups(session, row, kind, queue, avoid, counts):
                         "smoothing next.", sharpe, fitness, turnover * 100)
             queue.appendleft((sharper, sharpen_reason(expression, sharpe, fitness, turnover), "sharpen"))
 
-    # Auto-repair: strong numbers held back by one of BRAIN's fixable checks.
-    if kind != "repair" and row.get("submitted", "NO") == "NO" and strong_numbers(row):
+    # Strong numbers held back by a check: name it in the log, with BRAIN's value and limit when it gives them.
+    if row.get("submitted", "NO") == "NO" and strong_numbers(row):
         failed = row.get("failed_checks") or []
-        gap = hopeless_gap(row.get("checks"))
-        if gap:
-            logger.info("  Strong numbers but failed %s - it barely works among the biggest stocks, so no fix can "
-                        "get it through; not repairing it.", gap)
-        elif not fixable(failed):
-            if failed:
-                logger.info("  Strong numbers but failed %s - no automatic fix for that check.",
-                            failed_text(row.get("checks"), failed))
-            elif row.get("failing_checks"):
-                logger.info("  Strong numbers but not every check passed (%s).", row["failing_checks"])
-        fixes = [] if gap else repair_candidates(expression, failed, avoid)
-        room = MAX_REPAIRS_PER_ROUND - counts["repairs"]
-        if fixes and room > 0 and worth_repairing(session, row):
-            counts["repairs"] += min(room, len(fixes))
-            for new_expression, why in reversed(fixes[:room]):  # reversed: appendleft keeps their order
-                queue.appendleft((new_expression, f"Auto-repair of {expression}: {why}.", "repair"))
+        if failed:
+            logger.info("  Strong numbers but failed %s.", failed_text(row.get("checks"), failed))
+        elif row.get("failing_checks"):
+            logger.info("  Strong numbers but not every check passed (%s).", row["failing_checks"])
+
+    # Auto-blend: Sharpe is there, fitness isn't, and nothing else is known to be wrong - add a slow alpha.
+    if (kind != "blend" and counts["blends"] < MAX_BLENDS_PER_ROUND and row.get("submitted", "NO") == "NO"
+            and row.get("alpha_id") and blend_worthy(row)):
+        blends = blend_candidates(base, avoid)[:MAX_BLENDS_PER_ROUND - counts["blends"]]
+        if blends and not too_similar_to_pool(session, row, "blending"):
+            counts["blends"] += len(blends)
+            logger.info("  Sharpe %.2f but fitness %.2f at %.0f%% turnover - testing it added to %d of your best slow "
+                        "alphas next%s.", sharpe, fitness, turnover * 100, len(blends), padding_note(expression))
+            for new_expression, why in reversed(blends):  # reversed: appendleft keeps their order
+                queue.appendleft((new_expression, f"Auto-blend of {expression}: {why}.", "blend"))
 
 
 def sharpen_reason(expression, sharpe, fitness, turnover) -> str:
@@ -3065,24 +3158,20 @@ def too_similar_to_pool(session, row, purpose: str) -> bool:
     return False
 
 
-def worth_repairing(session, row) -> bool:
-    if too_similar_to_pool(session, row, "repairing"):
-        return False
-    logger.info("  Strong numbers but failed %s - testing a repaired version%s next.",
-                failed_text(row.get("checks"), row.get("failed_checks") or []), padding_note(row["expression"]))
-    return True
-
-
-def near_miss_rows() -> list:
-    """Earlier alphas with Sharpe and fitness over the bar that weren't submitted - most recent first."""
-    if not Path(RESULTS_FILE).exists():
-        return []
-    with open(RESULTS_FILE, encoding="utf-8", newline="") as f:
-        rows = [r for r in csv.DictReader(f)
-                if r.get("status") == "COMPLETE" and r.get("alpha_id") and strong_numbers(r)
-                and (r.get("submitted") or "NO").strip() == "NO"]
-    unique = {r["alpha_id"]: r for r in rows}  # one row per alpha
-    return sorted(unique.values(), key=lambda r: r.get("timestamp") or "", reverse=True)
+def blend_rows() -> list:
+    """Earlier alphas worth a blend that weren't submitted: blend_worthy() on their saved numbers, built on data
+    from your field list, and not blends themselves - best Sharpe first, one per idea."""
+    datasets, seen, out = listed_datasets(), set(), []
+    rows = [r for r in completed_history()
+            if r.get("alpha_id") and (r.get("submitted") or "NO").strip() == "NO" and blend_worthy(r)
+            and not (r.get("rationale") or "").startswith("Auto-blend") and on_listed_data(r["expression"], datasets)]
+    for r in sorted(rows, key=lambda r: as_float(r.get("sharpe")) or 0.0, reverse=True):
+        core = idea_core(r["expression"])
+        key = (skeleton(core), alpha_kind(core))  # other windows, groups or smoothing of one idea count once
+        if key not in seen:
+            seen.add(key)
+            out.append(r)
+    return out
 
 
 def sharpen_candidates() -> list:
@@ -3093,81 +3182,64 @@ def sharpen_candidates() -> list:
     return sorted(unique.values(), key=lambda r: r.get("timestamp") or "", reverse=True)
 
 
-def repair_past_near_misses(session, settings, email, password, avoid) -> list:
-    """Start-of-run step: re-examine up to MAX_PAST_REPAIRS recent near-misses whose follow-ups haven't
-    been tried - repair the ones failing a fixable check (asking BRAIN which check failed), and test the
-    slow ones without their outer smoothing. Every near-miss looked at gets a log line saying why."""
-    candidates = [("repair", r) for r in near_miss_rows()] + [("sharpen", r) for r in sharpen_candidates()]
-    candidates.sort(key=lambda kr: kr[1].get("timestamp") or "", reverse=True)
-    items, looked = [], 0
-    for kind, row in candidates:
-        if looked >= MAX_PAST_REPAIRS:
+def follow_up_past_near_misses(session, settings, email, password, avoid) -> list:
+    """Start-of-run step: blend up to MAX_PAST_BLENDS earlier near-misses that missed only on fitness (best Sharpe
+    first; one without BRAIN's big-stocks numbers on file gets them read and saved first, and isn't blended if it
+    failed that check), and test up to MAX_PAST_SHARPENS slow ones without their outer smoothing. Every near-miss
+    followed up gets a log line saying what's being tried."""
+    items, blended, asked = [], 0, 0
+    for row in blend_rows():
+        if blended >= MAX_PAST_BLENDS or asked >= 2 * MAX_PAST_BLENDS:
             break
         expression = row["expression"]
-        if kind == "sharpen":
-            sharper = (_less_smoothing(strip_padding(expression)) or (None,))[0]
-            if not sharper or sharper in avoid:
-                continue  # already tried
-            looked += 1
-            logger.info("Earlier near-miss %s (Sharpe %s, fitness %s, turnover %s):", expression,
-                        row.get("sharpe"), row.get("fitness"), row.get("turnover"))
-            if too_similar_to_pool(session, row, "sharpening"):
-                continue
-            logger.info("  Turnover is under BRAIN's 12.5% fitness floor - testing it without the outer smoothing.")
-            items.append((sharper, sharpen_reason(expression, *(as_float(row[k]) for k in
-                                                                ("sharpe", "fitness", "turnover"))), "sharpen"))
+        blends = blend_candidates(expression, avoid)
+        if not blends:
+            continue  # its blends were all tried, or there's no slow partner for it yet
+        if not (row.get("sub_universe_sharpe") or "").strip():
+            asked += 1
+            try:
+                alpha = be.fetch_alpha(session, row["alpha_id"])
+            except requests.RequestException as exc:
+                logger.warning("Couldn't reach BRAIN to look at earlier near-misses (%s) - skipping them this run.",
+                               type(exc).__name__)
+                break
+            value, limit, _ = sub_universe((alpha.get("is") or {}).get("checks") or [])
+            if value is None or limit is None:
+                record_sub_universe(row["alpha_id"], "-", "-")  # BRAIN has none: don't ask again
+            else:
+                record_sub_universe(row["alpha_id"], value, limit)
+                if value < limit:
+                    logger.info("Earlier near-miss %s fails the big-stocks check (%.2f vs limit %.2f) - not blending "
+                                "it.", expression, value, limit)
+                    continue
+        logger.info("Earlier near-miss %s (Sharpe %s, fitness %s, turnover %s):", expression, row.get("sharpe"),
+                    row.get("fitness"), row.get("turnover"))
+        if too_similar_to_pool(session, row, "blending"):
             continue
+        blended += 1
+        logger.info("  Only fitness is missing - testing it added to %d of your best slow alphas.", len(blends))
+        items.extend((e, f"Auto-blend of {expression}: {why}.", "blend") for e, why in blends)
 
-        known = bool((row.get("sub_universe_sharpe") or "").strip())  # "-" once BRAIN was asked and had none
-        if known and out_of_reach(as_float(row.get("sub_universe_sharpe")), as_float(row.get("sub_universe_limit"))):
-            continue  # it barely works among the biggest stocks - looked at before, nothing to fix
-        if all_repair_variants(expression) <= avoid and known:
-            continue  # every possible fix was already tried (its big-stocks numbers may still need filling in)
-        looked += 1
-        try:
-            alpha = be.fetch_alpha(session, row["alpha_id"])
-        except requests.RequestException as exc:
-            logger.warning("Couldn't reach BRAIN to look at earlier near-misses (%s) - skipping them this run.",
-                           type(exc).__name__)
+    sharpened = 0
+    for row in sharpen_candidates():
+        if sharpened >= MAX_PAST_SHARPENS:
             break
-        checks = (alpha.get("is") or {}).get("checks") or []
-        row["failed_checks"] = [str(c.get("name")) for c in checks if c.get("result") == "FAIL"]
-        row["checks"] = checks
-        label = f"Earlier near-miss {expression} (Sharpe {row.get('sharpe')}, fitness {row.get('fitness')})"
-        if not checks:
-            logger.info("%s: couldn't read BRAIN's record of it - trying again next run.", label)
+        expression = row["expression"]
+        sharper = (_less_smoothing(strip_padding(expression)) or (None,))[0]
+        if not sharper or sharper in avoid:
+            continue  # already tried
+        sharpened += 1
+        logger.info("Earlier near-miss %s (Sharpe %s, fitness %s, turnover %s):", expression,
+                    row.get("sharpe"), row.get("fitness"), row.get("turnover"))
+        if too_similar_to_pool(session, row, "sharpening"):
             continue
-        if not known:
-            big_value, big_limit, _ = sub_universe(checks)
-            record_sub_universe(row["alpha_id"], "-" if big_value is None else big_value,
-                                "-" if big_limit is None else big_limit)
-        if all_repair_variants(expression) <= avoid:
-            continue  # its numbers are filled in now; every possible fix was already tried
-        gap = hopeless_gap(checks)
-        if gap:
-            logger.info("%s fails %s - it barely works among the biggest stocks, so no fix can get it through; "
-                        "not repairing it.", label, gap)
-            continue
-        if not row["failed_checks"]:
-            pending = ", ".join(check_note(c) for c in checks
-                                if c.get("result") != "PASS" and c.get("name") != "SELF_CORRELATION")
-            logger.info("%s: BRAIN lists no failed check%s.", label, f" ({pending})" if pending else "")
-            continue
-        if not fixable(row["failed_checks"]):
-            logger.info("%s fails %s - no automatic fix for that check.", label,
-                        failed_text(checks, row["failed_checks"]))
-            continue
-        fixes = repair_candidates(expression, row["failed_checks"], avoid)
-        if not fixes:
-            continue  # its fixes were already tried
-        logger.info("%s:", label)
-        if not worth_repairing(session, row):
-            continue
-        items.extend((e, f"Auto-repair of {expression}: {why}.", "repair") for e, why in fixes)
+        logger.info("  Turnover is under BRAIN's 12.5% fitness floor - testing it without the outer smoothing.")
+        items.append((sharper, sharpen_reason(expression, *(as_float(row[k]) for k in
+                                                            ("sharpe", "fitness", "turnover"))), "sharpen"))
     if not items:
         return []
     logger.info("=== Following up earlier near-misses: %d version(s) to test ===", len(items))
-    return process_queue(session, items, settings, email, password, "repair", avoid)
+    return process_queue(session, items, settings, email, password, "follow-up", avoid)
 
 
 def run_try(session, expressions, settings, email, password) -> list:
@@ -3335,12 +3407,12 @@ def run(args):
                     "(aiming for %d) - mining to build the reserve.", spare, RESERVE_TARGET)
     avoid = already_tried()
     try:
-        repair_past_near_misses(session, settings, email, password, avoid)
+        follow_up_past_near_misses(session, settings, email, password, avoid)
     except StopLoop as e:
         logger.error("Stopping: %s", e)
         return
     except Exception:
-        logger.exception("Repairing earlier near-misses hit an unexpected problem - skipping it this run.")
+        logger.exception("Following up earlier near-misses hit an unexpected problem - skipping it this run.")
     feedback_text = build_feedback()
     past = len(completed_history())
     if past:

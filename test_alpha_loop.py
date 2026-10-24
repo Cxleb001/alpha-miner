@@ -1572,131 +1572,25 @@ def test_no_variety_rule_without_data_types(tmp_path):
     in_tmp(tmp_path, run)
 
 
-# ---- Auto-repair of strong alphas that fail a fixable check ----
+# ---- Strong alphas that fail a check ----
 
 DIVIDEND = "ts_decay_linear(group_rank(ts_delta(dividend, 180), market), 20)"
 CW_FAIL = [{"name": "LOW_SHARPE", "result": "PASS"}, {"name": "LOW_FITNESS", "result": "PASS"},
            {"name": "CONCENTRATED_WEIGHT", "result": "FAIL"}, {"name": "SELF_CORRELATION", "result": "PENDING"}]
 SUB_FAIL = [{"name": "LOW_SUB_UNIVERSE_SHARPE", "result": "FAIL"}, {"name": "SELF_CORRELATION", "result": "PENDING"}]
-RANKED = f"rank({DIVIDEND})"
-BACKFILLED = "ts_decay_linear(group_rank(ts_delta(ts_backfill(dividend, 120), 180), market), 20)"
-FINER = "ts_decay_linear(group_rank(ts_delta(dividend, 180), subindustry), 20)"
-LIQUID_SPLIT = ("ts_decay_linear(group_rank(ts_delta(dividend, 180), market), 20) * rank(ts_mean(volume * close, 20)) + "
-                "ts_decay_linear(group_rank(ts_delta(dividend, 180), market), 40) * (1 - rank(ts_mean(volume * close, 20)))")
 
 
 def near_miss(checks=None):
     return alpha_json(sharpe=1.35, fitness=1.34, turnover=0.13, checks=CW_FAIL if checks is None else checks)
 
 
-def test_strong_alpha_failing_a_fixable_check_is_repaired_right_after(tmp_path):
-    def run():
-        brain = SlowBrain({DIVIDEND: near_miss(), RANKED: calm(), BACKFILLED: calm(), "rank(b)": calm()})
-        rows = run_queue(brain, [DIVIDEND, "rank(b)"], parallel=1)
-        assert brain.started == [DIVIDEND, RANKED, BACKFILLED, "rank(b)"]
-        repair = next(r for r in rows if r["expression"] == RANKED)
-        assert repair["rationale"].startswith(f"Auto-repair of {DIVIDEND}: failed CONCENTRATED_WEIGHT; rank()")
-    in_tmp(tmp_path, run)
-
-
-def test_a_repair_that_passes_is_submitted(tmp_path):
-    def run():
-        # Without a field list naming cap, the size-bucket fix is skipped, so the second repair queued is the
-        # liquid/illiquid split (the third fix for this check). Both are queued at once, as before.
-        brain = SlowBrain({DIVIDEND: near_miss(SUB_FAIL), FINER: alpha_json(sharpe=1.5, fitness=1.3, turnover=0.12),
-                           LIQUID_SPLIT: calm()})
-        brain.session.post.side_effect = lambda url, **kw: (
-            fake_response(201, {}, headers={}) if url.endswith("/submit") else brain.post(url, **kw))
-        with patch.object(al, "submit_alpha", return_value=("YES", None)), \
-             patch.object(al, "is_active_on_brain", return_value=True):
-            rows = run_queue(brain, [DIVIDEND], parallel=1)
-        assert {r["expression"]: r["submitted"] for r in rows} == {DIVIDEND: "NO", FINER: "YES", LIQUID_SPLIT: "NO"}
-    in_tmp(tmp_path, run)
-
-
-def test_no_repair_when_the_original_is_too_similar(tmp_path):
-    def run():
-        brain = SlowBrain({DIVIDEND: near_miss()}, corr=0.88)
-        rows = run_queue(brain, [DIVIDEND], parallel=1)
-        assert brain.started == [DIVIDEND] and len(rows) == 1
-    in_tmp(tmp_path, run)
-
-
-def test_no_repair_for_checks_we_cant_fix_or_weak_numbers(tmp_path):
-    def run():
-        unfixable = [{"name": "MATCHES_COMPETITION", "result": "FAIL"}] + CW_FAIL
-        weak = alpha_json(sharpe=1.0, fitness=0.6, turnover=0.13, checks=CW_FAIL)
-        brain = SlowBrain({"rank(a)": near_miss(unfixable), "rank(b)": weak})
-        run_queue(brain, ["rank(a)", "rank(b)"], parallel=1)
-        assert brain.started == ["rank(a)", "rank(b)"]
-    in_tmp(tmp_path, run)
-
-
-def test_repairs_are_not_repaired_again_and_are_capped(tmp_path):
-    def run():
-        exprs = [f"group_rank(ts_delta(dividend, {d}), market)" for d in (30, 60, 90)]
-        results = {e: near_miss() for e in exprs}
-        for e in exprs:   # every repair fails the same check again
-            results[f"rank({e})"] = near_miss()
-            results[e.replace("dividend", "ts_backfill(dividend, 120)")] = near_miss()
-        brain = SlowBrain(results)
-        rows = run_queue(brain, exprs, parallel=1)
-        repairs = [r for r in rows if r["rationale"].startswith("Auto-repair")]
-        assert len(repairs) == al.MAX_REPAIRS_PER_ROUND == 4
-        assert not any(r["rationale"].startswith("Auto-repair of rank(") for r in repairs)
-    in_tmp(tmp_path, run)
-
-
-def test_earlier_near_miss_is_repaired_at_the_start_of_a_run(tmp_path):
-    def run():
-        _write_operators()
-        al.append_result(dict(_history_row(DIVIDEND, 1.35, 1.34, 0.1349), alpha_id="div", submitted="NO",
-                              timestamp="2026-10-10 12:14:01"))
-        brain = SlowBrain({DIVIDEND: near_miss(), RANKED: calm(), BACKFILLED: calm(), "rank(close)": calm()},
-                          existing={"div": DIVIDEND})
-        gen = MagicMock(return_value=[("rank(close)", "r")])
-        with patch.object(al, "MAX_ROUNDS", 1), patch.object(al, "generate_with_fallback", gen), \
-             patch.object(al, "get_authenticated_session", return_value=brain.session), \
-             patch("google.genai.Client"), patch("time.sleep"):
-            al.main([])
-        assert brain.started[:2] == [RANKED, BACKFILLED]            # repairs before Gemini's ideas
-        assert {r["expression"]: r["round"] for r in csv_rows()}[RANKED] == "repair"
-        assert "rank(close)" in brain.started
-    in_tmp(tmp_path, run)
-
-
-def test_earlier_near_misses_are_only_looked_at_until_every_fix_was_tried(tmp_path):
-    def run():
-        # Every fix tried, and its big-stocks numbers on file: nothing left to ask BRAIN about.
-        al.append_result(dict(_history_row(DIVIDEND, 1.35, 1.34, 0.13), alpha_id="div", submitted="NO",
-                              sub_universe_sharpe="0.5", sub_universe_limit="0.58"))
-        brain = SlowBrain({}, existing={"div": DIVIDEND})
-        tried = set(al.all_repair_variants(DIVIDEND))
-        with patch("time.sleep"):
-            assert al.repair_past_near_misses(brain.session, SETTINGS, "e@x.com", "pw", tried) == []
-        assert not brain.session.get.called                        # nothing left to try: BRAIN not asked
-    in_tmp(tmp_path, run)
-
-
-def test_near_miss_rows_skip_submitted_held_and_weak(tmp_path):
-    def run():
-        for alpha_id, submitted, sharpe, fitness in [("nm", "NO", 1.35, 1.34), ("sub", "YES", 1.6, 1.3),
-                                                     ("held", al.HELD_LABEL, 1.5, 1.2), ("weak", "NO", 1.1, 0.7)]:
-            al.append_result(dict(_history_row(f"rank({alpha_id})", sharpe, fitness, 0.1),
-                                  alpha_id=alpha_id, submitted=submitted))
-        assert [r["alpha_id"] for r in al.near_miss_rows()] == ["nm"]
-    in_tmp(tmp_path, run)
-
-
-def test_repair_helpers_read_expressions_carefully():
+def test_expression_helpers_read_expressions_carefully():
     expr = "rank(ts_regression(returns, rel_ret_comp, 60, lag=0, rettype=0)) * 1e-3"
     assert [n for _, _, n in al.data_fields_in(expr)] == ["returns", "rel_ret_comp"]
     grouped = "group_neutralize(rank(-returns), bucket(rank(cap), range='0, 1, 0.1'))"
     assert [n for _, _, n in al.data_fields_in(grouped)] == ["returns", "cap"]
     assert al.split_top_level("a, f(b, c), 'x, y'") == ["a", " f(b, c)", " 'x, y'"]
     assert al.outer_call("rank(x) + 1") is None and al.outer_call("rank(x)") == ("rank", ["x"])
-    assert al.repair_candidates(DIVIDEND, ["CONCENTRATED_WEIGHT", "LOW_SUB_UNIVERSE_SHARPE"]) [1][0] == FINER
-    assert al.repair_candidates(DIVIDEND, ["SELF_CORRELATION"]) == []
 
 
 # ---- Variety of formula shape ----
@@ -2017,19 +1911,22 @@ def test_ideas_using_fields_off_your_list_are_skipped(tmp_path):
         Path(al.FIELDS_CACHE_FILE).write_text(json.dumps({"matrix_fields": [
             {"id": name, "dataset": {"id": dataset}} for name, dataset in
             (("sales", "fundamental6"), ("assets", "fundamental6"), ("implied_volatility_call_90", "option8"),
-             ("cap", "pv1"))]}), encoding="utf-8")
+             ("debt", "fundamental6"), ("cap", "pv1"))]}), encoding="utf-8")
         returned = [{"expression": "rank(divide(implied_volatility_call_90, assets))", "rationale": "r"},  # remembered
                     {"expression": "rank(divide(sales, assets))", "rationale": "r"},
-                    {"expression": "group_rank(divide(sales, cap), sector)", "rationale": "r"}]     # cap: basic data
+                    {"expression": "group_rank(divide(sales, cap), sector)", "rationale": "r"},     # cap: basic data
+                    {"expression": "rank(divide(debt, assets))", "rationale": "r"}]  # unlisted, but a listed dataset
         client = MagicMock()
         client.models.generate_content.return_value = fake_gemini_response(returned)
-        brain = SlowBrain({"rank(divide(sales, assets))": calm(), "group_rank(divide(sales, cap), sector)": calm()})
+        brain = SlowBrain({"rank(divide(sales, assets))": calm(), "group_rank(divide(sales, cap), sector)": calm(),
+                           "rank(divide(debt, assets))": calm()})
         operators = [{"name": n, "usage": f"{n}(...)"} for n in ("rank", "divide", "group_rank")]
         fields = [{"name": n, "description": "d"} for n in ("sales", "assets")]
         with patch("time.sleep"), captured_logs() as lines:
             rows = al.run_round(brain.session, client, operators, fields, SETTINGS, "e@x.com", "pw", 1, "round 1", set())
-        assert [r["expression"] for r in rows] == ["rank(divide(sales, assets))", "group_rank(divide(sales, cap), sector)"]
-        assert any("Skipped 1 idea(s) using fields that aren't on your field list (implied_volatility_call_90)" in l
+        assert [r["expression"] for r in rows] == ["rank(divide(sales, assets))", "group_rank(divide(sales, cap), sector)",
+                                                   "rank(divide(debt, assets))"]
+        assert any("Skipped 1 idea(s) using data your field list leaves out (implied_volatility_call_90)" in l
                    for l in lines), lines
         Path(al.FIELDS_CACHE_FILE).unlink()          # without BRAIN's field list nothing can be told apart
         assert al.off_list_fields("rank(divide(implied_volatility_call_90, assets))", {"sales"}) == set()
@@ -2114,35 +2011,18 @@ def test_earlier_slow_near_misses_are_sharpened_at_the_start_of_a_run(tmp_path):
              patch("google.genai.Client"), patch("time.sleep"):
             al.main([])
         assert brain.started[:2] == [SHARPER, stripped] and brain.started[2] == "rank(close)"
-        assert {r["expression"]: r["round"] for r in csv_rows()}[SHARPER] == "repair"
+        assert {r["expression"]: r["round"] for r in csv_rows()}[SHARPER] == "follow-up"
     in_tmp(tmp_path, run)
 
 
-def test_a_check_we_cant_fix_is_named_in_the_log(tmp_path):
+def test_a_check_that_didnt_pass_is_named_in_the_log(tmp_path):
     def run():
         unfixable = [{"name": "MATCHES_COMPETITION", "result": "FAIL"}, {"name": "SELF_CORRELATION", "result": "PENDING"}]
         brain = SlowBrain({DIVIDEND: near_miss(unfixable)})
         with captured_logs() as lines:
             run_queue(brain, [DIVIDEND])
-        assert "  Strong numbers but failed MATCHES_COMPETITION - no automatic fix for that check." in lines
-    in_tmp(tmp_path, run)
-
-
-def test_earlier_near_misses_always_say_why_they_werent_repaired(tmp_path):
-    def run():
-        al.append_result(dict(_history_row(DIVIDEND, 1.35, 1.34, 0.1349), alpha_id="div", submitted="NO"))
-        cases = [([{"name": "MATCHES_COMPETITION", "result": "FAIL"}], "fails MATCHES_COMPETITION - no automatic fix"),
-                 ([{"name": "SELF_CORRELATION", "result": "PENDING"}], "BRAIN lists no failed check")]
-        for checks, expected in cases:
-            brain = SlowBrain({DIVIDEND: near_miss(checks)}, existing={"div": DIVIDEND})
-            with captured_logs() as lines, patch("time.sleep"):
-                assert al.repair_past_near_misses(brain.session, SETTINGS, "e@x.com", "pw", set()) == []
-            assert any(expected in line for line in lines), lines
-        empty = SlowBrain({}, existing={})
-        empty.session.get.side_effect = lambda url, **kw: fake_response(404, {"detail": "Not found."})
-        with captured_logs() as lines, patch("time.sleep"):
-            al.repair_past_near_misses(empty.session, SETTINGS, "e@x.com", "pw", set())
-        assert any("couldn't read BRAIN's record of it" in line for line in lines), lines
+        assert "  Strong numbers but failed MATCHES_COMPETITION." in lines
+        assert brain.started == [DIVIDEND]                         # nothing else is tried on it
     in_tmp(tmp_path, run)
 
 
@@ -3517,25 +3397,6 @@ def test_an_idea_differing_only_by_padding_counts_as_already_tried(tmp_path):
     in_tmp(tmp_path, run)
 
 
-def test_repairs_are_built_without_the_padding_and_skip_fixes_tried_with_it(tmp_path):
-    def run():
-        fixes = al.repair_candidates(IV_RATIO, ["LOW_SUB_UNIVERSE_SHARPE"])
-        assert fixes[0][0] == IV_RATIO_BARE.replace("sector", "subindustry") and "add(" not in fixes[1][0]
-        # Your real history: the subindustry and size-bucket versions were already tried, with the padding.
-        al.append_result(dict(_history_row(IV_RATIO.replace("sector", "subindustry"), 2.03, 1.48, 0.169)))
-        al.append_result(dict(_history_row(f"group_neutralize({IV_RATIO}, bucket(rank(cap), range='0, 1, 0.1'))",
-                                           2.13, 1.66, 0.164)))
-        write_cache({"cap": "Price Volume"})
-        left = al.repair_candidates(IV_RATIO, ["LOW_SUB_UNIVERSE_SHARPE"], al.already_tried())
-        assert [e for e, _ in left] == [
-            "ts_decay_linear(group_rank(divide(implied_volatility_call_180, implied_volatility_put_180), sector), 10)"
-            " * rank(ts_mean(volume * close, 20)) + "
-            "ts_decay_linear(group_rank(divide(implied_volatility_call_180, implied_volatility_put_180), sector), 20)"
-            " * (1 - rank(ts_mean(volume * close, 20)))"]
-        assert left[0][1].startswith("failed LOW_SUB_UNIVERSE_SHARPE; the most traded stocks get a faster version")
-    in_tmp(tmp_path, run)
-
-
 def test_the_generator_is_told_not_to_pad_and_what_the_checks_mean():
     client = MagicMock()
     client.models.generate_content.return_value = fake_gemini_response(ONE_IDEA)
@@ -3591,40 +3452,11 @@ def test_smoothing_toward_strong_only_when_it_could_get_there():
         assert not al.smoothing_could_make_it_strong(row(turnover=0.15))                     # trades little already
         assert not al.smoothing_could_make_it_strong(row(sharpe=1.59))                       # Sharpe isn't strong
         assert not al.smoothing_could_make_it_strong(row(fitness=1.3))                       # already strong
-        assert not al.smoothing_could_make_it_strong(row(failed_checks=["LOW_SUB_UNIVERSE_SHARPE"]))  # repairs' job
+        assert not al.smoothing_could_make_it_strong(row(failed_checks=["LOW_SUB_UNIVERSE_SHARPE"]))  # smoothing won't fix that
         for done in ("YES", "VERDICT_PENDING (check with BRAIN in the dashboard)", "TOO_CORRELATED (max 0.91)",
                      "REJECTED: failed SELF_CORRELATION"):
             assert not al.smoothing_could_make_it_strong(row(submitted=done)), done
         assert not al.smoothing_could_make_it_strong(row(sharpe=""))
-
-
-# ---- The third fix for the sub-universe check, and fixes not yet tried ----
-
-def test_the_liquid_split_keeps_the_alphas_own_smoothing_as_its_fast_speed():
-    assert al._liquid_split(DIVIDEND)[0] == LIQUID_SPLIT
-    bare = al._liquid_split("rank(x)")[0]
-    assert bare == ("ts_decay_linear(rank(x), 5) * rank(ts_mean(volume * close, 20)) + "
-                    "ts_decay_linear(rank(x), 10) * (1 - rank(ts_mean(volume * close, 20)))")
-    assert al._liquid_split("hump(rank(x), hump=0.01)")[0] == bare      # hump: its core, default speeds
-
-
-def test_fixes_already_tried_give_way_to_the_next_ones(tmp_path):
-    def run():
-        assert [e for e, _ in al.repair_candidates(DIVIDEND, ["LOW_SUB_UNIVERSE_SHARPE"], {FINER})] == [LIQUID_SPLIT]
-        assert al.repair_candidates(DIVIDEND, ["LOW_SUB_UNIVERSE_SHARPE"], {FINER, LIQUID_SPLIT}) == []
-        assert al.fixable(["LOW_SUB_UNIVERSE_SHARPE"]) and not al.fixable([]) and \
-            not al.fixable(["LOW_SUB_UNIVERSE_SHARPE", "MATCHES_COMPETITION"])
-    in_tmp(tmp_path, run)
-
-
-def test_an_earlier_near_miss_gets_its_next_untried_fix(tmp_path):
-    def run():
-        al.append_result(dict(_history_row(DIVIDEND, 1.35, 1.34, 0.13), alpha_id="div", submitted="NO"))
-        brain = SlowBrain({DIVIDEND: near_miss(SUB_FAIL), LIQUID_SPLIT: calm()}, existing={"div": DIVIDEND})
-        with patch("time.sleep"):
-            rows = al.repair_past_near_misses(brain.session, SETTINGS, "e@x.com", "pw", {DIVIDEND, FINER})
-        assert brain.started == [LIQUID_SPLIT] and rows[0]["round"] == "repair"
-    in_tmp(tmp_path, run)
 
 
 # ---- BRAIN's value and limit for a check that didn't pass ----
@@ -3642,16 +3474,15 @@ def test_checks_that_didnt_pass_show_brains_value_and_limit():
 def test_the_log_and_the_generator_see_the_value_and_limit(tmp_path):
     def run():
         checks = [LSUS_WITH_NUMBERS, {"name": "SELF_CORRELATION", "result": "PENDING"}]
-        brain = SlowBrain({DIVIDEND: near_miss(checks), FINER: calm(), LIQUID_SPLIT: calm()})
+        brain = SlowBrain({DIVIDEND: near_miss(checks)})
         with captured_logs() as lines:
             rows = run_queue(brain, [DIVIDEND], parallel=1)
-        assert any("failed LOW_SUB_UNIVERSE_SHARPE (0.62 vs limit 0.87) - testing a repaired version" in line
-                   for line in lines), lines
+        assert "  Strong numbers but failed LOW_SUB_UNIVERSE_SHARPE (0.62 vs limit 0.87)." in lines, lines
         assert "LOW_SUB_UNIVERSE_SHARPE:FAIL (0.62 vs limit 0.87)" in al.summarize_round(rows)
     in_tmp(tmp_path, run)
 
 
-# ---- The big-stocks check: hopeless gaps aren't repaired, and the generator hears which ideas fail it ----
+# ---- The big-stocks check: no follow-ups, and the generator hears which ideas fail it ----
 
 FAR_GAP = [{"name": "LOW_SUB_UNIVERSE_SHARPE", "result": "FAIL", "value": 0.10, "limit": 0.68},   # your seven
            {"name": "SELF_CORRELATION", "result": "PENDING"}]
@@ -3659,79 +3490,22 @@ NEAR_GAP = [{"name": "LOW_SUB_UNIVERSE_SHARPE", "result": "FAIL", "value": 0.61,
             {"name": "SELF_CORRELATION", "result": "PENDING"}]
 
 
-def test_a_big_stocks_gap_out_of_reach_is_not_repaired(tmp_path):
+def test_a_strong_alpha_failing_the_big_stocks_check_gets_no_follow_up(tmp_path):
     def run():
         brain = SlowBrain({DIVIDEND: near_miss(FAR_GAP)})
         with captured_logs() as lines:
             rows = run_queue(brain, [DIVIDEND], parallel=1)
         assert brain.started == [DIVIDEND] and len(rows) == 1
-        assert any("failed LOW_SUB_UNIVERSE_SHARPE (0.10 vs limit 0.68) - it barely works among the biggest "
-                   "stocks, so no fix can get it through" in line for line in lines), lines
-    in_tmp(tmp_path, run)
-
-
-def test_a_big_stocks_gap_within_reach_is_still_repaired(tmp_path):
-    def run():
-        brain = SlowBrain({DIVIDEND: near_miss(NEAR_GAP), FINER: calm(), LIQUID_SPLIT: calm()})
-        run_queue(brain, [DIVIDEND], parallel=1)
-        assert brain.started == [DIVIDEND, FINER, LIQUID_SPLIT]
-        assert al.out_of_reach(0.31, 0.93) is False and al.out_of_reach(0.30, 0.93) is True   # the line: a third
-        assert al.out_of_reach(None, 0.93) is False and al.out_of_reach(0.1, None) is False
+        assert "  Strong numbers but failed LOW_SUB_UNIVERSE_SHARPE (0.10 vs limit 0.68)." in lines, lines
     in_tmp(tmp_path, run)
 
 
 def test_big_stocks_numbers_are_saved_with_each_result(tmp_path):
     def run():
-        brain = SlowBrain({DIVIDEND: near_miss(NEAR_GAP), FINER: calm(), LIQUID_SPLIT: calm()})
-        run_queue(brain, [DIVIDEND], parallel=1)
+        brain = SlowBrain({DIVIDEND: near_miss(NEAR_GAP), "rank(close)": calm()})
+        run_queue(brain, [DIVIDEND, "rank(close)"], parallel=1)
         saved = {r["expression"]: (r["sub_universe_sharpe"], r["sub_universe_limit"]) for r in csv_rows()}
-        assert saved[DIVIDEND] == ("0.61", "0.93") and saved[FINER] == ("", "")   # calm() reports no such check
-    in_tmp(tmp_path, run)
-
-
-def test_an_earlier_near_miss_out_of_reach_is_noted_once_and_then_left_alone(tmp_path):
-    def run():
-        al.append_result(dict(_history_row(DIVIDEND, 1.35, 1.34, 0.13), alpha_id="div", submitted="NO"))
-        brain = SlowBrain({DIVIDEND: near_miss(FAR_GAP)}, existing={"div": DIVIDEND})
-        with patch("time.sleep"), captured_logs() as lines:
-            assert al.repair_past_near_misses(brain.session, SETTINGS, "e@x.com", "pw", set()) == []
-        assert brain.started == [] and any("barely works among the biggest stocks" in line for line in lines)
-        assert (csv_rows()[0]["sub_universe_sharpe"], csv_rows()[0]["sub_universe_limit"]) == ("0.1", "0.68")
-        brain.session.get.reset_mock()
-        with patch("time.sleep"):
-            al.repair_past_near_misses(brain.session, SETTINGS, "e@x.com", "pw", set())
-        assert not brain.session.get.called                       # known now: BRAIN isn't asked again
-    in_tmp(tmp_path, run)
-
-
-def test_an_earlier_near_miss_gets_its_big_stocks_numbers_filled_in_once(tmp_path):
-    def run():
-        al.append_result(dict(_history_row(DIVIDEND, 1.35, 1.34, 0.13), alpha_id="div", submitted="NO"))
-        brain = SlowBrain({DIVIDEND: near_miss(NEAR_GAP)}, existing={"div": DIVIDEND})
-        tried = set(al.all_repair_variants(DIVIDEND))              # every fix already tried
-        with patch("time.sleep"):
-            assert al.repair_past_near_misses(brain.session, SETTINGS, "e@x.com", "pw", tried) == []
-        assert brain.started == [] and csv_rows()[0]["sub_universe_sharpe"] == "0.61"
-        brain.session.get.reset_mock()
-        with patch("time.sleep"):
-            al.repair_past_near_misses(brain.session, SETTINGS, "e@x.com", "pw", tried)
-        assert not brain.session.get.called
-    in_tmp(tmp_path, run)
-
-
-def test_brain_without_big_stocks_numbers_is_only_asked_once(tmp_path):
-    def run():
-        al.append_result(dict(_history_row(DIVIDEND, 1.35, 1.34, 0.13), alpha_id="div", submitted="NO"))
-        brain = SlowBrain({DIVIDEND: near_miss(CW_FAIL)}, existing={"div": DIVIDEND})   # no big-stocks check listed
-        tried = set(al.all_repair_variants(DIVIDEND))
-        with patch("time.sleep"):
-            al.repair_past_near_misses(brain.session, SETTINGS, "e@x.com", "pw", tried)
-        assert (csv_rows()[0]["sub_universe_sharpe"], csv_rows()[0]["sub_universe_limit"]) == ("-", "-")
-        assert not al.small_stocks_only(csv_rows()[0])
-        brain.session.get.reset_mock()
-        with patch("time.sleep"):
-            al.repair_past_near_misses(brain.session, SETTINGS, "e@x.com", "pw", tried)
-        assert not brain.session.get.called
+        assert saved[DIVIDEND] == ("0.61", "0.93") and saved["rank(close)"] == ("", "")  # calm() has no such check
     in_tmp(tmp_path, run)
 
 
@@ -3785,9 +3559,13 @@ def test_the_generator_is_told_which_ideas_only_work_in_small_stocks(tmp_path):
             "(Sharpe 2.13 overall, 0.57 among the biggest stocks - needs 0.93)",
             "- group_rank(ts_delta(dividend, 90), sector) (Sharpe 1.4 overall, 0.10 among the biggest stocks - "
             "needs 0.68)"]
-        feedback = al.build_feedback()
-        assert "fitness=1.5 turnover=0.15 [fails the big-stocks check: 0.57 vs limit 0.93 - only works in small " \
-               "stocks]" in feedback
+        feedback = al.build_feedback()  # the memory of best results leaves the small-stock ones out
+        assert "implied_volatility" not in feedback and "dividend" not in feedback
+        assert "ts_decay_linear(group_rank(ts_zscore(rel_ret_all, 60), sector), 10)" in feedback
+        assert "ones that only worked in small stocks, or use data left off your field list, are left out" in feedback
+        write_dataset_cache({"rel_ret_all": "pv13", "sales": "fundamental6"})   # pv13 left off the field list
+        Path(al.OPERATORS_FILE).write_text(json.dumps({"operators": [], "fields": [{"name": "sales", "description": "d"}]}))
+        assert "rel_ret_all" not in al.build_feedback()
         assert "rel_ret_all, 60), sector), 10) -> sharpe=1.86 fitness=1.5 turnover=0.15\n" in feedback + "\n"
         client = MagicMock()
         client.models.generate_content.return_value = fake_gemini_response(ONE_IDEA)
@@ -3843,6 +3621,339 @@ def test_an_older_gemini_library_still_works_without_a_time_limit():
          captured_logs() as lines:
         assert al.gemini_client() is plain
     assert any("can't put a time limit on Gemini requests" in line for line in lines)
+
+# ---- Auto-blend: a good Sharpe that misses only on fitness, added to your best slow alphas ----
+
+REV = ("reverse(ts_decay_linear(group_neutralize(group_rank(divide(close, vwap), sector), "
+       "bucket(rank(cap), range='0, 1, 0.1')), 10))")
+EBIT = ("ts_decay_linear(group_neutralize(group_rank(ts_delta(anl4_ebit_value, 90) / ts_std_dev(anl4_ebit_value, 180), "
+        "industry), bucket(rank(cap), range='0, 1, 0.1')), 20)")
+UNSYS = "ts_decay_linear(group_rank(ts_zscore(unsystematic_risk_last_90_days, 60), sector), 15)"
+BLEND_DATASETS = {"anl4_ebit_value": "analyst4", "sales_estimate_median_value": "analyst4",
+                  "unsystematic_risk_last_90_days": "model51", "implied_volatility_put_90": "option8",
+                  "snt_buzz": "socialmedia12", "close": "pv1", "vwap": "pv1", "cap": "pv1"}
+FAST_CHECKS = [{"name": "LOW_FITNESS", "result": "FAIL"},
+               {"name": "LOW_SUB_UNIVERSE_SHARPE", "result": "PASS", "value": 1.09, "limit": 0.86},
+               {"name": "SELF_CORRELATION", "result": "PENDING"}]
+BLEND_EBIT, BLEND_UNSYS = f"rank({REV}) + rank({EBIT})", f"rank({REV}) + rank({UNSYS})"
+SMOOTHED_REV = f"ts_decay_linear({REV}, 10)"
+
+
+def fast_json(checks=None, **kw):
+    """Your close/vwap reversal: Sharpe 1.99, fitness 0.99 at 55% turnover, big-stocks check passed."""
+    stats = dict(sharpe=1.99, fitness=0.99, turnover=0.5546, checks=FAST_CHECKS if checks is None else checks)
+    stats.update(kw)
+    return alpha_json(**stats)
+
+
+def saved_row(expression, sharpe, turnover, fitness=1.4, big="0.9", limit="0.8", alpha_id="", submitted="NO",
+              passed="7", total="8", rationale="r"):
+    row = _history_row(expression, sharpe, fitness, turnover)
+    row.update(alpha_id=alpha_id, submitted=submitted, sub_universe_sharpe=big, sub_universe_limit=limit,
+               checks_passed=passed, checks_total=total, rationale=rationale)
+    return row
+
+
+def save_partners():
+    """Your slow alphas, as the results file has them, plus ones that mustn't be picked as partners."""
+    write_dataset_cache(BLEND_DATASETS)
+    for row in [
+        saved_row(EBIT, 1.96, 0.0416, big="0.85", limit="0.85", submitted="TOO_CORRELATED (max 0.81)"),  # best
+        saved_row(UNSYS, 1.7, 0.096, big="0.9", limit="0.74", submitted="YES"),                       # other data
+        saved_row("ts_decay_linear(group_rank(ts_delta(anl4_ebit_value, 60), sector), 20)", 1.5, 0.05),  # same data
+        saved_row("rank(ts_delta(close, 5))", 2.0, 0.3),                                              # not slow
+        saved_row("ts_decay_linear(group_rank(implied_volatility_put_90, sector), 20)", 2.1, 0.06,
+                  big="0.5", limit="0.9"),                                                             # small stocks
+        saved_row("ts_decay_linear(group_rank(sales_estimate_median_value, sector), 20)", 1.9, 0.05,
+                  fitness=0.8),                                                                         # under the bar
+        saved_row("ts_decay_linear(group_rank(snt_buzz, sector), 20)", 1.95, 0.05, passed="5"),      # a check failed
+        saved_row("ts_decay_linear(group_rank(ts_delta(snt_buzz, 5), sector), 20)", 1.94, 0.05, big="", limit=""),
+    ]:
+        al.append_result(row)
+
+
+def test_operator_count_matches_brains_count():
+    assert al.operator_count("rank(a) + ts_mean(b, 5) * 2") == 4
+    assert al.operator_count("group_neutralize(x, bucket(rank(cap), range='0, 1, 0.1'))") == 3  # quotes don't count
+    assert al.operator_count("ts_decay_linear(rank(close > open), 5) - 1") == 4
+    sixty_four = "rank(" * 64 + "close" + ")" * 64
+    assert not al.too_long(sixty_four) and al.too_long(f"rank({sixty_four})")
+
+
+def test_expressions_over_brains_operator_limit_are_never_sent(tmp_path):
+    def run():
+        long_one = "rank(" * 65 + "close" + ")" * 65
+        brain = SlowBrain({"rank(close)": calm()})
+        with captured_logs() as lines:
+            rows = run_queue(brain, [long_one, "rank(close)"], parallel=1)
+        assert brain.started == ["rank(close)"] and len(rows) == 1
+        assert any("it has 65 operators, and BRAIN refuses more than 64" in line for line in lines), lines
+        client = MagicMock()
+        client.models.generate_content.return_value = fake_gemini_response(
+            [{"expression": long_one, "rationale": "r"}, {"expression": "rank(open)", "rationale": "r"}])
+        brain = SlowBrain({"rank(open)": calm()})
+        with patch("time.sleep"), captured_logs() as lines:
+            al.run_round(brain.session, client, [], [], SETTINGS, "e@x.com", "pw", 1, "round 1", set())
+        assert brain.started == ["rank(open)"]
+        assert any("Skipped 1 idea(s) with more than 64 operators" in line for line in lines), lines
+    in_tmp(tmp_path, run)
+
+
+def test_which_alphas_are_worth_a_blend():
+    good = {"sharpe": "1.99", "fitness": "0.99", "turnover": "0.5546", "sub_universe_sharpe": "1.09",
+            "sub_universe_limit": "0.86"}
+    assert al.blend_worthy(good)
+    assert al.blend_worthy(dict(good, sub_universe_sharpe="", sub_universe_limit=""))       # numbers unknown
+    assert al.blend_worthy(dict(good, failed_checks=["LOW_FITNESS", "HIGH_TURNOVER"]))
+    assert not al.blend_worthy(dict(good, failed_checks=["LOW_FITNESS", "CONCENTRATED_WEIGHT"]))
+    assert not al.blend_worthy(dict(good, sub_universe_sharpe="0.5"))                      # small stocks only
+    assert not al.blend_worthy(dict(good, sharpe="1.2"))                                   # Sharpe isn't there
+    assert not al.blend_worthy(dict(good, fitness="1.0"))                                  # nothing to fix
+    assert not al.blend_worthy(dict(good, turnover="1.0"))                                 # still over 70% blended
+    assert al.blend_worthy(dict(good, turnover="0.98"))
+    assert not al.blend_worthy(dict(good, sharpe=""))
+
+
+def test_partners_are_your_best_slow_alphas_on_other_data(tmp_path):
+    def run():
+        save_partners()
+        assert [p for p, _ in al.blend_partners(REV)] == [EBIT, UNSYS]
+        assert [p for p, _ in al.blend_partners("rank(anl4_ebit_value)")] == [UNSYS]          # not its own data
+        # Datasets left off your field list stay out of blends too.
+        Path(al.OPERATORS_FILE).write_text(json.dumps({"operators": [], "fields": [
+            {"name": "sales_estimate_median_value", "description": "d"}, {"name": "close", "description": "d"}]}))
+        assert [p for p, _ in al.blend_partners(REV)] == [EBIT]
+        assert al.listed_datasets() == {"analyst4"}
+        # Too long to add: the blend would pass BRAIN's operator limit.
+        assert al.blend_partners("rank(" * 60 + "close" + ")" * 60) == []
+        # A blend is never a partner: it already carries a fast signal.
+        Path(al.OPERATORS_FILE).unlink()
+        al.append_result(saved_row(f"{REV} + {EBIT}", 2.76, 0.128, big="1.33", limit="1.2"))
+        al.append_result(saved_row("rank(ts_zscore(anl4_ebit_value, 90))", 2.5, 0.05, rationale="Auto-blend of x: y."))
+        assert [p for p, _ in al.blend_partners(REV)] == [EBIT, UNSYS]
+    in_tmp(tmp_path, run)
+
+
+def test_a_fast_alpha_missing_only_fitness_is_blended_right_after(tmp_path):
+    def run():
+        save_partners()
+        brain = SlowBrain({REV: fast_json(), BLEND_EBIT: calm(), BLEND_UNSYS: calm(), SMOOTHED_REV: calm(),
+                           "rank(b)": calm()})
+        with captured_logs() as lines:
+            rows = run_queue(brain, [REV, "rank(b)"], parallel=1)
+        assert brain.started == [REV, BLEND_EBIT, BLEND_UNSYS, SMOOTHED_REV, "rank(b)"]
+        blend = next(r for r in rows if r["expression"] == BLEND_EBIT)
+        assert blend["rationale"].startswith(f"Auto-blend of {REV}: added to your slow alpha {EBIT} (Sharpe 1.96, "
+                                             f"turnover 4.2%)")
+        assert any("testing it added to 2 of your best slow alphas next" in line for line in lines), lines
+    in_tmp(tmp_path, run)
+
+
+def test_a_blend_that_clears_the_bar_is_submitted(tmp_path):
+    def run():
+        save_partners()
+        brain = SlowBrain({REV: fast_json(), BLEND_EBIT: alpha_json(sharpe=2.6, fitness=1.6, turnover=0.39),
+                           BLEND_UNSYS: calm(), SMOOTHED_REV: calm()})
+        with patch.object(al, "submit_alpha", return_value=("YES", None)), \
+             patch.object(al, "is_active_on_brain", return_value=True):
+            rows = run_queue(brain, [REV], parallel=1)
+        assert {r["expression"]: r["submitted"] for r in rows}[BLEND_EBIT] == "YES"
+    in_tmp(tmp_path, run)
+
+
+def test_blends_are_capped_and_never_blended_again(tmp_path):
+    def run():
+        save_partners()
+        fast = [REV.replace("10))", f"{d}))") for d in (10, 12, 14)]
+        results = {e: fast_json() for e in fast}
+        for e in fast:  # every blend misses on fitness again
+            results[f"rank({e}) + rank({EBIT})"] = fast_json()
+            results[f"rank({e}) + rank({UNSYS})"] = fast_json()
+            results[f"ts_decay_linear({e}, 10)"] = calm()
+        brain = SlowBrain(results)
+        rows = run_queue(brain, fast, parallel=1)
+        blends = [r for r in rows if r["rationale"].startswith("Auto-blend")]
+        assert len(blends) == al.MAX_BLENDS_PER_ROUND == 4
+        assert not any(r["expression"].startswith("rank(rank(") for r in rows)
+    in_tmp(tmp_path, run)
+
+
+def test_at_most_two_blends_per_alpha_and_the_round_cap_holds_exactly(tmp_path):
+    def run():
+        save_partners()
+        write_dataset_cache(dict(BLEND_DATASETS, rel_ret_all="pv13"))
+        al.append_result(saved_row("ts_decay_linear(group_rank(ts_zscore(rel_ret_all, 60), sector), 10)", 1.65, 0.13))
+        assert len(al.blend_partners(REV)) == 3 and len(al.blend_candidates(REV)) == 2
+        fast = [REV.replace("10))", f"{d}))") for d in (10, 12)]
+        results = {e: fast_json() for e in fast}
+        for e in fast:
+            for partner in (EBIT, UNSYS):
+                results[f"rank({e}) + rank({partner})"] = calm()
+            results[f"ts_decay_linear({e}, 10)"] = calm()
+        brain = SlowBrain(results)
+        with patch.object(al, "MAX_BLENDS_PER_ROUND", 3):
+            rows = run_queue(brain, fast, parallel=1)
+        assert sum(r["rationale"].startswith("Auto-blend") for r in rows) == 3   # 2 for the first, 1 left for the next
+    in_tmp(tmp_path, run)
+
+
+def test_an_earlier_near_miss_too_similar_to_your_alphas_is_not_blended(tmp_path):
+    def run():
+        save_partners()
+        al.append_result(saved_row(REV, 1.99, 0.5546, fitness=0.99, big="1.09", limit="0.86", alpha_id="rev"))
+        brain = SlowBrain({}, corr=0.9, existing={"rev": REV})
+        with patch("time.sleep"), captured_logs() as lines:
+            assert al.follow_up_past_near_misses(brain.session, SETTINGS, "e@x.com", "pw", set()) == []
+        assert brain.started == [] and any("too similar to your submitted alphas" in line for line in lines)
+    in_tmp(tmp_path, run)
+
+def test_no_blend_when_it_cant_help(tmp_path):
+    def run():
+        save_partners()
+        cases = {
+            "too similar already": (fast_json(), 0.88),
+            "small stocks only": (fast_json(checks=[{"name": "LOW_FITNESS", "result": "FAIL"}, {
+                "name": "LOW_SUB_UNIVERSE_SHARPE", "result": "FAIL", "value": 0.4, "limit": 0.86}]), 0.3),
+            "another check failed": (fast_json(checks=[{"name": "LOW_FITNESS", "result": "FAIL"},
+                                                       {"name": "CONCENTRATED_WEIGHT", "result": "FAIL"}]), 0.3),
+            "fitness is fine": (fast_json(fitness=1.2, checks=QUALIFYING_CHECKS), 0.3),
+        }
+        for why, (result, corr) in cases.items():
+            brain = SlowBrain({REV: result, SMOOTHED_REV: calm()}, corr=corr)
+            with patch.object(al, "PORTFOLIO_CHECK", False), patch.object(al, "submit_alpha", return_value=("YES", None)), \
+                 patch.object(al, "is_active_on_brain", return_value=True):
+                run_queue(brain, [REV], parallel=1)
+            assert not any(e.startswith("rank(") for e in brain.started), why
+            Path(al.RESULTS_FILE).unlink()
+            save_partners()
+        Path(al.RESULTS_FILE).unlink()                              # no slow alpha to add: nothing to blend
+        brain = SlowBrain({REV: fast_json(), SMOOTHED_REV: calm()})
+        run_queue(brain, [REV], parallel=1)
+        assert brain.started == [REV, SMOOTHED_REV]
+    in_tmp(tmp_path, run)
+
+
+def test_an_earlier_near_miss_is_blended_at_the_start_of_a_run(tmp_path):
+    def run():
+        _write_operators()
+        save_partners()
+        al.append_result(saved_row(REV, 1.99, 0.5546, fitness=0.99, big="1.09", limit="0.86", alpha_id="rev",
+                                   passed="6"))
+        brain = SlowBrain({BLEND_EBIT: calm(), BLEND_UNSYS: calm(), "rank(close)": calm()}, existing={"rev": REV})
+        gen = MagicMock(return_value=[("rank(close)", "r")])
+        with patch.object(al, "MAX_ROUNDS", 1), patch.object(al, "generate_with_fallback", gen), \
+             patch.object(al, "get_authenticated_session", return_value=brain.session), \
+             patch("google.genai.Client"), patch("time.sleep"):
+            al.main([])
+        assert brain.started[:3] == [BLEND_EBIT, BLEND_UNSYS, "rank(close)"]    # before Gemini's ideas
+        assert {r["expression"]: r["round"] for r in csv_rows()}[BLEND_EBIT] == "follow-up"
+        # Next run: both blends were tried, so it's left alone - BRAIN isn't even asked about it.
+        brain.session.get.reset_mock()
+        with patch("time.sleep"):
+            assert al.follow_up_past_near_misses(brain.session, SETTINGS, "e@x.com", "pw", al.already_tried()) == []
+        assert not brain.session.get.called
+    in_tmp(tmp_path, run)
+
+
+def test_an_earlier_near_miss_without_big_stocks_numbers_gets_them_read_once(tmp_path):
+    def run():
+        save_partners()
+        al.append_result(saved_row(REV, 1.99, 0.5546, fitness=0.99, big="", limit="", alpha_id="rev"))
+        failing = fast_json(checks=[{"name": "LOW_SUB_UNIVERSE_SHARPE", "result": "FAIL", "value": 0.4, "limit": 0.86}])
+        brain = SlowBrain({REV: failing}, existing={"rev": REV})
+        with patch("time.sleep"), captured_logs() as lines:
+            assert al.follow_up_past_near_misses(brain.session, SETTINGS, "e@x.com", "pw", set()) == []
+        assert any("fails the big-stocks check (0.40 vs limit 0.86) - not blending it" in line for line in lines)
+        saved = {r["alpha_id"]: (r["sub_universe_sharpe"], r["sub_universe_limit"]) for r in csv_rows()}
+        assert saved["rev"] == ("0.4", "0.86")
+        brain.session.get.reset_mock()
+        with patch("time.sleep"):
+            al.follow_up_past_near_misses(brain.session, SETTINGS, "e@x.com", "pw", set())
+        assert not brain.session.get.called                        # known now: not asked again, not blended
+        # BRAIN has no such numbers: saved as "-", and the near-miss is blended.
+        Path(al.RESULTS_FILE).unlink()
+        save_partners()
+        al.append_result(saved_row(REV, 1.99, 0.5546, fitness=0.99, big="", limit="", alpha_id="rev"))
+        brain = SlowBrain({REV: fast_json(checks=[]), BLEND_EBIT: calm(), BLEND_UNSYS: calm()}, existing={"rev": REV})
+        with patch("time.sleep"):
+            rows = al.follow_up_past_near_misses(brain.session, SETTINGS, "e@x.com", "pw", set())
+        assert [r["expression"] for r in rows] == [BLEND_EBIT, BLEND_UNSYS]
+        assert {r["alpha_id"]: r["sub_universe_sharpe"] for r in csv_rows()}["rev"] == "-"
+    in_tmp(tmp_path, run)
+
+
+def test_blend_rows_pick_unsubmitted_originals_on_your_data_best_first(tmp_path):
+    def run():
+        write_dataset_cache(BLEND_DATASETS)
+        rows = [saved_row(REV, 1.99, 0.55, fitness=0.99, alpha_id="a"),
+                saved_row(REV.replace("10))", "15))"), 1.87, 0.46, fitness=0.99, alpha_id="b"),     # same idea
+                saved_row("rank(ts_zscore(unsystematic_risk_last_90_days, 20))", 2.1, 0.5, fitness=0.9, alpha_id="c"),
+                saved_row("rank(implied_volatility_put_90)", 2.2, 0.5, fitness=0.9, alpha_id="d"),
+                saved_row("rank(snt_buzz)", 2.3, 0.5, fitness=0.9, alpha_id="e", submitted="YES"),
+                saved_row(BLEND_EBIT, 2.4, 0.4, fitness=0.95, alpha_id="f", rationale="Auto-blend of x: y."),
+                saved_row("rank(ts_delta(close, 3))", 1.6, 0.5, fitness=0.9, alpha_id="g", big="0.3", limit="0.7")]
+        for r in rows:
+            al.append_result(r)
+        assert [r["alpha_id"] for r in al.blend_rows()] == ["d", "c", "a"]
+        Path(al.OPERATORS_FILE).write_text(json.dumps({"operators": [], "fields": [
+            {"name": "unsystematic_risk_last_90_days", "description": "d"}]}))
+        assert [r["alpha_id"] for r in al.blend_rows()] == ["c", "a"]           # options left off the list
+    in_tmp(tmp_path, run)
+
+
+def test_fields_whose_good_scores_all_failed_the_big_stocks_check_are_dead_ends(tmp_path):
+    def run():
+        for i in range(8):
+            al.append_result(saved_row(f"rank(ts_delta(snt_buzz, {i + 1}))", 0.3, 0.1, fitness=0.2, big="", limit=""))
+            al.append_result(saved_row(f"rank(ts_delta(sales_est, {i + 1}))", 0.3, 0.1, fitness=0.2, big="", limit=""))
+        al.append_result(saved_row("rank(snt_buzz)", 1.8, 0.04, fitness=2.2, big="-0.6", limit="0.78"))  # small stocks
+        al.append_result(saved_row("rank(sales_est)", 1.3, 0.04, fitness=0.9, big="0.6", limit="0.5"))   # big ones too
+        dead = al.dead_end_fields()
+        assert dead == {"snt_buzz": (9, 0.2)} and "sales_est" not in dead
+        al.append_result(saved_row("rank(only_small)", 1.8, 0.04, fitness=2.2, big="-0.6", limit="0.78"))
+        with patch.object(al, "DEAD_END_MIN_TRIES", 1):
+            assert al.dead_end_fields()["only_small"] == (1, None)
+            note = al.avoid_note(set(), al.dead_end_fields())
+        assert "never reached fitness 0.5 outside small stocks" in note and "only_small (1 tries, only small-stock " \
+                                                                            "results)" in note
+    in_tmp(tmp_path, run)
+
+
+def test_the_generator_is_shown_what_works_on_your_account(tmp_path):
+    def run():
+        write_dataset_cache({"anl4_ebit_value": "analyst4", "snt_buzz": "socialmedia12", "rel_ret_all": "pv13"})
+        for i in range(10):
+            submitted = {0: "YES", 1: "TOO_CORRELATED (max 0.8)"}.get(i, "NO")
+            al.append_result(saved_row(f"rank(ts_delta(anl4_ebit_value, {i + 1}))", 1.0, 0.1, submitted=submitted))
+            al.append_result(saved_row(f"rank(ts_delta(snt_buzz, {i + 1}))", 0.3, 0.1))
+            al.append_result(saved_row(f"rank(ts_delta(close, {i + 1}))", 0.3, 0.1))
+        al.append_result(saved_row("rank(snt_buzz)", 0.3, 0.1))
+        for i in range(3):                                                   # too few tests to score
+            al.append_result(saved_row(f"rank(ts_delta(rel_ret_all, {i + 1}))", 1.5, 0.1, submitted="YES"))
+        card = al.data_scorecard()
+        assert card.splitlines() == [
+            "Data that has produced alphas passing every check here (passed / tested):",
+            "- ANALYST4 (analyst4): 2 of 10 (e.g. anl4_ebit_value)",
+            "Data that never has, after 10+ tests - only use it with a clear reason it would also work in large stocks:",
+            "- SOCIALMEDIA12 (socialmedia12): 0 of 11 (e.g. snt_buzz)",
+            "- price/volume data only: 0 of 10"]
+        client = MagicMock()
+        client.models.generate_content.return_value = fake_gemini_response(ONE_IDEA)
+        brain = SlowBrain({"rank(close)": calm()})
+        with patch("time.sleep"):
+            al.run_round(brain.session, client, [], [{"name": "close", "description": "d"}], SETTINGS,
+                         "e@x.com", "pw", 1, "round 1", set())
+        prompt = client.models.generate_content.call_args.kwargs["contents"]
+        assert "WHAT HAS WORKED ON THIS ACCOUNT" in prompt and "ts_delta(x, 90) / ts_std_dev(x, 180)" in prompt
+        assert "bucket(rank(cap), range='0, 1, 0.1')" in prompt and "rank(fast) + rank(slow)" in prompt
+        assert "- ANALYST4 (analyst4): 2 of 10" in prompt
+        assert "re-tested added to your best slow alphas" in prompt
+        # With a field list, only its datasets are scored (price/volume always is).
+        Path(al.OPERATORS_FILE).write_text(json.dumps({"operators": [], "fields": [
+            {"name": "anl4_ebit_value", "description": "d"}]}))
+        assert "SOCIALMEDIA12" not in al.data_scorecard() and "ANALYST4" in al.data_scorecard()
+        assert "price/volume data only" in al.data_scorecard()
+    in_tmp(tmp_path, run)
 
 
 if __name__ == "__main__":
