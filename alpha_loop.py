@@ -73,23 +73,29 @@ READ BEFORE YOU RUN THIS:
   Fitness divides by turnover, so trading less can lift it over the bar. The same goes for a strong Sharpe
   whose fitness misses the strong bar: with no failed check, turnover over SMOOTH_TOWARD_STRONG_MIN_TURNOVER
   (0.15), and fitness that would reach STRONG_MIN_FITNESS at BRAIN's 12.5% turnover floor with the same returns.
-- Auto-blend: an alpha with Sharpe >= 1.25 that misses only on fitness - usually a fast signal that trades too
-  much - is re-tested added to one of your best slow alphas built on other data: rank(<expression>) + rank(<slow>).
-  Two unrelated signals added together trade about half as much and usually beat both on Sharpe and fitness. A slow
-  partner is one of your results that cleared BRAIN's bar with every check but similarity passed, passed the
-  big-stocks check on BRAIN's numbers and trades under BLEND_PARTNER_MAX_TURNOVER (15%), using data from datasets on
-  your field list; the best Sharpe goes first, one per kind of data. Up to MAX_BLENDS_PER_ALPHA (default 2) blends
-  per alpha and MAX_BLENDS_PER_ROUND (default 4) per round, after the free similarity check: an original that's
-  already too similar to your submitted alphas isn't blended. An alpha that failed the big-stocks check isn't
-  blended either - a partner doesn't make a small-stocks idea work in big ones. (This replaced the old auto-repair:
-  its 307 tests on your account - finer groups, size buckets, the liquid/illiquid split, rank or ts_backfill - never
-  produced an alpha that passed every check, and repairs of repairs grew past BRAIN's 64-operator limit.)
+- Auto-blend: an alpha with Sharpe >= 1.25 that isn't strong yet - it misses on fitness (usually a fast signal that
+  trades too much), or it clears the bar without reaching the strong one - is re-tested added to one of your best slow
+  alphas with a different idea: rank(<expression>) + rank(<slow>). Two unrelated signals added together trade about
+  half as much and usually beat both on Sharpe and fitness, and strong alphas weigh more in your combined score. A
+  slow partner is one of your results with Sharpe >= BLEND_PARTNER_MIN_SHARPE (1.0), every check passed except
+  similarity and the ones its own Sharpe or fitness explain, the big-stocks check passed on BRAIN's numbers, turnover
+  under BLEND_PARTNER_MAX_TURNOVER (15%), no data field in common with the alpha and either other data or - on the same
+  data - one tracking a level and the other a change (earnings yield and cash-flow surprise are both analyst data but
+  different ideas), using datasets on
+  your field list; the best Sharpe goes first - alphas outside your submitted pool before ones in it or too similar to
+  it - one per kind of data, never a blend. Up to MAX_BLENDS_PER_ALPHA (default
+  2) blends per alpha and MAX_BLENDS_PER_ROUND (default 4) per round, after the free similarity check: an original
+  that's already too similar to your submitted alphas - or held as somewhat similar - isn't blended. A held alpha
+  stays held while its blends are tested. An alpha that failed the big-stocks check isn't blended either - a partner
+  doesn't make a small-stocks idea work in big ones. (This replaced the old auto-repair: its 307 tests on your account
+  - finer groups, size buckets, the liquid/illiquid split, rank or ts_backfill - never produced an alpha that passed
+  every check, and repairs of repairs grew past BRAIN's 64-operator limit.)
   A strong alpha failing a check still gets a log line naming it, with BRAIN's value and limit when BRAIN gives them.
 - Auto-sharpen: an alpha with Sharpe >= 1.25 but fitness under 1.0 whose turnover is already under 12.5%
   - where BRAIN's fitness formula stops giving credit for trading less - is re-tested without its outer
   ts_decay_linear/hump (up to MAX_SHARPENS_PER_ROUND, default 3), after the same free similarity check.
-- Each normal run starts with earlier near-misses: up to MAX_PAST_BLENDS (default 3) that missed only on fitness
-  (with BRAIN's big-stocks numbers on file and passing) get the blends not tried yet, best Sharpe first, and up to
+- Each normal run starts with earlier alphas worth a blend: up to MAX_PAST_BLENDS (default 3) that missed on fitness
+  or are held without being strong (with BRAIN's big-stocks numbers on file and passing) get the blends not tried yet, best Sharpe first, and up to
   MAX_PAST_SHARPENS (default 3) slow ones get sharpened.
 - Operator limit: BRAIN refuses an expression with more than 64 operators (every function call and every
   + - * / or comparison counts). Longer ideas are skipped before they're sent.
@@ -326,6 +332,7 @@ MAX_BLENDS_PER_ROUND = int(os.environ.get("MAX_BLENDS_PER_ROUND", 4))
 MAX_PAST_BLENDS = int(os.environ.get("MAX_PAST_BLENDS", 3))  # earlier near-misses blended at the start of each run
 MAX_PAST_SHARPENS = int(os.environ.get("MAX_PAST_SHARPENS", 3))  # ...and earlier slow ones sharpened
 BLEND_PARTNER_MAX_TURNOVER = float(os.environ.get("BLEND_PARTNER_MAX_TURNOVER", 0.15))  # what counts as slow
+BLEND_PARTNER_MIN_SHARPE = float(os.environ.get("BLEND_PARTNER_MIN_SHARPE", 1.0))
 BLEND_FIXES = {"LOW_FITNESS", "HIGH_TURNOVER"}  # failed checks a blend can fix; any other failure rules it out
 # BRAIN refuses an expression with more operators than this: every function call and every + - * / or comparison.
 MAX_OPERATORS = 64
@@ -1947,17 +1954,46 @@ def top_level_sum(expression: str) -> bool:
 
 
 def blend_worthy(row) -> bool:
-    """Sharpe over BRAIN's bar and fitness under it, with nothing else known to be wrong: the big-stocks check isn't
-    failed (BRAIN's numbers, when there are any), no check FAILed apart from fitness or turnover (when BRAIN's checks
-    are at hand), and turnover a blend - which trades about 1/sqrt(2) as much - can bring under BRAIN's 70%."""
+    """Sharpe over BRAIN's bar but the alpha isn't strong yet - fitness under the bar, or it clears the bar without
+    reaching the strong one - with nothing else known to be wrong: the big-stocks check isn't failed (BRAIN's numbers,
+    when there are any), no check FAILed apart from fitness or turnover (when BRAIN's checks are at hand), and turnover
+    a blend - which trades about 1/sqrt(2) as much - can bring under BRAIN's 70%. Strong alphas weigh more in your
+    combined score than ones that only just clear the bar, so making one strong is worth a simulation."""
     sharpe, fitness, turnover = (as_float(row.get(k)) for k in ("sharpe", "fitness", "turnover"))
     if sharpe is None or fitness is None or turnover is None:
         return False
-    if sharpe < SUBMIT_MIN_SHARPE or fitness >= SUBMIT_MIN_FITNESS or turnover / math.sqrt(2) > TURNOVER_MAX:
+    if sharpe < SUBMIT_MIN_SHARPE or turnover / math.sqrt(2) > TURNOVER_MAX:
         return False
+    if fitness >= SUBMIT_MIN_FITNESS and row_is_strong(row):
+        return False  # strong already
     if small_stocks_only(row):
         return False
     return not set(row.get("failed_checks") or ()) - BLEND_FIXES
+
+
+def blendable_outcome(row) -> bool:
+    """Not submitted, or held for a reason a blend could change: waiting for a free slot, not strong, or lowering
+    your combined portfolio. One held as somewhat similar to your submitted alphas isn't - its blends would be too."""
+    submitted = (row.get("submitted") or "NO").strip()
+    return submitted in ("NO", "") or submitted in (HELD_LABEL, HELD_FOR_STRONGER_LABEL, HELD_PORTFOLIO_LABEL)
+
+
+def tracks_change(expression: str) -> bool:
+    """Whether the idea under any outer smoothing works on how the data changes over time (any ts_* operator: a
+    surprise, a revision, a z-score) rather than on its level (a ratio such as earnings yield)."""
+    return bool(re.search(r"\bts_\w+\s*\(", _blank_quotes(idea_core(expression))))
+
+
+def different_idea(expression: str, partner: str) -> bool:
+    """Whether a partner brings a different idea: no data field in common, and either other data or - on the same
+    data - one tracks a level and the other a change (earnings yield and cash-flow surprise are both analyst data, but
+    different ideas; cash-flow surprise and an earnings z-score are one idea, changes in what companies report)."""
+    fields = lambda e: {n for _, _, n in data_fields_in(e) if n not in BASIC_FIELDS}
+    if fields(expression) & fields(partner):
+        return False
+    if not alpha_kind(expression) & alpha_kind(partner):
+        return True
+    return tracks_change(expression) != tracks_change(partner)
 
 
 def passed_every_check(row) -> bool:
@@ -1967,29 +2003,39 @@ def passed_every_check(row) -> bool:
 
 
 def blend_partners(expression: str) -> list:
-    """(partner expression, its row) - your slow alphas worth adding to `expression`, best Sharpe first, one per kind
-    of data: cleared BRAIN's bar with every check but similarity passing, passed the big-stocks check on BRAIN's
-    numbers, trade under BLEND_PARTNER_MAX_TURNOVER, built on other data than `expression`, using datasets on your
-    field list, short enough that the blend stays under BRAIN's operator limit, and not blends themselves."""
-    kind, datasets = alpha_kind(expression), listed_datasets()
+    """(partner expression, its row) - your slow alphas worth adding to `expression`, best Sharpe first (ones outside
+    your submitted pool before ones in it or too similar to it), one per kind of data: Sharpe at least BLEND_PARTNER_MIN_SHARPE with every check passed except the ones its own Sharpe and
+    fitness explain and similarity, the big-stocks check passed on BRAIN's numbers, trading under
+    BLEND_PARTNER_MAX_TURNOVER, a different idea from `expression` (different_idea), using datasets on your field list,
+    short enough that the blend stays under BRAIN's operator limit, and not blends themselves."""
+    datasets = listed_datasets()
     room = MAX_OPERATORS - operator_count(expression) - 3  # rank() twice and the +
-    rows = sorted(completed_history(), key=lambda r: as_float(r.get("sharpe")) or 0.0, reverse=True)
+
+    def in_pool(r):  # submitted, or too similar to one that is: a blend with it would carry some of that likeness
+        submitted = (r.get("submitted") or "").strip()
+        return submitted == "YES" or submitted.startswith(("VERDICT_PENDING", "TOO_CORRELATED"))
+
+    rows = sorted(completed_history(), key=lambda r: (not in_pool(r), as_float(r.get("sharpe")) or 0.0), reverse=True)
     out, kinds_taken = [], []
     for r in rows:
         partner = strip_padding(r["expression"]).strip()
         if top_level_sum(partner) or (r.get("rationale") or "").startswith("Auto-blend"):
             continue  # a blend already carries a fast signal - adding it would double that up
-        turnover = as_float(r.get("turnover"))
+        sharpe, fitness, turnover = (as_float(r.get(k)) for k in ("sharpe", "fitness", "turnover"))
         big, limit = as_float(r.get("sub_universe_sharpe")), as_float(r.get("sub_universe_limit"))
         passed, total = as_float(r.get("checks_passed")), as_float(r.get("checks_total"))
-        cleared = strong_numbers(r) and (passed_every_check(r) or (passed is not None and total is not None
-                                                                     and passed >= total - 1))
-        if not cleared or turnover is None or not TURNOVER_MIN <= turnover <= BLEND_PARTNER_MAX_TURNOVER:
+        if sharpe is None or fitness is None or sharpe < BLEND_PARTNER_MIN_SHARPE:
+            continue
+        if turnover is None or not TURNOVER_MIN <= turnover <= BLEND_PARTNER_MAX_TURNOVER:
             continue
         if big is None or limit is None or big < limit:
             continue
+        # Checks that may be short: similarity (pending until submitted), and Sharpe or fitness when under the bar.
+        allowed = 1 + (sharpe < SUBMIT_MIN_SHARPE) + (fitness < SUBMIT_MIN_FITNESS)
+        if not passed_every_check(r) and (passed is None or total is None or passed < total - allowed):
+            continue
         partner_kind = alpha_kind(partner)
-        if partner_kind & kind or any(partner_kind & taken for taken in kinds_taken):
+        if not different_idea(expression, partner) or any(partner_kind & taken for taken in kinds_taken):
             continue
         if not on_listed_data(partner, datasets) or operator_count(partner) > room:
             continue
@@ -3129,14 +3175,16 @@ def queue_followups(session, row, kind, queue, avoid, counts):
         elif row.get("failing_checks"):
             logger.info("  Strong numbers but not every check passed (%s).", row["failing_checks"])
 
-    # Auto-blend: Sharpe is there, fitness isn't, and nothing else is known to be wrong - add a slow alpha.
-    if (kind != "blend" and counts["blends"] < MAX_BLENDS_PER_ROUND and row.get("submitted", "NO") == "NO"
+    # Auto-blend: Sharpe is there but the alpha isn't strong, and nothing else is known to be wrong - add a slow alpha.
+    if (kind != "blend" and counts["blends"] < MAX_BLENDS_PER_ROUND and blendable_outcome(row)
             and row.get("alpha_id") and blend_worthy(row)):
         blends = blend_candidates(base, avoid)[:MAX_BLENDS_PER_ROUND - counts["blends"]]
         if blends and not too_similar_to_pool(session, row, "blending"):
             counts["blends"] += len(blends)
-            logger.info("  Sharpe %.2f but fitness %.2f at %.0f%% turnover - testing it added to %d of your best slow "
-                        "alphas next%s.", sharpe, fitness, turnover * 100, len(blends), padding_note(expression))
+            missing = (f"fitness {fitness:.2f} at {turnover:.0%} turnover" if fitness < SUBMIT_MIN_FITNESS
+                       else "it clears the bar without being strong")
+            logger.info("  Sharpe %.2f but %s - testing it added to %d of your best slow alphas next%s.", sharpe,
+                        missing, len(blends), padding_note(expression))
             for new_expression, why in reversed(blends):  # reversed: appendleft keeps their order
                 queue.appendleft((new_expression, f"Auto-blend of {expression}: {why}.", "blend"))
 
@@ -3159,11 +3207,12 @@ def too_similar_to_pool(session, row, purpose: str) -> bool:
 
 
 def blend_rows() -> list:
-    """Earlier alphas worth a blend that weren't submitted: blend_worthy() on their saved numbers, built on data
-    from your field list, and not blends themselves - best Sharpe first, one per idea."""
+    """Earlier alphas worth a blend - not submitted, or held for a reason a blend could change (blendable_outcome) -
+    with blend_worthy() saved numbers, built on data from your field list, and not blends themselves: best Sharpe
+    first, one per idea."""
     datasets, seen, out = listed_datasets(), set(), []
     rows = [r for r in completed_history()
-            if r.get("alpha_id") and (r.get("submitted") or "NO").strip() == "NO" and blend_worthy(r)
+            if r.get("alpha_id") and blendable_outcome(r) and blend_worthy(r)
             and not (r.get("rationale") or "").startswith("Auto-blend") and on_listed_data(r["expression"], datasets)]
     for r in sorted(rows, key=lambda r: as_float(r.get("sharpe")) or 0.0, reverse=True):
         core = idea_core(r["expression"])
@@ -3217,7 +3266,9 @@ def follow_up_past_near_misses(session, settings, email, password, avoid) -> lis
         if too_similar_to_pool(session, row, "blending"):
             continue
         blended += 1
-        logger.info("  Only fitness is missing - testing it added to %d of your best slow alphas.", len(blends))
+        logger.info("  %s - testing it added to %d of your best slow alphas.",
+                    "Only fitness is missing" if as_float(row.get("fitness")) < SUBMIT_MIN_FITNESS
+                    else "It clears the bar but isn't strong", len(blends))
         items.extend((e, f"Auto-blend of {expression}: {why}.", "blend") for e, why in blends)
 
     sharpened = 0

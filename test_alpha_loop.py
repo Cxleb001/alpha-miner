@@ -3658,14 +3658,14 @@ def save_partners():
     """Your slow alphas, as the results file has them, plus ones that mustn't be picked as partners."""
     write_dataset_cache(BLEND_DATASETS)
     for row in [
-        saved_row(EBIT, 1.96, 0.0416, big="0.85", limit="0.85", submitted="TOO_CORRELATED (max 0.81)"),  # best
+        saved_row(EBIT, 1.96, 0.0416, big="0.85", limit="0.85"),                                        # best
         saved_row(UNSYS, 1.7, 0.096, big="0.9", limit="0.74", submitted="YES"),                       # other data
         saved_row("ts_decay_linear(group_rank(ts_delta(anl4_ebit_value, 60), sector), 20)", 1.5, 0.05),  # same data
         saved_row("rank(ts_delta(close, 5))", 2.0, 0.3),                                              # not slow
         saved_row("ts_decay_linear(group_rank(implied_volatility_put_90, sector), 20)", 2.1, 0.06,
                   big="0.5", limit="0.9"),                                                             # small stocks
         saved_row("ts_decay_linear(group_rank(sales_estimate_median_value, sector), 20)", 1.9, 0.05,
-                  fitness=0.8),                                                                         # under the bar
+                  fitness=0.8),                                             # slow, low returns: fine as a partner
         saved_row("ts_decay_linear(group_rank(snt_buzz, sector), 20)", 1.95, 0.05, passed="5"),      # a check failed
         saved_row("ts_decay_linear(group_rank(ts_delta(snt_buzz, 5), sector), 20)", 1.94, 0.05, big="", limit=""),
     ]:
@@ -3718,7 +3718,10 @@ def test_partners_are_your_best_slow_alphas_on_other_data(tmp_path):
     def run():
         save_partners()
         assert [p for p, _ in al.blend_partners(REV)] == [EBIT, UNSYS]
-        assert [p for p, _ in al.blend_partners("rank(anl4_ebit_value)")] == [UNSYS]          # not its own data
+        # Not its own field, and not the same kind of idea on the same data: two levels of analyst numbers.
+        assert [p for p, _ in al.blend_partners("rank(anl4_ebit_value)")] == [UNSYS]
+        assert [p for p, _ in al.blend_partners("rank(ts_delta(anl4_ebit_value, 90))")] == [
+            "ts_decay_linear(group_rank(sales_estimate_median_value, sector), 20)", UNSYS]   # a change and a level
         # Datasets left off your field list stay out of blends too.
         Path(al.OPERATORS_FILE).write_text(json.dumps({"operators": [], "fields": [
             {"name": "sales_estimate_median_value", "description": "d"}, {"name": "close", "description": "d"}]}))
@@ -3733,6 +3736,102 @@ def test_partners_are_your_best_slow_alphas_on_other_data(tmp_path):
         assert [p for p, _ in al.blend_partners(REV)] == [EBIT, UNSYS]
     in_tmp(tmp_path, run)
 
+
+CFO = ("ts_decay_linear(group_neutralize(group_rank(ts_delta(anl4_cfo_value, 90) / ts_std_dev(anl4_cfo_value, 180), "
+       "industry), bucket(rank(cap), range='0, 1, 0.1')), 20)")
+FCF = CFO.replace("anl4_cfo_value", "anl4_fcf_value")
+EP = "ts_decay_linear(group_rank(anl4_afv4_eps_mean / close, industry), 20)"
+
+
+def test_a_partner_can_be_under_the_bar_but_must_be_a_different_idea(tmp_path):
+    def run():
+        write_dataset_cache(dict(BLEND_DATASETS, anl4_cfo_value="analyst4", anl4_fcf_value="analyst4",
+                                 anl4_afv4_eps_mean="analyst4"))
+        al.append_result(saved_row(FCF, 1.66, 0.0356, fitness=1.11, big="1.05", limit="0.72"))      # same idea
+        al.append_result(saved_row(EP, 1.19, 0.0198, fitness=0.99, big="0.58", limit="0.52", passed="5"))  # yield
+        al.append_result(saved_row("rank(ts_mean(unsystematic_risk_last_90_days, 20))", 0.9, 0.02, big="0.5",
+                                   limit="0.3"))                                      # other data, but Sharpe too low
+        al.append_result(saved_row("rank(close / anl4_afv4_eps_mean)", 1.3, 0.02, fitness=1.2,
+                                   big="0.6", limit="0.5", passed="5"))       # cleared the bar, yet 2 checks short
+        assert [p for p, _ in al.blend_partners(CFO)] == [EP]
+        assert al.different_idea(CFO, EP) and not al.different_idea(CFO, FCF)
+        assert not al.different_idea("rank(anl4_afv4_eps_mean)", EP)                  # a data field in common
+        assert al.different_idea(REV, EBIT)                                           # other data altogether
+        assert not al.different_idea(CFO, "ts_decay_linear(group_rank(ts_zscore(anl4_ebit_value, 90), sector), 20)")
+        assert al.tracks_change(CFO) and not al.tracks_change(EP)                    # EP's decay is outer smoothing
+    in_tmp(tmp_path, run)
+
+
+def test_partners_outside_your_submitted_pool_come_first(tmp_path):
+    def run():
+        save_partners()
+        assert [p for p, _ in al.blend_partners(REV)] == [EBIT, UNSYS]
+        Path(al.RESULTS_FILE).unlink()
+        save_partners()
+        # Now EBIT is too similar to a submitted alpha: the sales-estimate alpha, outside the pool, takes analyst data's
+        # place even with a lower Sharpe; the submitted UNSYS stays, as nothing else is on risk data.
+        al.append_result(saved_row(EBIT, 1.96, 0.0416, big="0.85", limit="0.85", alpha_id="e",
+                                   submitted="TOO_CORRELATED (max 0.81)"))
+        rows = [dict(r, submitted="TOO_CORRELATED (max 0.81)") if r["expression"] == EBIT else r for r in csv_rows()]
+        Path(al.RESULTS_FILE).unlink()
+        for r in rows:
+            al.append_result(r)
+        assert [p for p, _ in al.blend_partners(REV)] == [
+            "ts_decay_linear(group_rank(sales_estimate_median_value, sector), 20)", UNSYS]
+    in_tmp(tmp_path, run)
+
+def test_alphas_that_clear_the_bar_but_arent_strong_are_worth_a_blend():
+    weak = {"sharpe": "1.66", "fitness": "1.12", "turnover": "0.0356", "returns": "0.0569", "drawdown": "0.0229",
+            "sub_universe_sharpe": "1.03", "sub_universe_limit": "0.72"}
+    with real_strong_bar():
+        assert al.blend_worthy(weak)
+        assert not al.blend_worthy(dict(weak, sharpe="1.8", fitness="1.5"))           # strong already
+        assert al.blend_worthy(dict(weak, sharpe="1.8", fitness="1.5", returns="0.02"))  # returns under drawdown
+        assert not al.blend_worthy(dict(weak, failed_checks=["CONCENTRATED_WEIGHT"]))
+    for held in (al.HELD_LABEL, al.HELD_FOR_STRONGER_LABEL, al.HELD_PORTFOLIO_LABEL, "NO", ""):
+        assert al.blendable_outcome({"submitted": held}), held
+    for done in ("YES", al.HELD_SIMILAR_LABEL, al.HELD_RETRY_LABEL, "TOO_CORRELATED (max 0.8)", "REJECTED: x"):
+        assert not al.blendable_outcome({"submitted": done}), done
+
+
+def test_a_held_alpha_that_isnt_strong_is_blended_and_stays_held(tmp_path):
+    def run():
+        save_partners()
+        write_dataset_cache(dict(BLEND_DATASETS, anl4_cfo_value="analyst4"))
+        not_strong = alpha_json(sharpe=1.66, fitness=1.12, turnover=0.0356, returns=0.0569, drawdown=0.0229)
+        blends = [f"rank({CFO}) + rank(ts_decay_linear(group_rank(sales_estimate_median_value, sector), 20))", f"rank({CFO}) + rank({UNSYS})"]
+        brain = SlowBrain({CFO: not_strong, **{b: calm() for b in blends}})
+        with real_strong_bar(), captured_logs() as lines:
+            rows = run_queue(brain, [CFO], parallel=1)
+        # EBIT surprise is analyst data in the same shape - one idea with cash-flow surprise, so not a partner;
+        # the sales-estimate alpha is analyst data in another shape, so it is.
+        assert brain.started == [CFO, *blends]
+        assert {r["expression"]: r["submitted"] for r in rows}[CFO] == al.HELD_FOR_STRONGER_LABEL
+        assert any("it clears the bar without being strong - testing it added to 2 of your best slow alphas" in line
+                   for line in lines), lines
+        # Too similar to your submitted alphas to be held: its blends would be too, so none.
+        brain = SlowBrain({CFO.replace("20)", "15)"): not_strong}, corr=0.75)
+        with real_strong_bar():
+            run_queue(brain, [CFO.replace("20)", "15)")], parallel=1)
+        assert len(brain.started) == 1
+    in_tmp(tmp_path, run)
+
+
+def test_a_held_alpha_that_isnt_strong_is_blended_at_the_start_of_a_run(tmp_path):
+    def run():
+        save_partners()
+        write_dataset_cache(dict(BLEND_DATASETS, anl4_cfo_value="analyst4"))
+        held = saved_row(CFO, 1.66, 0.0356, fitness=1.12, big="1.03", limit="0.72", alpha_id="cfo",
+                         submitted=al.HELD_FOR_STRONGER_LABEL)
+        held.update(returns="0.0569", drawdown="0.0229")
+        al.append_result(held)
+        blends = [f"rank({CFO}) + rank(ts_decay_linear(group_rank(sales_estimate_median_value, sector), 20))", f"rank({CFO}) + rank({UNSYS})"]
+        brain = SlowBrain({b: calm() for b in blends}, existing={"cfo": CFO})
+        with real_strong_bar(), patch("time.sleep"), captured_logs() as lines:
+            rows = al.follow_up_past_near_misses(brain.session, SETTINGS, "e@x.com", "pw", set())
+        assert [r["expression"] for r in rows] == blends
+        assert any("It clears the bar but isn't strong - testing it added to 2" in line for line in lines), lines
+    in_tmp(tmp_path, run)
 
 def test_a_fast_alpha_missing_only_fitness_is_blended_right_after(tmp_path):
     def run():
