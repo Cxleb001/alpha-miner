@@ -27,6 +27,8 @@ from google.genai import errors as genai_errors
 # BRAIN's bar counts as strong. The strong-alpha tests set the real thresholds themselves (real_strong_bar).
 al.STRONG_MIN_SHARPE, al.STRONG_MIN_FITNESS = al.SUBMIT_MIN_SHARPE, al.SUBMIT_MIN_FITNESS
 al.STRONG_MIN_RETURNS_TO_DRAWDOWN = 0.0
+# Never call the real Nemotron from a test, even with an NVIDIA_API_KEY in your .env: the tests about it set a fake one.
+al.NVIDIA_API_KEY = ""
 # The test world never touches the real internet or the computer's power settings: BRAIN always answers the
 # "are you there?" probe and the power state is unknown. BRAIN's day never ends in the middle of a test either.
 # The tests about lost connections, laptops and the end of the day set these themselves.
@@ -65,6 +67,7 @@ def in_tmp(tmp_path, fn, *a, **kw):
     al.ACTIVE_COMPETITION = ""
     al.BEFORE_AFTER_REFUSED = False
     al.SETTLING = False
+    al.REFUSED_ON = None
     try:
         return fn(*a, **kw)
     finally:
@@ -382,6 +385,74 @@ def test_generation_with_fallback_turned_off():
         except genai_errors.ServerError:
             pass
     assert models_called(client) == [al.GEMINI_MODEL] * 5
+
+
+def nemotron_reply(content, status=200):
+    body = {"choices": [{"message": {"role": "assistant", "content": content}}]}
+    return fake_response(status, body if status == 200 else {"detail": "no"}, text=json.dumps(body) if status == 200
+                         else '{"detail": "Function not found"}')
+
+
+def test_nemotron_writes_the_ideas_only_when_gemini_cant():
+    client = MagicMock()
+    client.models.generate_content.side_effect = [busy()] * 6                     # main model and fallback both down
+    content = ('<think>Maybe {"ideas": "draft"} first...</think>\n```json\n'
+               '{"ideas": [{"expression": "rank(ts_delta(rel_ret_comp, 5))", "rationale": "competitors lead"}]}\n```')
+    with patch.object(al, "NVIDIA_API_KEY", "nvapi-test"), patch("time.sleep"), \
+            patch.object(al.requests, "post", return_value=nemotron_reply(content)) as post, captured_logs() as lines:
+        ideas = al.generate_with_fallback(client, [{"name": "rank", "usage": "rank(x)"}], [], SETTINGS, "", set(), 1)
+    assert ideas == [("rank(ts_delta(rel_ret_comp, 5))", "competitors lead")]
+    sent = post.call_args.kwargs
+    assert post.call_args.args[0] == "https://integrate.api.nvidia.com/v1/chat/completions"
+    assert sent["headers"]["Authorization"] == "Bearer nvapi-test" and sent["json"]["model"] == al.NEMOTRON_MODEL
+    assert "ONLY use these operators" in sent["json"]["messages"][1]["content"]       # the same brief Gemini gets
+    assert any("asking Nemotron (nvidia/" in l for l in lines) and any("Nemotron wrote 1 idea" in l for l in lines)
+    client.models.generate_content.side_effect = [fake_gemini_response(ONE_IDEA)]
+    with patch.object(al, "NVIDIA_API_KEY", "nvapi-test"), patch.object(al.requests, "post") as post:
+        assert al.generate_with_fallback(client, [], [], SETTINGS, "", set(), 1) == [("rank(close)", "r1")]
+    post.assert_not_called()                                                       # Gemini answered: no backup
+
+
+def test_a_nemotron_failure_says_what_to_fix():
+    client = MagicMock()
+    client.models.generate_content.side_effect = [busy()] * 6
+    with patch.object(al, "NVIDIA_API_KEY", "nvapi-test"), patch("time.sleep"), \
+            patch.object(al.requests, "post", return_value=nemotron_reply("", status=404)):
+        try:
+            al.generate_with_fallback(client, [], [], SETTINGS, "", set(), 1)
+            assert False, "should have raised"
+        except RuntimeError as e:
+            assert "Nemotron answered 404 - check NEMOTRON_MODEL" in str(e)
+    for status, hint in ((401, "check NVIDIA_API_KEY"), (500, "Nemotron answered 500")):
+        with patch.object(al, "NVIDIA_API_KEY", "nvapi-test"), \
+                patch.object(al.requests, "post", return_value=nemotron_reply("", status=status)):
+            try:
+                al.generate_with_nemotron("p")
+                assert False, "should have raised"
+            except RuntimeError as e:
+                assert hint in str(e)
+    with patch.object(al, "NVIDIA_API_KEY", "nvapi-test"), \
+            patch.object(al.requests, "post", return_value=nemotron_reply("Sorry, I can't help with that.")):
+        try:
+            al.generate_with_nemotron("p")
+            assert False, "should have raised"
+        except ValueError as e:
+            assert "no ideas" in str(e)
+
+
+def test_ideas_are_read_from_whatever_nemotron_wraps_them_in():
+    final = '{"ideas": [{"expression": "rank(a)", "rationale": "r"}, {"expression": "rank(b)"}, {"expression": ""}]}'
+    assert al.ideas_from_text(final) == [("rank(a)", "r"), ("rank(b)", "")]            # an empty expression is dropped
+    draft = '{"ideas": [{"expression": "rank(old)", "rationale": "x"}]}'
+    assert al.ideas_from_text(f"First draft: {draft}\nFinal answer: {final}")[0] == ("rank(a)", "r")   # the last wins
+    assert al.ideas_from_text('Here you go: {"ideas": [{"expression": "rank(c)", "rationale": "{curly}"}]} Done.') \
+        == [("rank(c)", "{curly}")]
+    for junk in ("", "no json here", '{"other": 1}', '{"ideas": "none"}'):
+        try:
+            al.ideas_from_text(junk)
+            assert False, junk
+        except ValueError:
+            pass
 
 
 def test_run_round_raises_generation_failed_and_touches_nothing(tmp_path):
@@ -1935,6 +2006,7 @@ def test_ideas_using_fields_off_your_list_are_skipped(tmp_path):
 
 # ---- Auto-sharpen slow near-misses; log the checks we can't fix ----
 
+import collections
 import contextlib
 import logging as _logging
 
@@ -2085,6 +2157,14 @@ def test_no_extra_rounds_when_today_is_already_in(tmp_path):
     in_tmp(tmp_path, run)
 
 
+def test_no_extra_rounds_once_brain_turns_submissions_away(tmp_path):
+    def run():
+        brain = RefusingBrain({"r1": alpha_json(), "r2": calm(), "r3": calm(), "r4": calm()})
+        assert run_main_rounds(brain, MAX_ROUNDS=1, MAX_EXTRA_ROUNDS=3) == 1
+        assert submitted_value("r1") == al.HELD_RETRY_LABEL and al.submissions_today() == 0
+    in_tmp(tmp_path, run)
+
+
 def test_an_extra_round_first_gives_held_alphas_another_try(tmp_path):
     def run():
         al.append_result(held_row("held", 1.3))
@@ -2176,6 +2256,33 @@ def test_after_a_rejection_the_next_good_alpha_still_goes_in(tmp_path):
         assert submitted_value("first") == "REJECTED: failed SELF_CORRELATION"
         assert submitted_value("second") == "YES"
         assert submit_posts(brain) == ["first", "second"] and al.submissions_today() == 1
+    in_tmp(tmp_path, run)
+
+
+class RefusingBrain(FakeBrain):
+    """BRAIN turning submissions away with a 403 that names no failed check - a limit on submissions, say."""
+    def post(self, url, **kw):
+        if url.endswith("/submit"):
+            return fake_response(403, {"detail": "Daily limit reached."}, text='{"detail": "Daily limit reached."}')
+        return super().post(url, **kw)
+
+
+def test_a_submission_turned_away_without_a_failed_check_keeps_the_alpha_and_ends_the_day(tmp_path):
+    def run():
+        al.append_result(held_row("first", 1.5))
+        al.append_result(held_row("second", 1.2))
+        brain = RefusingBrain({"first": alpha_json(), "second": alpha_json()})
+        with captured_logs() as lines:
+            assert run_held(brain) is None
+        assert submit_posts(brain) == ["first"]                               # nothing more is tried today
+        assert submitted_value("first") == al.HELD_LABEL == submitted_value("second")   # both still queued
+        assert al.submissions_today() == 0 and al.REFUSED_ON == al.brain_day()
+        assert not al.may_submit("rank(x)") and "turned a submission away" in al.why_held("rank(x)")
+        assert any("away without naming a failed check (403" in l for l in lines), lines
+        rows = run_one_idea(RefusingBrain({"a1": alpha_json()}))                # found later in the run: held too
+        assert rows[0]["submitted"] == al.HELD_LABEL
+        with patch.object(al, "brain_day", return_value=al.brain_day() + _td(days=1)):
+            assert al.may_submit("rank(x)")                                     # BRAIN's next day: try again
     in_tmp(tmp_path, run)
 
 
@@ -2713,7 +2820,11 @@ def test_daily_pnl_turns_brains_running_total_into_daily_changes():
     assert al.daily_pnl({}) == {} and al.daily_pnl("junk") == {}
 
 
-def test_fetching_a_pnl_waits_while_brain_prepares_it_and_gives_up_cleanly():
+def test_fetching_a_pnl_waits_while_brain_prepares_it_and_gives_up_cleanly(tmp_path):
+    in_tmp(tmp_path, _fetching_a_pnl_waits)
+
+
+def _fetching_a_pnl_waits():
     session = MagicMock()
     session.get.side_effect = [fake_response(200, None, headers={"Retry-After": "1.5"}, text=""),
                                fake_response(429, {"detail": "slow down"}, headers={"Retry-After": "2.0"}, text="x"),
@@ -2723,7 +2834,9 @@ def test_fetching_a_pnl_waits_while_brain_prepares_it_and_gives_up_cleanly():
     assert [c.args[0] for c in sleep.call_args_list] == [1.5, 2.0]
     assert session.get.call_args.args[0] == "https://api.worldquantbrain.com/alphas/a1/recordsets/pnl"
     session.get.side_effect = [fake_response(500, {"detail": "oops"}, text="oops")]
-    assert al.fetch_daily_pnl(session, "a1") is None
+    assert al.fetch_daily_pnl(session, "a2") is None
+    assert al.fetch_daily_pnl(session, "a1") == {"2019-01-02": 5.0, "2019-01-03": -2.0}   # kept: BRAIN isn't asked
+    assert session.get.call_count == 4 and al.cached_pnl("a2") is None              # a failed read isn't kept
 
 
 def test_your_submitted_alphas_are_listed_page_by_page_or_read_from_the_results_file(tmp_path):
@@ -3562,7 +3675,8 @@ def test_the_generator_is_told_which_ideas_only_work_in_small_stocks(tmp_path):
         feedback = al.build_feedback()  # the memory of best results leaves the small-stock ones out
         assert "implied_volatility" not in feedback and "dividend" not in feedback
         assert "ts_decay_linear(group_rank(ts_zscore(rel_ret_all, 60), sector), 10)" in feedback
-        assert "ones that only worked in small stocks, or use data left off your field list, are left out" in feedback
+        assert ("ones that only worked in small stocks, use data left off your field list or are built only on data "
+                "your submitted alphas already cover are left out") in feedback
         write_dataset_cache({"rel_ret_all": "pv13", "sales": "fundamental6"})   # pv13 left off the field list
         Path(al.OPERATORS_FILE).write_text(json.dumps({"operators": [], "fields": [{"name": "sales", "description": "d"}]}))
         assert "rel_ret_all" not in al.build_feedback()
@@ -3733,6 +3847,8 @@ def test_partners_are_your_best_slow_alphas_on_other_data(tmp_path):
         Path(al.OPERATORS_FILE).unlink()
         al.append_result(saved_row(f"{REV} + {EBIT}", 2.76, 0.128, big="1.33", limit="1.2"))
         al.append_result(saved_row("rank(ts_zscore(anl4_ebit_value, 90))", 2.5, 0.05, rationale="Auto-blend of x: y."))
+        al.append_result(saved_row(f"ts_decay_linear(rank(ts_delta(close, 3)) + rank({UNSYS}), 10)", 2.6, 0.06,
+                                   big="1.3", limit="1.1", rationale="Auto-smooth of a blend."))     # smoothed, still one
         assert [p for p, _ in al.blend_partners(REV)] == [EBIT, UNSYS]
     in_tmp(tmp_path, run)
 
@@ -3911,8 +4027,6 @@ def test_no_blend_when_it_cant_help(tmp_path):
         save_partners()
         cases = {
             "too similar already": (fast_json(), 0.88),
-            "small stocks only": (fast_json(checks=[{"name": "LOW_FITNESS", "result": "FAIL"}, {
-                "name": "LOW_SUB_UNIVERSE_SHARPE", "result": "FAIL", "value": 0.4, "limit": 0.86}]), 0.3),
             "another check failed": (fast_json(checks=[{"name": "LOW_FITNESS", "result": "FAIL"},
                                                        {"name": "CONCENTRATED_WEIGHT", "result": "FAIL"}]), 0.3),
             "fitness is fine": (fast_json(fitness=1.2, checks=QUALIFYING_CHECKS), 0.3),
@@ -3929,6 +4043,104 @@ def test_no_blend_when_it_cant_help(tmp_path):
         brain = SlowBrain({REV: fast_json(), SMOOTHED_REV: calm()})
         run_queue(brain, [REV], parallel=1)
         assert brain.started == [REV, SMOOTHED_REV]
+    in_tmp(tmp_path, run)
+
+
+SMALL_ONLY = [{"name": "LOW_FITNESS", "result": "FAIL"},
+              {"name": "LOW_SUB_UNIVERSE_SHARPE", "result": "FAIL", "value": 0.4, "limit": 0.86}]
+
+
+def test_an_alpha_that_only_works_in_small_stocks_is_paired_with_one_that_holds_up_in_big_ones(tmp_path):
+    def run():
+        save_partners()   # of these, only UNSYS holds up among the biggest stocks (0.90 vs limit 0.74)
+        brain = SlowBrain({REV: fast_json(checks=SMALL_ONLY), SMOOTHED_REV: calm(), BLEND_UNSYS: calm()}, corr=0.3)
+        with patch.object(al, "PORTFOLIO_CHECK", False), captured_logs() as lines:
+            rows = run_queue(brain, [REV], parallel=1)
+        assert BLEND_UNSYS in brain.started and BLEND_EBIT not in brain.started   # EBIT: 0.85 vs 0.85 isn't enough
+        assert any("Sharpe 1.99, but only in small stocks (0.4 among the biggest, limit 0.86)" in l for l in lines), lines
+        assert next(r for r in rows if r["expression"] == BLEND_UNSYS)["rationale"].startswith("Auto-pair of ")
+        for why, setting, checks in [("Sharpe under PAIR_MIN_SHARPE", {"PAIR_MIN_SHARPE": 2.5}, SMALL_ONLY),
+                                     ("another check failed", {}, SMALL_ONLY + [{"name": "CONCENTRATED_WEIGHT",
+                                                                                 "result": "FAIL"}]),
+                                     ("pairing off", {"MAX_PAIRS_PER_ROUND": 0}, SMALL_ONLY)]:
+            Path(al.RESULTS_FILE).unlink()
+            save_partners()
+            brain = SlowBrain({REV: fast_json(checks=checks), SMOOTHED_REV: calm()}, corr=0.3)
+            with patch.object(al, "PORTFOLIO_CHECK", False), contextlib.ExitStack() as stack:
+                for name, value in setting.items():
+                    stack.enter_context(patch.object(al, name, value))
+                run_queue(brain, [REV], parallel=1)
+            assert not any(e.startswith("rank(") for e in brain.started), why
+        # A partner on the same data as the alpha isn't one: model51 with model51 adds nothing new.
+        assert al.pair_partners("rank(ts_zscore(unsystematic_risk_last_30_days, 20))") == []
+        assert [p for p, _ in al.pair_partners(REV)] == [UNSYS]
+    in_tmp(tmp_path, run)
+
+
+IV_BASE = "rank(ts_delta(implied_volatility_put_90, 5))"
+
+
+def test_what_gets_paired_and_with_what(tmp_path):
+    def run():
+        write_dataset_cache(BLEND_DATASETS)
+        base = dict(expression=IV_BASE, sharpe="1.8", fitness="1.0", turnover="0.2", sub_universe_sharpe="0.4",
+                    sub_universe_limit="0.8", checks_passed="7", checks_total="8")
+        assert al.pair_worthy(base)
+        assert not al.pair_worthy(dict(base, expression=f"{IV_BASE} + rank(snt_buzz)"))      # a blend already
+        assert not al.pair_worthy(dict(base, checks_passed="4"))                             # four checks short
+        assert not al.pair_worthy(dict(base, sub_universe_sharpe="-0.2"))                    # loses in big stocks
+        partners = [
+            saved_row(UNSYS, 1.6, 0.05, big="1.0", limit="0.7"),
+            saved_row("ts_decay_linear(rank(ts_delta(anl4_ebit_value, 90)), 20)", 1.5, 0.05, big="1.4", limit="0.7"),
+            saved_row("ts_decay_linear(rank(sales_estimate_median_value), 20)", 1.5, 0.05, big="1.2", limit="0.7"),
+            saved_row("rank(close) + rank(snt_buzz)", 2.5, 0.05, big="2.0", limit="0.7"),   # a blend: never a partner
+        ]
+        for row in partners:
+            al.append_result(row)
+        found = [p for p, _ in al.pair_partners(IV_BASE)]
+        assert found == ["ts_decay_linear(rank(ts_delta(anl4_ebit_value, 90)), 20)", UNSYS]  # best in big stocks first,
+        with patch.object(al, "MAX_PAIRS_PER_ALPHA", 1):                                        # one per dataset
+            assert len(al.pair_candidates(IV_BASE)) == 1
+        session = FakeBrain({}).session
+        fresh = dict(base, status="COMPLETE", alpha_id="x", submitted="NO", sharpe=1.8, fitness=1.0, turnover=0.2,
+                     failed_checks=["LOW_SUB_UNIVERSE_SHARPE"])
+        counts = {"flips": 0, "smooths": 0, "blends": 0, "sharpens": 0, "pairs": 0, "network": 0}
+        queue = collections.deque()
+        with patch("time.sleep"):
+            al.queue_followups(session, fresh, "idea", queue, set(), counts)
+        assert [k for _, _, k in queue] == ["pair", "pair"] and counts["pairs"] == 2
+        queue.clear()
+        with patch("time.sleep"):
+            al.queue_followups(session, fresh, "idea", queue, set(), dict(counts, pairs=al.MAX_PAIRS_PER_ROUND))
+        assert "pair" not in [k for _, _, k in queue]                                          # the round's cap
+        # A pair's own result is never blended or paired again.
+        near = dict(fresh, sub_universe_sharpe=0.9, fitness=0.9, failed_checks=["LOW_FITNESS"])
+        for kind, expected in (("idea", True), ("pair", False)):
+            queue.clear()
+            with patch("time.sleep"):
+                al.queue_followups(session, near, kind, queue, set(), dict(counts, pairs=0, blends=0))
+            assert ("blend" in [k for _, _, k in queue]) is expected, kind
+        save_submitted(*[f"rank(ts_zscore(implied_volatility_put_{d}, 20))" for d in (30, 60, 120)])
+        assert not al.pair_worthy(base)                                      # built only on data you've covered
+    in_tmp(tmp_path, run)
+
+
+def test_earlier_alphas_that_only_work_in_small_stocks_are_paired_at_the_start_of_a_run(tmp_path):
+    def run():
+        save_partners()
+        al.append_result(saved_row(REV, 1.99, 0.5546, fitness=0.99, big="0.4", limit="0.86", alpha_id="rev"))
+        al.append_result(saved_row(REV.replace("10))", "15))"), 1.9, 0.5, fitness=0.9, big="0.4", limit="0.86",
+                                   alpha_id="rev15"))                               # the same idea: paired once
+        al.append_result(saved_row("rank(snt_buzz)", 1.2, 0.2, big="0.1", limit="0.6", alpha_id="weak"))  # Sharpe too low
+        brain = SlowBrain({BLEND_UNSYS: calm()}, existing={"rev": REV})
+        with patch("time.sleep"), captured_logs() as lines:
+            rows = al.follow_up_past_near_misses(brain.session, SETTINGS, "e@x.com", "pw", set())
+        assert [r["expression"] for r in rows] == [BLEND_UNSYS]
+        assert any("only works in small stocks (0.4 among the biggest, limit 0.86) - testing it added to 1" in l
+                   for l in lines), lines
+        assert [r["alpha_id"] for r in al.pair_rows()] == ["rev"]
+        with patch("time.sleep"):                                             # tried now: nothing more to pair
+            assert al.follow_up_past_near_misses(brain.session, SETTINGS, "e@x.com", "pw", {BLEND_UNSYS}) == []
     in_tmp(tmp_path, run)
 
 
@@ -3960,13 +4172,13 @@ def test_an_earlier_near_miss_without_big_stocks_numbers_gets_them_read_once(tmp
         al.append_result(saved_row(REV, 1.99, 0.5546, fitness=0.99, big="", limit="", alpha_id="rev"))
         failing = fast_json(checks=[{"name": "LOW_SUB_UNIVERSE_SHARPE", "result": "FAIL", "value": 0.4, "limit": 0.86}])
         brain = SlowBrain({REV: failing}, existing={"rev": REV})
-        with patch("time.sleep"), captured_logs() as lines:
+        with patch("time.sleep"), patch.object(al, "MAX_PAST_PAIRS", 0), captured_logs() as lines:
             assert al.follow_up_past_near_misses(brain.session, SETTINGS, "e@x.com", "pw", set()) == []
         assert any("fails the big-stocks check (0.40 vs limit 0.86) - not blending it" in line for line in lines)
         saved = {r["alpha_id"]: (r["sub_universe_sharpe"], r["sub_universe_limit"]) for r in csv_rows()}
         assert saved["rev"] == ("0.4", "0.86")
         brain.session.get.reset_mock()
-        with patch("time.sleep"):
+        with patch("time.sleep"), patch.object(al, "MAX_PAST_PAIRS", 0):
             al.follow_up_past_near_misses(brain.session, SETTINGS, "e@x.com", "pw", set())
         assert not brain.session.get.called                        # known now: not asked again, not blended
         # BRAIN has no such numbers: saved as "-", and the near-miss is blended.
@@ -4052,6 +4264,372 @@ def test_the_generator_is_shown_what_works_on_your_account(tmp_path):
             {"name": "anl4_ebit_value", "description": "d"}]}))
         assert "SOCIALMEDIA12" not in al.data_scorecard() and "ANALYST4" in al.data_scorecard()
         assert "price/volume data only" in al.data_scorecard()
+        assert "holds up in large stocks, the blend often passes" in prompt
+        # Once your submitted alphas cover a field's data, it isn't held up as an example any more.
+        for i in (1, 2):
+            al.append_result(saved_row(f"rank(ts_zscore(anl4_ebit_value, {i * 30}))", 1.6, 0.1, submitted="YES"))
+        al.append_result(saved_row("rank(ts_delta(anl4_cfo_value, 9))", 1.6, 0.1))
+        write_dataset_cache({"anl4_ebit_value": "analyst4", "anl4_cfo_value": "analyst4", "snt_buzz": "socialmedia12"})
+        line = next(l for l in al.data_scorecard().splitlines() if "ANALYST4" in l)
+        assert "anl4_ebit_value" not in line and "anl4_cfo_value" in line, line
+    in_tmp(tmp_path, run)
+
+# ---- Raising the IS Score: rank by portfolio gain, extras that add, data already covered ----
+
+def test_top_level_parts_split_only_real_sums():
+    assert al.top_level_parts("rank(a) + rank(b) - rank(c)") == ["rank(a)", "rank(b)", "rank(c)"]
+    assert al.top_level_parts("rank(a + b)") == ["rank(a + b)"]
+    assert al.top_level_parts("rank(x) * 1e-3") == ["rank(x) * 1e-3"]                # a number, not a sum
+    assert al.top_level_parts("-rank(x)") == ["-rank(x)"] and al.top_level_parts("rank(x) * -1") == ["rank(x) * -1"]
+    assert al.top_level_parts("rank(x) > -1") == ["rank(x) > -1"]
+    assert al.is_blend("a + b") and not al.is_blend("group_neutralize(a + b, sector)") and not al.is_blend("rank(x)")
+
+
+def test_a_smoothed_blend_is_still_two_signals():
+    assert al.signal_parts("ts_decay_linear(rank(a) + rank(b), 10)") == ["rank(a)", "rank(b)"]
+    assert al.signal_parts("ts_decay_linear(group_neutralize(rank(a) - rank(b), bucket(rank(cap), "
+                           "range='0, 1, 0.1')), 5)") == ["rank(a)", "rank(b)"]
+    assert al.signal_parts("-ts_decay_linear(rank(a) + rank(b), 10)") == ["rank(a)", "rank(b)"]
+    assert al.signal_parts("rank(ts_decay_linear(rank(a) + rank(b), 3)) + rank(c)") == ["rank(a)", "rank(b)", "rank(c)"]
+    assert al.signal_parts("rank(close - vwap)") == ["rank(close - vwap)"]          # one signal on two fields
+    assert al.signal_parts("ts_decay_linear(rank(x), 5)") == ["ts_decay_linear(rank(x), 5)"]
+    assert al.is_blend("ts_decay_linear(rank(a) + rank(b), 10)") and not al.is_blend("rank(a * b)")
+
+
+def test_ingredients_are_field_families_part_by_part():
+    blend = (f"{REV} + ts_decay_linear(group_neutralize(group_rank(ts_zscore(unsystematic_risk_last_90_days, 60), "
+             f"sector), bucket(rank(sharesout), range='0, 1, 0.1')), 15)")
+    assert al.ingredients(blend) == {"price/volume: close+vwap", "unsystematic_risk_last_days"}  # buckets don't count
+    assert al.ingredients(f"ts_decay_linear({blend}, 10)") == al.ingredients(blend)     # smoothed, it's the same two
+    assert al.ingredients("rank(ts_zscore(unsystematic_risk_last_360_days, 30))") == {"unsystematic_risk_last_days"}
+    assert al.ingredients("rank(divide(volume, ts_mean(volume, 90)))") == {"price/volume: volume"}
+    assert al.ingredients("rank(ts_step(1))") == {"price/volume: none"}
+    assert al.signal_fields("group_rank(x, sector)") == ["x"]
+
+
+def test_summaries_of_one_quantity_are_one_family(tmp_path):
+    assert al.field_family("anl4_ebit_value") == al.field_family("anl4_fs_detail_estimates_advanced_af_nd_ebit_high") \
+        == al.field_family("anl4_fs_detail_estimate_1qf_v4_nd_ebit_low") == "ebit"
+    assert al.field_family("anl4_ebit_number") == "ebit_number"                 # how many analysts: another quantity
+    assert al.field_family("anl4_afv4_eps_mean") == "eps" and al.field_family("sales_estimate_median_value") == "sales"
+    assert al.field_family("implied_volatility_put_90") == "implied_volatility_put"
+    assert al.field_family("mean_equity_sentiment_score") == "mean_equity_sentiment_score"   # a leading summary word stays
+    assert al.field_family("value") == "value" and al.field_family("anl4_value") == "value"
+
+    def run():
+        sue = lambda f: f"rank(ts_delta({f}, 90) / ts_std_dev({f}, 180))"
+        save_submitted(sue("anl4_ebit_value"), sue("anl4_fs_detail_estimates_advanced_af_nd_ebit_high"),
+                       sue("anl4_fs_detail_estimate_1qf_v4_nd_ebit_low"))
+        assert al.saturated_ingredients() == {"ebit": 3}
+        assert al.only_covered(sue("anl4_fs_detail_estimates_advanced_af_nd_ebit_median"))
+        assert ("- anl4_ebit_value, anl4_fs_detail_estimates_advanced_af_nd_ebit_high, anl4_fs_detail_estimate_1qf_v4_nd_"
+                "ebit_low (and any other window, version or summary of it): in 3") in al.covered_rule()
+    in_tmp(tmp_path, run)
+
+
+def save_submitted(*expressions):
+    for i, e in enumerate(expressions):
+        al.append_result(dict(_history_row(e, 1.8, 1.4, 0.1), alpha_id=f"sub{i}", submitted="YES"))
+
+
+def test_data_your_submitted_alphas_lean_on_is_covered(tmp_path):
+    def run():
+        unsys = [f"rank(ts_zscore(unsystematic_risk_last_{d}_days, 60))" for d in (30, 90, 360)]
+        save_submitted(*unsys, f"rank({REV}) + rank(ts_zscore(anl4_ebit_value, 90))", f"{REV} + rank(sales)",
+                       f"{REV} + rank(debt)")
+        al.append_result(dict(_history_row("rank(assets)", 1.8, 1.4, 0.1), alpha_id="h", submitted=al.HELD_LABEL))
+        assert al.saturated_ingredients() == {"unsystematic_risk_last_days": 3, "price/volume: close+vwap": 3}
+        assert al.only_covered("rank(ts_delta(unsystematic_risk_last_60_days, 5))")
+        assert al.only_covered(f"rank({REV}) + rank(ts_zscore(unsystematic_risk_last_90_days, 30))")
+        assert not al.only_covered(f"rank({REV}) + rank(assets)")                   # something new in it
+        rule = al.covered_rule()
+        assert rule.startswith("ALREADY COVERED")
+        assert "- unsystematic_risk_last_30_days (and any other window, version or summary of it): in 3 of your " \
+               "submitted" in rule                                       # one example: the others differ by numbers
+        assert "- signals built only on close and vwap (price/volume data): in 3 of your submitted alphas" in rule
+        with patch.object(al, "SATURATED_AT", 0):
+            assert al.saturated_ingredients() == {} and al.covered_rule() == ""
+    in_tmp(tmp_path, run)
+
+
+def test_ideas_built_only_on_covered_data_are_skipped_and_the_rule_is_shown(tmp_path):
+    def run():
+        save_submitted(*[f"rank(ts_zscore(unsystematic_risk_last_{d}_days, 60))" for d in (30, 90, 360)])
+        returned = [{"expression": "rank(ts_delta(unsystematic_risk_last_60_days, 20))", "rationale": "r"},
+                    {"expression": "rank(ts_delta(anl4_cfo_value, 20))", "rationale": "r"}]
+        client = MagicMock()
+        client.models.generate_content.return_value = fake_gemini_response(returned)
+        brain = SlowBrain({"rank(ts_delta(anl4_cfo_value, 20))": calm()})
+        with patch("time.sleep"), captured_logs() as lines:
+            al.run_round(brain.session, client, [], [], SETTINGS, "e@x.com", "pw", 1, "round 1", set())
+        assert brain.started == ["rank(ts_delta(anl4_cfo_value, 20))"]
+        assert any("Skipped 1 idea(s) built only on data your submitted alphas already cover" in l for l in lines)
+        prompt = client.models.generate_content.call_args.kwargs["contents"]
+        assert "ALREADY COVERED" in prompt
+        al.append_result(_history_row("rank(ts_av_diff(unsystematic_risk_last_90_days, 9))", 2.0, 3.0, 0.1))
+        assert "ts_av_diff(unsystematic_risk_last_90_days, 9)" not in al.build_feedback()   # not in the memory
+    in_tmp(tmp_path, run)
+
+
+def test_nothing_built_only_on_covered_data_is_blended_and_no_partner_uses_it(tmp_path):
+    def run():
+        save_partners()
+        assert [p for p, _ in al.blend_partners(REV)] == [EBIT, UNSYS]
+        save_submitted(*[f"rank(ts_delta(close / vwap, {d}))" for d in (1, 2, 3)])          # reversal is covered
+        assert al.blend_candidates(REV) == []
+        save_submitted(*[f"rank(ts_zscore(unsystematic_risk_last_{d}_days, 60))" for d in (30, 90, 360)])
+        assert [p for p, _ in al.blend_partners("rank(anl4_cfo_value)")] == [EBIT]         # UNSYS is covered now
+    in_tmp(tmp_path, run)
+
+
+def test_pnl_is_read_from_brain_once_and_kept(tmp_path):
+    def run():
+        brain = mine_and({"fresh": FRESH})
+        with patch("time.sleep"):
+            first = al.fetch_daily_pnl(brain.session, "fresh")
+            again = al.fetch_daily_pnl(brain.session, "fresh")
+        assert first == again and brain.pnl_asked == ["fresh"] and Path(al.PNL_CACHE_DIR, "fresh.json").exists()
+        al.PORTFOLIO = al.Portfolio()                                       # a new run: nothing asked again
+        with portfolio_on(), patch("time.sleep"):
+            al.portfolio_effect(brain.session, "fresh")
+        assert brain.pnl_asked.count("fresh") == 1 and brain.pnl_asked.count("mine1") == 1
+        al.PORTFOLIO = al.Portfolio()
+        with portfolio_on(), patch("time.sleep"):
+            al.portfolio_effect(brain.session, "fresh")
+        assert brain.pnl_asked.count("mine1") == 1
+    in_tmp(tmp_path, run)
+
+
+def test_the_held_alpha_that_adds_most_goes_in_not_the_one_with_the_best_fitness(tmp_path):
+    def run():
+        al.append_result(held_row("meh", 1.4))      # better fitness, smaller gain
+        al.append_result(held_row("fresh", 1.2))
+        brain = mine_and({"meh": MEH, "fresh": FRESH})
+        brain.alphas.update(meh=alpha_json(fitness=1.4), fresh=alpha_json(fitness=1.2))   # BRAIN's latest numbers too
+        with portfolio_on(), captured_logs() as lines:
+            assert run_held(brain) == "YES"
+        assert submit_posts(brain) == ["fresh"] and submitted_value("meh") == al.HELD_LABEL
+        assert any(l.startswith("Held queue ranked by what each alpha would add to your combined Sharpe: fresh +")
+                   for l in lines), lines
+    in_tmp(tmp_path, run)
+
+
+def test_a_strong_held_alpha_goes_in_before_a_bigger_gain_that_isnt_strong(tmp_path):
+    def run():
+        al.append_result(held_row("meh", 1.4))
+        al.append_result(held_row("fresh", 1.2))
+        brain = mine_and({"meh": MEH, "fresh": FRESH})
+        brain.alphas.update(meh=alpha_json(fitness=1.4), fresh=alpha_json(fitness=1.2))
+        with portfolio_on(STRONG_MIN_FITNESS=1.3), captured_logs() as lines:
+            assert run_held(brain) == "YES"
+        assert submit_posts(brain) == ["meh"] and submitted_value("fresh") == al.HELD_LABEL
+        assert not any("None of the held alphas is strong" in l for l in lines), lines
+    in_tmp(tmp_path, run)
+
+
+def test_an_extra_that_isnt_strong_goes_in_when_it_adds_enough(tmp_path):
+    def run():
+        al.append_result(held_row("meh", 1.4))
+        al.append_result(held_row("fresh", 1.2))
+        brain = mine_and({"meh": MEH, "fresh": FRESH})
+        brain.alphas.update(meh=alpha_json(fitness=1.4), fresh=alpha_json(fitness=1.2))
+        with portfolio_on(MAX_SUBMISSIONS_PER_DAY=2, RESERVE_TARGET=0, STRONG_MIN_FITNESS=1.3), captured_logs() as lines:
+            run_held(brain)
+        # Nothing was in yet, so only the strong one could go first; then fresh - not strong - adds 1%+ as an extra.
+        assert submit_posts(brain) == ["meh", "fresh"] and al.submissions_today() == 2
+        assert any("Portfolio check on held alpha fresh: your 4 submitted alpha(s)" in l for l in lines), lines
+        # Without a readable portfolio, an extra must still be strong.
+        with patch.object(al, "PORTFOLIO_CHECK", False), patch.object(al, "MAX_SUBMISSIONS_PER_DAY", 3), \
+                patch.object(al, "RESERVE_TARGET", 0), patch.object(al, "STRONG_MIN_FITNESS", 1.3):
+            assert not al.may_submit("rank(x)", strong=False) and al.may_submit("rank(x)", strong=True)
+            assert "only strong alphas" in al.why_held("rank(x)", strong=False)
+        with portfolio_on(MAX_SUBMISSIONS_PER_DAY=3, RESERVE_TARGET=0, STRONG_MIN_FITNESS=1.3):
+            al.PORTFOLIO.state = "unavailable"                                   # on, but its PnL couldn't be read
+            assert not al.may_submit("rank(x)", strong=False)
+            al.PORTFOLIO.state = "ready"
+            assert al.may_submit("rank(x)", strong=False)
+        with portfolio_on(MAX_SUBMISSIONS_PER_DAY=3, RESERVE_TARGET=5, STRONG_MIN_FITNESS=1.3):
+            assert "would leave only" in al.why_held("rank(x)", strong=False)    # the reserve holds it, not strength
+        # A new alpha found after today's first: its portfolio gain is read, and it goes in though it isn't strong.
+        al.PORTFOLIO = al.Portfolio()
+        brain2 = mine_and({"fresh2": FRESH})
+        brain2.alphas.update(fresh2=alpha_json(fitness=1.2))
+        with portfolio_on(MAX_SUBMISSIONS_PER_DAY=3, RESERVE_TARGET=0, STRONG_MIN_FITNESS=1.3):
+            assert run_one_idea(brain2)[0]["submitted"] == "YES"
+    in_tmp(tmp_path, run)
+
+
+def test_after_the_first_the_biggest_gain_goes_next_strong_or_not(tmp_path):
+    def run():
+        for alpha_id in ("fresh", "meh", "apart"):
+            al.append_result(held_row(alpha_id, 1.3))
+        brain = mine_and({"fresh": FRESH, "meh": MEH, "apart": APART})
+        brain.alphas.update(fresh=alpha_json(fitness=1.4), meh=alpha_json(fitness=1.4), apart=alpha_json(fitness=1.2))
+        with portfolio_on(MAX_SUBMISSIONS_PER_DAY=2, RESERVE_TARGET=0, STRONG_MIN_FITNESS=1.3):
+            run_held(brain)
+        # fresh: the strong one adding most goes first; then apart (not strong) adds far more than meh (strong).
+        assert submit_posts(brain) == ["fresh", "apart"] and submitted_value("meh") == al.HELD_LABEL
+    in_tmp(tmp_path, run)
+
+
+def test_a_somewhat_similar_alpha_that_clearly_adds_goes_in_during_the_day(tmp_path):
+    def run():
+        al.append_result(held_row("fresh", 1.3))
+        brain = mine_and({"fresh": FRESH}, corr={"fresh": 0.6})               # over the daytime 0.5, under 0.7
+        with portfolio_on(EXTRA_MIN_GAIN=0.5), captured_logs() as lines:      # +39% isn't enough for a 50% bar
+            assert run_held(brain) is None
+        assert submit_posts(brain) == [] and any("can still be that pick" in l for l in lines), lines
+        with portfolio_on(), captured_logs() as lines:
+            assert run_held(brain) == "YES"
+        assert submit_posts(brain) == ["fresh"]
+        assert any("self-correlation is 0.60 - over the daytime 0.5, but adding it raises your combined Sharpe +"
+                   in l for l in lines), lines
+        # Found during a run: the same.
+        al.PORTFOLIO = al.Portfolio()
+        brain2 = mine_and({"fresh2": FRESH}, corr={"fresh2": 0.6})
+        with portfolio_on(MAX_SUBMISSIONS_PER_DAY=2, RESERVE_TARGET=0):
+            assert run_one_idea(brain2)[0]["submitted"] == "YES"
+        # Without the portfolio check it's held as before - it can still be the end-of-day pick.
+        brain3 = FakeBrain({"a3": alpha_json()}, corr=0.6)
+        with patch.object(al, "PORTFOLIO_CHECK", False), patch.object(al, "MAX_SUBMISSIONS_PER_DAY", 3), \
+                patch.object(al, "RESERVE_TARGET", 0):
+            assert run_one_idea(brain3)[0]["submitted"] == al.HELD_SIMILAR_LABEL
+        brain4 = mine_and({"fresh4": FRESH})
+        with portfolio_on(), patch("time.sleep"):
+            assert al.adds_despite_similarity(brain4.session, "fresh4", 0.6)
+            assert not al.adds_despite_similarity(brain4.session, "fresh4", None)   # similarity unread: never
+    in_tmp(tmp_path, run)
+
+
+def test_the_held_queue_is_ranked_by_what_each_alpha_adds(tmp_path):
+    def run():
+        brain = mine_and({"meh": MEH, "fresh": FRESH, "copy": COPY})
+        queue = [held_row("copy", 1.5), held_row("nopnl", 1.4), held_row("meh", 1.3), held_row("fresh", 1.2)]
+        with portfolio_on(), patch("time.sleep"):
+            assert [r["alpha_id"] for r in al.rank_by_portfolio(brain.session, queue)] == \
+                   ["fresh", "meh", "copy", "nopnl"]                          # the one BRAIN has no PnL for last
+            assert al.rank_by_portfolio(brain.session, []) == []
+        # Once the time for reading PnL is up, only alphas whose PnL is kept are scored; BRAIN isn't asked for the rest.
+        al.PORTFOLIO = al.Portfolio()
+        brain = mine_and({"meh": MEH, "fresh": FRESH, "copy": COPY, "late": FRESH})
+        queue = [held_row("late", 1.6), held_row("copy", 1.5), held_row("meh", 1.3), held_row("fresh", 1.2)]
+        with portfolio_on(PNL_PREFETCH_SECONDS=-1), patch("time.sleep"):
+            assert [r["alpha_id"] for r in al.rank_by_portfolio(brain.session, queue)] == \
+                   ["fresh", "meh", "copy", "late"]
+        assert "late" not in brain.pnl_asked
+        with patch.object(al, "PORTFOLIO_CHECK", False):
+            assert al.rank_by_portfolio(brain.session, queue) == queue
+    in_tmp(tmp_path, run)
+
+
+# Two more held alphas: ECHO moves much like FRESH, APART like nothing you have. Before FRESH goes in, ECHO adds a bit
+# more than APART; once FRESH is in, APART adds far more.
+_E = _random.Random(55)
+ECHO = [1.8 / _math.sqrt(252) + 0.9 * (f - 2.0 / _math.sqrt(252)) + _math.sqrt(1 - 0.81) * _E.gauss(0, 1)
+        for f in FRESH]
+APART = pnl_series(14, 1.4)
+
+
+def test_once_one_goes_in_the_rest_are_ranked_again(tmp_path):
+    def run():
+        for alpha_id, fitness in (("echo", 1.4), ("apart", 1.3), ("fresh", 1.2)):
+            al.append_result(held_row(alpha_id, fitness))
+        brain = mine_and({"echo": ECHO, "apart": APART, "fresh": FRESH})
+        with portfolio_on(MAX_SUBMISSIONS_PER_DAY=2, RESERVE_TARGET=1), captured_logs() as lines:
+            run_held(brain)
+        assert any("combined Sharpe: fresh +" in l and l.index("echo") < l.index("apart") for l in lines), lines
+        assert submit_posts(brain) == ["fresh", "apart"] and submitted_value("echo") == al.HELD_LABEL
+    in_tmp(tmp_path, run)
+
+
+def test_an_extra_submission_goes_in_only_if_it_adds_enough(tmp_path):
+    def run():
+        for alpha_id, fitness in (("fresh", 1.2), ("meh", 1.4), ("copy", 1.3)):
+            al.append_result(held_row(alpha_id, fitness))
+        brain = mine_and({"meh": MEH, "fresh": FRESH, "copy": COPY})
+        with portfolio_on(MAX_SUBMISSIONS_PER_DAY=3, RESERVE_TARGET=1), captured_logs() as lines:
+            run_held(brain)
+        # fresh adds most; after it, meh still adds 1%+; copy would lower it - and nothing would be left in reserve.
+        assert submit_posts(brain) == ["fresh", "meh"] and submitted_value("copy") == al.HELD_LABEL
+        assert al.submissions_today() == 2
+        assert any(l.startswith("Portfolio check on held alpha meh: your 4 submitted alpha(s) combined") for l in lines), \
+            lines                                                               # measured with fresh in
+    in_tmp(tmp_path, run)
+
+
+def test_an_extra_that_adds_too_little_waits_for_a_coming_day(tmp_path):
+    def run():
+        for alpha_id, fitness in (("fresh", 1.2), ("meh", 1.4), ("copy", 1.3)):
+            al.append_result(held_row(alpha_id, fitness))
+        brain = mine_and({"meh": MEH, "fresh": FRESH, "copy": COPY})
+        with portfolio_on(MAX_SUBMISSIONS_PER_DAY=3, RESERVE_TARGET=1, EXTRA_MIN_GAIN=0.5), captured_logs() as lines:
+            run_held(brain)
+        assert submit_posts(brain) == ["fresh"] and submitted_value("meh") == al.HELD_LABEL
+        assert any("Held alpha meh stays queued" in l and "an extra submission today needs at least +50%" in l
+                   for l in lines), lines
+        # A new alpha found later in the run is held for a coming day the same way, not as a portfolio loser.
+        brain2 = mine_and({"meh2": MEH})
+        with portfolio_on(MAX_SUBMISSIONS_PER_DAY=3, RESERVE_TARGET=0, EXTRA_MIN_GAIN=0.5):
+            assert run_one_idea(brain2)[0]["submitted"] == al.HELD_LABEL
+        assert "meh2" in al.RESERVE.waiting                                       # good for a coming day: in the reserve
+        with portfolio_on(MAX_SUBMISSIONS_PER_DAY=3, RESERVE_TARGET=0, EXTRA_MIN_GAIN=0.001):
+            assert run_one_idea(mine_and({"meh3": MEH}), "rank(open)")[0]["submitted"] == "YES"
+    in_tmp(tmp_path, run)
+
+
+def test_the_reserve_counts_alphas_once_the_portfolio_can_be_read(tmp_path):
+    def run():
+        al.RESERVE.keep("a", f"rank({REV}) + rank(x1)")
+        al.RESERVE.keep("b", f"rank({REV}) + rank(x2)")
+        al.RESERVE.keep("c", "rank(x3)")
+        assert al.RESERVE.spare() == al.RESERVE.kinds() and len(al.RESERVE.waiting) == 3
+        kinds = al.RESERVE.kinds()
+        al.PORTFOLIO.state = "ready"
+        assert al.RESERVE.spare() == 3 and al.RESERVE.spare(besides="rank(x3)") == 2
+        al.append_result(held_row("q1", 1.3, expression="rank(q1)"))                 # waiting in the held queue
+        al.append_result(held_row("c", 1.3, expression="rank(x3)"))                 # the same one: counted once
+        al.append_result(held_row("low", 1.3, expression="rank(q2)", submitted=al.HELD_PORTFOLIO_LABEL))
+        assert al.RESERVE.spare() == 4 and al.RESERVE.spare(besides="rank(q1)") == 3
+        held_queue = al.RESERVE.spare()
+        al.PORTFOLIO.state = "unread"
+        assert al.RESERVE.spare() == kinds and held_queue == 4                       # before it's read: kinds
+        al.PORTFOLIO.state = "ready"
+        Path(al.RESULTS_FILE).unlink()
+        al.record_submission()                                                  # today's first is in
+        with patch.object(al, "MAX_SUBMISSIONS_PER_DAY", 2), patch.object(al, "RESERVE_TARGET", 3):
+            assert kinds < 3 and al.may_submit("rank(x4)")                     # 3 good alphas would still wait
+            assert not al.may_submit("rank(x3)")
+            assert "would leave only 2 other good alpha(s)" in al.why_held("rank(x3)")
+    in_tmp(tmp_path, run)
+
+
+def test_an_extra_needs_the_full_minimum_gain(tmp_path):
+    def run():
+        al.record_submission()
+        effect = lambda after: al.PortfolioEffect(1.0, after, 0.2, 300, 3)
+        with portfolio_on(MAX_SUBMISSIONS_PER_DAY=2, EXTRA_MIN_GAIN=0.25):
+            with patch.object(al, "portfolio_effect", return_value=effect(1.25)):
+                assert al.portfolio_verdict(None, "x")[0] is True                # exactly the minimum is enough
+            with patch.object(al, "portfolio_effect", return_value=effect(1.2499)):
+                assert al.portfolio_verdict(None, "x")[0] is False
+        assert al.gain(al.PortfolioEffect(-1.0, -0.5, 0.2, 300, 3)) == 0.5        # measured on the size of the Sharpe
+        assert al.gain(None) == 0.0 and al.gain(al.PortfolioEffect(None, 1.0, None, 300, 0)) == 0.0
+    in_tmp(tmp_path, run)
+
+
+def test_datasets_that_never_worked_are_named(tmp_path):
+    def run():
+        write_dataset_cache({"snt_buzz": "socialmedia12", "anl4_ebit_value": "analyst4"})
+        for i in range(10):
+            al.append_result(_history_row(f"rank(ts_delta(snt_buzz, {i + 1}))", 0.3, 0.1, 0.1))
+            al.append_result(dict(_history_row(f"rank(ts_delta(anl4_ebit_value, {i + 1}))", 1.6, 1.2, 0.1),
+                                  submitted="YES" if i == 0 else "NO"))
+            al.append_result(_history_row(f"rank(ts_delta(close, {i + 1}))", 0.3, 0.1, 0.1))
+        tests, passes, _ = al.dataset_track_record()
+        assert (tests["socialmedia12"], passes["socialmedia12"], passes["analyst4"]) == (10, 0, 1)
+        assert tests[al.PRICE_VOLUME] == 10 and passes[al.PRICE_VOLUME] == 0
+        assert al.never_worked() == {"socialmedia12"} and al.never_worked(min_tests=11) == set()   # not price/volume:
+        # it's every blend's other half
     in_tmp(tmp_path, run)
 
 

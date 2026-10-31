@@ -34,7 +34,8 @@ overridable via GEMINI_MODEL without touching code.
 
 When Gemini is busy (503) or rate-limited (429), idea generation retries with backoff
 (10s, 20s, 40s, 80s), then tries GEMINI_FALLBACK_MODEL once (default gemini-3.7-flash,
-which Google's own 3.8 Flash docs name as the fully supported alternative). A failed
+which Google's own 3.8 Flash docs name as the fully supported alternative), then - if NVIDIA_API_KEY is set in
+.env (a free key from build.nvidia.com) - NVIDIA's Nemotron once (NEMOTRON_MODEL). A failed
 generation does NOT use up one of the MAX_ROUNDS - rounds only count when ideas actually
 get tested. After MAX_GENERATION_FAILURES failed attempts in a row, the run stops cleanly;
 nothing was simulated in that case, so no BRAIN quota was spent.
@@ -97,6 +98,11 @@ READ BEFORE YOU RUN THIS:
 - Each normal run starts with earlier alphas worth a blend: up to MAX_PAST_BLENDS (default 3) that missed on fitness
   or are held without being strong (with BRAIN's big-stocks numbers on file and passing) get the blends not tried yet, best Sharpe first, and up to
   MAX_PAST_SHARPENS (default 3) slow ones get sharpened.
+- Auto-pair: an alpha with Sharpe >= PAIR_MIN_SHARPE (1.5) that fails only the big-stocks check (besides fitness or
+  turnover) is re-tested added to up to MAX_PAIRS_PER_ALPHA (2) of your alphas on other data that hold up best among
+  the biggest stocks (their Sharpe there at least PAIR_PARTNER_MIN_BIG_RATIO, 1.2, times BRAIN's limit; one per
+  dataset). Up to MAX_PAIRS_PER_ROUND (4) a round, and MAX_PAST_PAIRS (3) earlier ones at the start of each run. Option
+  and news signals often work only in small stocks; paired like this, many pass.
 - Operator limit: BRAIN refuses an expression with more than 64 operators (every function call and every
   + - * / or comparison counts). Longer ideas are skipped before they're sent.
 - Never miss a day (the Gold leaderboard counts the days you submitted on): a normal run that still has
@@ -110,20 +116,29 @@ READ BEFORE YOU RUN THIS:
   An alpha's kind is the BRAIN dataset its data fields come from (data_fields_cache.json; without it, the
   field name minus its numbers): alphas on the same data usually come back too similar to submit both, so
   near-copies count once. Only alphas BRAIN confirmed during this run count. RESERVE_TARGET=0 turns it off.
+  Once your combined portfolio can be read (Portfolio check), the reserve counts every good alpha in your held
+  queue instead, and every submission beyond the day's first must raise the combined Sharpe by EXTRA_MIN_GAIN
+  (default 0.01 = 1%) - strong or not, since what it adds is what the IS Score rates. Near-copies can't, so they wait for a coming day instead
+  (as "daily cap reached"). If BRAIN turns a submission away without naming a failed check (a limit on submissions,
+  say), the alpha stays queued and nothing more is submitted until BRAIN's next day.
 - Strong alphas first: an alpha that clears BRAIN's bar counts as strong with Sharpe >= STRONG_MIN_SHARPE (1.6),
   fitness >= STRONG_MIN_FITNESS (1.3) and annual returns above its worst drawdown (STRONG_MIN_RETURNS_TO_DRAWDOWN,
   1.0; 0 turns that part off). A strong alpha goes in straight away; one that only clears BRAIN's bar is held
-  ("not strong"). Held alphas are ranked strong first, then by fitness, on BRAIN's latest numbers. If nothing
+  ("not strong"). Held alphas are ranked strong first, then by what each would add to your combined Sharpe (see
+  Portfolio check) - or, when that can't be read, by fitness on BRAIN's latest numbers. If nothing
   has gone in by the end of the usual MAX_ROUNDS rounds - or the run stops early, or a --try run ends, or BRAIN's
   day is about to end - the run settles: an end-of-day pick from the held alphas that clear BRAIN's bar (see
   Portfolio check for how it's chosen) goes in, so the day can still count. Submissions beyond the day's first
-  must be strong. Returns and drawdown are saved in the results file (an older file gets the two columns added
+  must be strong - unless your combined portfolio can be read, when what they add decides (see Reserve). Returns and
+  drawdown are saved in the results file (an older file gets the two columns added
   once) and shown to the generator, which is told the strong targets.
 - Near-copies: BRAIN accepts self-correlation up to 0.7, but every submission except the end-of-day pick must be
   under DAYTIME_MAX_SELF_CORRELATION (default 0.5) - a strong alpha straight away, an extra one, a held one.
   Near-copies of your own alphas add little to a combined score and keep your submissions looking alike. One
   in between - or one whose similarity BRAIN didn't report in time - is held instead, labelled "somewhat
-  similar", and can still be the end-of-day pick. DAYTIME_MAX_SELF_CORRELATION=0.7 turns it off.
+  similar", and can still be the end-of-day pick. Once your combined portfolio can be read, one in between that
+  raises the combined Sharpe by EXTRA_MIN_GAIN or more goes in anyway: it plainly isn't just a copy.
+  DAYTIME_MAX_SELF_CORRELATION=0.7 turns it off.
 - Portfolio check: the Country Challenge's IS Score is "Combined Portfolio Performance based on an equal weighting
   of all submitted alphas". So before any alpha goes in, the loop reads the daily PnL of your submitted alphas
   (BRAIN's list of your ACTIVE alphas - or, failing that, the results file - and the PnL behind each alpha's
@@ -132,6 +147,20 @@ READ BEFORE YOU RUN THIS:
   run. The end-of-day pick takes the held alpha that leaves the combined Sharpe highest (least similar breaks ties)
   and must raise it too - unless END_OF_DAY_MAX_PORTFOLIO_DROP (default 0) allows a small drop to keep the day's
   streak: 0.02 = up to 2%. If the PnL can't be read, the usual rules decide alone. PORTFOLIO_CHECK=0 turns it off.
+  The held queue is ranked the same way: each run scores every held alpha by what it would add to the combined
+  Sharpe, re-checks them with BRAIN biggest gain first (so with a long queue the best are the ones checked), and
+  submits the strong one with the biggest gain - not the one with the best fitness - re-ranking the rest after each
+  one goes in. Each alpha's PnL is read from BRAIN once and kept in pnl_cache/ (it never changes), so this is quick;
+  reading new ones stops after PNL_PREFETCH_SECONDS (300) per run and the rest are scored next run.
+- Already covered: an ingredient of an alpha is the family of a data field one of its signals builds on - the
+  field without its numbers, provider and version words or trailing summary, so every window of
+  unsystematic_risk_last_N_days is one family, and so is every summary of analysts' EBIT forecasts (anl4_ebit_value,
+  ..._ebit_high, ..._ebit_low) - or, for a signal built on price and volume alone, which of those it uses (close and
+  vwap for an intraday reversal). A blend's signals count separately, smoothed or not. One in SATURATED_AT (default
+  3) or more of your submitted alphas is covered: Gemini is told so, its ideas built only on covered data are
+  skipped, they're left out of the best results it learns from and of the examples in the data scorecard, nothing
+  built only on covered data is blended, and no partner uses it. The IS Score rates your alphas combined, so a
+  near-copy of what's in adds almost nothing. SATURATED_AT=0 turns it off.
 - --backup, for a second scheduled run later in the day: if today's submission is already in and the
   reserve is full, it stops after re-checking the held queue; otherwise it mines like a normal run.
 - Before/after check: before each submission, and for each alpha it holds, the loop asks BRAIN's free
@@ -252,6 +281,13 @@ GENERATION_COOLDOWN_SECONDS = int(os.environ.get("GENERATION_COOLDOWN_SECONDS", 
 # A time limit on each Gemini request. The library's default is none at all, so a connection that drops
 # mid-request could leave a run waiting for hours - and while it waits, Windows skips the next scheduled run.
 GEMINI_TIMEOUT_SECONDS = int(os.environ.get("GEMINI_TIMEOUT_SECONDS", 300))
+# Backup idea writer: NVIDIA's Nemotron, asked only when Gemini (main model and fallback) can't answer a round. Needs a
+# free key from build.nvidia.com as NVIDIA_API_KEY in .env; without one there's no backup. NEMOTRON_MODEL takes any
+# model id from NVIDIA's catalog.
+NVIDIA_API_KEY = os.environ.get("NVIDIA_API_KEY", "").strip()
+NEMOTRON_MODEL = os.environ.get("NEMOTRON_MODEL", "nvidia/nemotron-3.5-super-vl-120b-a12b")
+NEMOTRON_URL = os.environ.get("NEMOTRON_URL", "https://integrate.api.nvidia.com/v1/chat/completions")
+NEMOTRON_TIMEOUT_SECONDS = int(os.environ.get("NEMOTRON_TIMEOUT_SECONDS", 300))
 
 # Submission bar - unchanged values, just named once so dashboard.py reads the same numbers.
 SUBMIT_MIN_SHARPE = 1.25
@@ -289,6 +325,12 @@ END_OF_DAY_MAX_PORTFOLIO_DROP = float(os.environ.get("END_OF_DAY_MAX_PORTFOLIO_D
 USER_ALPHAS_URL = "https://api.worldquantbrain.com/users/self/alphas"
 PNL_URL = "https://api.worldquantbrain.com/alphas/{alpha_id}/recordsets/pnl"
 PNL_MAX_SECONDS = 120     # per alpha, while BRAIN says its PnL is still being prepared
+# An alpha's in-sample PnL never changes once it's simulated, so each one read is kept in this folder (one small file
+# per alpha) and never asked for again - that makes ranking a long held queue by portfolio gain quick.
+PNL_CACHE_DIR = "pnl_cache"
+PNL_PREFETCH_SECONDS = int(os.environ.get("PNL_PREFETCH_SECONDS", 300))  # per run, reading held alphas' PnL
+# Submissions beyond the day's first must raise your combined Sharpe by at least this much (0.01 = 1%).
+EXTRA_MIN_GAIN = float(os.environ.get("EXTRA_MIN_GAIN", 0.01))
 PORTFOLIO_MIN_DAYS = 250  # trading days all the alphas must share for a fair comparison (about a year)
 ALPHA_LIST_PAGE = 100
 MAX_ALPHA_LIST_PAGES = 30
@@ -334,6 +376,16 @@ MAX_PAST_SHARPENS = int(os.environ.get("MAX_PAST_SHARPENS", 3))  # ...and earlie
 BLEND_PARTNER_MAX_TURNOVER = float(os.environ.get("BLEND_PARTNER_MAX_TURNOVER", 0.15))  # what counts as slow
 BLEND_PARTNER_MIN_SHARPE = float(os.environ.get("BLEND_PARTNER_MIN_SHARPE", 1.0))
 BLEND_FIXES = {"LOW_FITNESS", "HIGH_TURNOVER"}  # failed checks a blend can fix; any other failure rules it out
+# Auto-pair: an alpha with this Sharpe that only works in small stocks (it fails the big-stocks check) is added to
+# your alphas on other data that hold up best among the biggest stocks - their Sharpe there at least
+# PAIR_PARTNER_MIN_BIG_RATIO times BRAIN's limit. Up to MAX_PAIRS_PER_ALPHA partners each, MAX_PAIRS_PER_ROUND per
+# round, and MAX_PAST_PAIRS earlier ones at the start of each run. MAX_PAIRS_PER_ROUND=0 and MAX_PAST_PAIRS=0 turn it off.
+PAIR_MIN_SHARPE = float(os.environ.get("PAIR_MIN_SHARPE", 1.5))
+PAIR_PARTNER_MIN_BIG_RATIO = float(os.environ.get("PAIR_PARTNER_MIN_BIG_RATIO", 1.2))
+MAX_PAIRS_PER_ALPHA = int(os.environ.get("MAX_PAIRS_PER_ALPHA", 2))
+MAX_PAIRS_PER_ROUND = int(os.environ.get("MAX_PAIRS_PER_ROUND", 4))
+MAX_PAST_PAIRS = int(os.environ.get("MAX_PAST_PAIRS", 3))
+PAIR_FIXES = BLEND_FIXES | {"LOW_SUB_UNIVERSE_SHARPE"}  # what pairing can fix: the big-stocks check, and what a blend can
 # BRAIN refuses an expression with more operators than this: every function call and every + - * / or comparison.
 MAX_OPERATORS = 64
 SMALL_STOCKS_EXAMPLES = 8  # ideas that failed the big-stocks check, shown to the generator as ones not to rework
@@ -347,6 +399,9 @@ DEAD_END_MIN_TRIES = int(os.environ.get("DEAD_END_MIN_TRIES", 8))
 DEAD_END_MAX_FITNESS = float(os.environ.get("DEAD_END_MAX_FITNESS", 0.5))
 # What works: datasets with at least this many tests are scored for the generator (alphas passing every check).
 DATA_SCORECARD_MIN_TESTS = int(os.environ.get("DATA_SCORECARD_MIN_TESTS", 10))
+# Already covered: data your submitted alphas lean on - an ingredient in this many of them or more. New alphas built
+# only on covered data add little to your combined score, so they aren't tested or blended. 0 turns this off.
+SATURATED_AT = int(os.environ.get("SATURATED_AT", 3))
 BASIC_FIELDS = ("open", "high", "low", "close", "vwap", "volume", "returns", "adv20", "cap")  # never dropped
 
 # Variety: alphas built on the same kind of data tend to be too correlated to submit together.
@@ -1088,15 +1143,17 @@ def pick_varied(ideas, type_map: dict, crowded: Counter, n: int, overused_shapes
 def build_feedback(last_round_rows=None) -> str:
     """What the generator sees each round: your best results across ALL runs so far, so a new run
     builds on what already worked instead of starting from scratch, plus how the last round went."""
-    history, datasets = completed_history(), listed_datasets()
-    # Small-stock results are listed apart, as ideas not to rework; data left off the field list can't be used.
-    usable = [r for r in history if not small_stocks_only(r) and on_listed_data(r["expression"], datasets)]
+    history, datasets, covered = completed_history(), listed_datasets(), saturated_ingredients()
+    # Small-stock results are listed apart, as ideas not to rework; data left off the field list can't be used; and
+    # results built only on data your submitted alphas already cover would only invite more of the same.
+    usable = [r for r in history if not small_stocks_only(r) and on_listed_data(r["expression"], datasets)
+              and not only_covered(r["expression"], covered)]
     best = sorted(usable, key=lambda r: as_float(r["fitness"]), reverse=True)[:MEMORY_TOP_N]
     parts = []
     if best:
         lines = [f"Your best results so far, out of {len(history)} simulated alphas across all runs "
-                 f"(best fitness first; ones that only worked in small stocks, or use data left off your field "
-                 f"list, are left out). "
+                 f"(best fitness first; ones that only worked in small stocks, use data left off your field list "
+                 f"or are built only on data your submitted alphas already cover are left out). "
                  f"Learn from what works here - the operators, lookback windows, "
                  f"grouping and decay that score well, and what's holding each one back (usually fitness or "
                  f"turnover). But don't keep reusing the same data: a new alpha on the same data as one "
@@ -1122,7 +1179,8 @@ CHECKS_EXPLAINED = (
 )
 
 
-def generate_ideas(client: genai.Client, model: str, operators, fields, settings, feedback_text, avoid: set, n: int):
+def idea_prompt(operators, fields, settings, feedback_text, avoid: set, n: int) -> str:
+    """What the idea writer (Gemini, or Nemotron as the backup) is asked each round."""
     op_list = "\n".join(f"- {o['name']}: {o['usage']}" for o in operators)
     field_list = "\n".join(f"- {f['name']}: {f['description']}" for f in fields)
     avoid_list = "\n".join(f"- {e}" for e in list(avoid)[:50]) or "(none yet)"
@@ -1148,7 +1206,11 @@ def generate_ideas(client: genai.Client, model: str, operators, fields, settings
         f"economic rationale for why it might predict returns.\n\n"
         f"Do not repeat any of these already-tried expressions:\n{avoid_list}"
     )
+    return prompt
 
+
+def generate_ideas(client: genai.Client, model: str, operators, fields, settings, feedback_text, avoid: set, n: int):
+    prompt = idea_prompt(operators, fields, settings, feedback_text, avoid, n)
     resp = client.models.generate_content(
         model=model,
         contents=prompt,
@@ -1183,7 +1245,7 @@ def short_error(exc: Exception) -> str:
 
 def generate_with_fallback(client: genai.Client, operators, fields, settings, feedback_text, avoid: set, n: int):
     """Main model first, retried with backoff while it's busy or rate-limited. Then the
-    fallback model once. Raises the last error only if both fail."""
+    fallback model once, then Nemotron once if NVIDIA_API_KEY is set. Raises the last error only if all fail."""
     last_exc = None
     attempts = len(RETRY_DELAYS_SECONDS) + 1
     for attempt in range(1, attempts + 1):
@@ -1206,7 +1268,61 @@ def generate_with_fallback(client: genai.Client, operators, fields, settings, fe
         except Exception as exc:
             last_exc = exc
 
+    if NVIDIA_API_KEY:
+        logger.warning("Gemini can't write this round's ideas (%s) - asking Nemotron (%s) instead.",
+                       short_error(last_exc), NEMOTRON_MODEL)
+        try:
+            ideas = generate_with_nemotron(idea_prompt(operators, fields, settings, feedback_text, avoid, n))
+            logger.info("Nemotron wrote %d idea(s) for this round.", len(ideas))
+            return ideas
+        except Exception as exc:
+            logger.warning("Nemotron couldn't either (%s).", short_error(exc))
+            last_exc = exc
+
     raise last_exc
+
+
+NEMOTRON_INSTRUCTIONS = ('Reply with JSON only, in exactly this shape: {"ideas": [{"expression": "...", "rationale": "..."}]} '
+                         "- no explanation before or after it.")
+
+
+def ideas_from_text(text: str) -> list:
+    """[(expression, rationale)] from a reply that should hold {"ideas": [...]} - found even when the model wraps it
+    in a code fence or writes its reasoning or a draft first (the last such object wins). Raises ValueError when
+    there's no usable idea in it."""
+    text = text or ""
+    decoder, found = json.JSONDecoder(), None
+    for match in re.finditer(r"\{", text):
+        try:
+            data, _ = decoder.raw_decode(text, match.start())
+        except ValueError:
+            continue
+        if isinstance(data, dict) and isinstance(data.get("ideas"), list):
+            found = data  # the last one wins: a reply may show a draft before its answer
+    ideas = [(str(i["expression"]).strip(), str(i.get("rationale") or "").strip())
+             for i in (found or {}).get("ideas", []) if isinstance(i, dict) and str(i.get("expression") or "").strip()]
+    if not ideas:
+        raise ValueError("Nemotron's reply had no ideas in the expected JSON shape")
+    return ideas
+
+
+def generate_with_nemotron(prompt: str) -> list:
+    """Ask NVIDIA's Nemotron (OpenAI-style chat API) for this round's ideas: [(expression, rationale)]."""
+    resp = requests.post(
+        NEMOTRON_URL, timeout=NEMOTRON_TIMEOUT_SECONDS,
+        headers={"Authorization": f"Bearer {NVIDIA_API_KEY}", "Accept": "application/json"},
+        json={"model": NEMOTRON_MODEL, "temperature": 0.7, "max_tokens": 8192,
+              "messages": [{"role": "system", "content": NEMOTRON_INSTRUCTIONS},
+                           {"role": "user", "content": f"{prompt}\n\n{NEMOTRON_INSTRUCTIONS}"}]})
+    if resp.status_code != 200:
+        hint = {401: " - check NVIDIA_API_KEY in .env", 403: " - check NVIDIA_API_KEY in .env",
+                404: " - check NEMOTRON_MODEL in .env against build.nvidia.com"}.get(resp.status_code, "")
+        raise RuntimeError(f"Nemotron answered {resp.status_code}{hint}: {resp.text[:150]}")
+    try:
+        message = resp.json()["choices"][0]["message"]
+    except (ValueError, KeyError, IndexError, TypeError) as exc:
+        raise ValueError(f"Nemotron's reply wasn't in the expected format: {resp.text[:150]}") from exc
+    return ideas_from_text(message.get("content") or message.get("reasoning_content") or "")
 
 
 def wait_seconds(resp, default=2.0) -> float:
@@ -1258,18 +1374,25 @@ def self_correlation_max(session, alpha_id: str):
     return None
 
 
+def refusal(resp) -> tuple:
+    """BRAIN's 403 to a submission: REJECTED with the failed checks it names, or REFUSED when it names none."""
+    reason = failing_reason(resp)
+    return ("REJECTED", reason) if reason else ("REFUSED", f"403 {resp.text[:150]}")
+
+
 def submit_alpha(session, alpha_id: str):
     """Submit, then poll until BRAIN gives its verdict. Returns (state, detail), state being one of
-    YES, REJECTED, VERDICT_PENDING or FAILED. Following community clients that recorded BRAIN's
+    YES, REJECTED, REFUSED, VERDICT_PENDING or FAILED. Following community clients that recorded BRAIN's
     live traffic: 503 or 303 means queued / still processing, Retry-After means poll again, and
-    a 403 lists the failed checks. Anything ambiguous is reported as VERDICT_PENDING, never YES."""
+    a 403 lists the failed checks - one that lists none is REFUSED: BRAIN turned the submission away without saying
+    the alpha is at fault (a limit on submissions, say). Anything ambiguous is reported as VERDICT_PENDING, never YES."""
     url = SUBMIT_URL.format(alpha_id=alpha_id)
     try:
         resp = session.post(url, timeout=30, allow_redirects=False)
     except requests.RequestException as exc:
         return "FAILED", f"couldn't reach BRAIN ({type(exc).__name__})"
     if resp.status_code == 403:
-        return "REJECTED", failing_reason(resp) or f"403 {resp.text[:150]}"
+        return refusal(resp)
     if resp.status_code == 429:
         return "FAILED", f"BRAIN is throttling submissions right now ({resp.text[:100]})"
     if resp.status_code not in (200, 201, 202, 303, 503):
@@ -1286,7 +1409,7 @@ def submit_alpha(session, alpha_id: str):
         if still_working(resp) or resp.status_code == 429:
             continue
         if resp.status_code == 403:
-            return "REJECTED", failing_reason(resp) or f"403 {resp.text[:150]}"
+            return refusal(resp)
         if resp.status_code == 200 and resp.text.strip():
             reason = failing_reason(resp)
             return ("REJECTED", reason) if reason else ("YES", None)
@@ -1462,6 +1585,20 @@ def similar_for_now(corr) -> bool:
     return corr is None or corr >= daytime_limit()
 
 
+def adds_despite_similarity(session, alpha_id, corr) -> bool:
+    """For an alpha similar_for_now() would hold: whether it goes in anyway because it plainly isn't a copy - BRAIN
+    read its self-correlation, and adding it raises your submitted alphas' combined Sharpe by EXTRA_MIN_GAIN or more."""
+    if corr is None or not PORTFOLIO_CHECK:
+        return False
+    effect = portfolio_effect(session, alpha_id)
+    if effect is None or effect.after is None or effect.before is None or gain(effect) < EXTRA_MIN_GAIN:
+        return False
+    logger.info("Alpha %s's self-correlation is %.2f - over the daytime %g, but adding it raises your combined Sharpe "
+                "%+.1f%% (%+.0f%% needed), so it isn't held for that.", alpha_id, corr, daytime_limit(),
+                100 * gain(effect), 100 * EXTRA_MIN_GAIN)
+    return True
+
+
 def daytime_note() -> str:
     """' with self-correlation under 0.5' while the stricter limit is on, '' when it's off."""
     limit = daytime_limit()
@@ -1492,8 +1629,39 @@ def daily_pnl(data) -> dict:
     return {day: total - prev for (_, prev), (day, total) in zip(rows, rows[1:])}
 
 
+def _pnl_path(alpha_id) -> Path:
+    return Path(PNL_CACHE_DIR) / (re.sub(r"[^A-Za-z0-9_-]", "_", str(alpha_id)) + ".json")
+
+
+def cached_pnl(alpha_id):
+    """The daily PnL read for this alpha before (PNL_CACHE_DIR), or None."""
+    try:
+        data = json.loads(_pnl_path(alpha_id).read_text(encoding="utf-8"))
+        daily = data.get("daily") if isinstance(data, dict) else None
+        return {str(day): float(value) for day, value in daily.items()} if isinstance(daily, dict) and daily else None
+    except (OSError, ValueError, TypeError, AttributeError):
+        return None
+
+
+def save_pnl(alpha_id, daily):
+    """Keep an alpha's daily PnL for later runs. Written to a temporary file and swapped in; a failure only means it's
+    read from BRAIN again next time."""
+    path = _pnl_path(alpha_id)
+    try:
+        path.parent.mkdir(exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"daily": daily}), encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
 def fetch_daily_pnl(session, alpha_id):
-    """An alpha's daily PnL from BRAIN, or None if BRAIN didn't send it (after waiting while it's prepared)."""
+    """An alpha's daily PnL - kept from an earlier read, or from BRAIN (then kept) - or None if BRAIN didn't send it
+    (after waiting while it's prepared)."""
+    known = cached_pnl(alpha_id)
+    if known:
+        return known
     url = PNL_URL.format(alpha_id=alpha_id)
     deadline = time.time() + PNL_MAX_SECONDS
     try:
@@ -1507,7 +1675,10 @@ def fetch_daily_pnl(session, alpha_id):
                 continue
             if resp.status_code != 200 or not resp.text.strip():
                 return None
-            return daily_pnl(resp.json()) or None
+            daily = daily_pnl(resp.json()) or None
+            if daily:
+                save_pnl(alpha_id, daily)
+            return daily
     except (requests.RequestException, ValueError):
         return None
 
@@ -1647,9 +1818,17 @@ def portfolio_effect(session, alpha_id):
         return None
 
 
+def gain(effect) -> float:
+    """How much adding the alpha changes your submitted alphas' combined Sharpe: 0.02 = 2% higher."""
+    if effect is None or effect.after is None or not effect.before:
+        return 0.0
+    return (effect.after - effect.before) / abs(effect.before)
+
+
 def portfolio_verdict(session, alpha_id):
     """(may go in, what the check found). It may go in only if adding it raises your submitted alphas' combined
-    Sharpe; the end-of-day pick may lower it by up to END_OF_DAY_MAX_PORTFOLIO_DROP. If the check can't be made
+    Sharpe - by EXTRA_MIN_GAIN or more for a submission beyond the day's first; the end-of-day pick may lower it by up
+    to END_OF_DAY_MAX_PORTFOLIO_DROP. If the check can't be made
     (it's off, BRAIN didn't send a PnL, too few shared days), the answer is yes and the usual rules decide alone."""
     effect = portfolio_effect(session, alpha_id)
     if effect is None or effect.after is None:
@@ -1657,10 +1836,15 @@ def portfolio_verdict(session, alpha_id):
     if effect.before is None:
         return True, f"it would be your first submitted alpha (Sharpe {effect.after:.2f})"
     allowed = END_OF_DAY_MAX_PORTFOLIO_DROP if end_of_day_pick() else 0.0
-    change = (effect.after - effect.before) / abs(effect.before) if effect.before else 0.0
+    change = gain(effect)
     note = (f"your {effect.alphas} submitted alpha(s) combined have Sharpe {effect.before:.2f}, {effect.after:.2f} "
             f"with it ({change:+.1%})" + (f"; its correlation with them is {effect.corr:.2f}"
                                           if effect.corr is not None else ""))
+    if submissions_today() > 0 and MAX_SUBMISSIONS_PER_DAY > 1:
+        # An extra submission: it must clearly add something, or it's better kept for a coming day.
+        if change >= EXTRA_MIN_GAIN:
+            return True, note
+        return False, note + f" - an extra submission today needs at least {EXTRA_MIN_GAIN:+.0%}"
     if effect.after > effect.before - allowed * abs(effect.before):
         return True, note
     PORTFOLIO.blocked.add(alpha_id)
@@ -1715,6 +1899,13 @@ def try_submit(session, alpha_id: str, corr=_UNCHECKED) -> str:
     if state == "REJECTED":
         logger.warning("BRAIN rejected the submission of %s: %s", alpha_id, detail)
         return f"REJECTED: {detail}"
+    if state == "REFUSED":
+        global REFUSED_ON
+        REFUSED_ON = brain_day()
+        logger.warning("BRAIN turned the submission of %s away without naming a failed check (%s) - perhaps a limit "
+                       "on submissions. Keeping it queued, and submitting nothing more until BRAIN's next day (3 AM "
+                       "US Eastern).", alpha_id, detail)
+        return f"FAILED: {detail}"
     if state == "VERDICT_PENDING":
         logger.warning("BRAIN took %s but hasn't confirmed it as submitted yet - press Check with "
                        "BRAIN in the dashboard later.", alpha_id)
@@ -1942,15 +2133,47 @@ def on_listed_data(expression: str, datasets) -> bool:
     return datasets is None or alpha_kind(expression) <= set(datasets) | {PRICE_VOLUME}
 
 
-def top_level_sum(expression: str) -> bool:
-    """Whether the expression is two or more signals added or subtracted at its outermost level, like a blend."""
-    plain, depth = _blank_quotes(expression or "").strip(), 0
+def top_level_parts(expression: str) -> list:
+    """The signals added or subtracted together at an expression's outermost level - just the expression itself when
+    it isn't a sum. A sign that's part of a number (1e-3) or of an operand (-x, a * -1) doesn't split it."""
+    text = (expression or "").strip()
+    plain, depth, start, parts = _blank_quotes(text), 0, 0, []
     for i, ch in enumerate(plain):
         depth += ch == "("
         depth -= ch == ")"
-        if depth == 0 and ch in "+-" and i > 0 and plain[:i].strip() and plain[:i].rstrip()[-1] not in "(,*/<>=+-":
-            return True
-    return False
+        if depth or ch not in "+-" or not plain[:i].strip():
+            continue
+        before = plain[:i].rstrip()
+        if before[-1] in "(,*/<>=+-" or (before[-1] in "eE" and len(before) > 1 and before[-2].isdigit()):
+            continue
+        parts.append(text[start:i])
+        start = i + 1
+    parts.append(text[start:])
+    return [part.strip() for part in parts if part.strip()]
+
+
+def signal_parts(expression: str) -> list:
+    """The signals an expression adds or subtracts: the parts of a sum at its outermost level (top_level_parts) - or
+    of a sum under the calls wrapped round it, so an auto-smoothed blend, ts_decay_linear(rank(a) + rank(b), 10), is
+    two signals too. Plain fields added inside a call (rank(close - vwap), group_neutralize(a + b, sector)) are one."""
+    text = (expression or "").strip()
+    parts = top_level_parts(text)
+    if len(parts) > 1:
+        return [piece for part in parts for piece in signal_parts(part)]
+    call = outer_call(text[1:] if text.startswith("-") else text)
+    if not call or not call[1][0].strip():
+        return [text]
+    inner = call[1][0].strip()
+    nested = top_level_parts(inner)
+    if len(nested) > 1 and not all("(" in part for part in nested):
+        return [text]
+    deeper = signal_parts(inner)
+    return deeper if len(deeper) > 1 else [text]
+
+
+def is_blend(expression: str) -> bool:
+    """Whether the expression adds separate signals together (signal_parts), smoothed or not - like a blend."""
+    return len(signal_parts(expression)) > 1
 
 
 def blend_worthy(row) -> bool:
@@ -2004,11 +2227,13 @@ def passed_every_check(row) -> bool:
 
 def blend_partners(expression: str) -> list:
     """(partner expression, its row) - your slow alphas worth adding to `expression`, best Sharpe first (ones outside
-    your submitted pool before ones in it or too similar to it), one per kind of data: Sharpe at least BLEND_PARTNER_MIN_SHARPE with every check passed except the ones its own Sharpe and
-    fitness explain and similarity, the big-stocks check passed on BRAIN's numbers, trading under
-    BLEND_PARTNER_MAX_TURNOVER, a different idea from `expression` (different_idea), using datasets on your field list,
-    short enough that the blend stays under BRAIN's operator limit, and not blends themselves."""
-    datasets = listed_datasets()
+    your submitted pool before ones in it or too similar to it), one per kind of data: Sharpe at least
+    BLEND_PARTNER_MIN_SHARPE with every check passed except similarity and the ones its own Sharpe and fitness explain,
+    the big-stocks check passed on BRAIN's numbers, trading under BLEND_PARTNER_MAX_TURNOVER, a different idea from
+    `expression` (different_idea), using datasets on your field list, short enough that the blend stays under BRAIN's
+    operator limit, not blends themselves, and not built on data your submitted alphas already cover
+    (saturated_ingredients)."""
+    datasets, covered = listed_datasets(), set(saturated_ingredients())
     room = MAX_OPERATORS - operator_count(expression) - 3  # rank() twice and the +
 
     def in_pool(r):  # submitted, or too similar to one that is: a blend with it would carry some of that likeness
@@ -2019,8 +2244,8 @@ def blend_partners(expression: str) -> list:
     out, kinds_taken = [], []
     for r in rows:
         partner = strip_padding(r["expression"]).strip()
-        if top_level_sum(partner) or (r.get("rationale") or "").startswith("Auto-blend"):
-            continue  # a blend already carries a fast signal - adding it would double that up
+        if is_blend(partner) or (r.get("rationale") or "").startswith("Auto-blend"):
+            continue  # a blend (an auto-smoothed one too) already carries a fast signal - adding it would double that up
         sharpe, fitness, turnover = (as_float(r.get(k)) for k in ("sharpe", "fitness", "turnover"))
         big, limit = as_float(r.get("sub_universe_sharpe")), as_float(r.get("sub_universe_limit"))
         passed, total = as_float(r.get("checks_passed")), as_float(r.get("checks_total"))
@@ -2037,6 +2262,8 @@ def blend_partners(expression: str) -> list:
         partner_kind = alpha_kind(partner)
         if not different_idea(expression, partner) or any(partner_kind & taken for taken in kinds_taken):
             continue
+        if ingredients(partner) & covered:
+            continue  # data your submitted alphas already lean on would make the blend look like them
         if not on_listed_data(partner, datasets) or operator_count(partner) > room:
             continue
         kinds_taken.append(partner_kind)
@@ -2048,6 +2275,8 @@ def blend_candidates(expression: str, avoid=frozenset()) -> list:
     """(blend, why) for `expression` with each of its blend_partners() not tried yet, up to MAX_BLENDS_PER_ALPHA.
     rank() on both sides puts them on the same scale, so neither drowns the other out."""
     base, out = strip_padding(expression).strip(), []
+    if only_covered(base):
+        return []  # built only on data your submitted alphas already cover: a blend would mostly repeat them
     for partner, r in blend_partners(base):
         blended = f"rank({base}) + rank({partner})"
         if blended in avoid or too_long(blended):
@@ -2057,6 +2286,101 @@ def blend_candidates(expression: str, avoid=frozenset()) -> list:
                              f"together and usually beat both on Sharpe and fitness"))
         if len(out) == MAX_BLENDS_PER_ALPHA:
             break
+    return out
+
+
+def pair_worthy(row) -> bool:
+    """Sharpe at least PAIR_MIN_SHARPE, but only in small stocks: the big-stocks check failed on BRAIN's numbers (with
+    the Sharpe there still above zero), and nothing else is known to be wrong besides fitness or turnover (the checks
+    BRAIN failed, when they're at hand, or at most three of its checks short). Not a blend already, not built only on data your submitted alphas cover, and
+    trading little enough that a blend stays under BRAIN's turnover limit."""
+    sharpe, turnover = as_float(row.get("sharpe")), as_float(row.get("turnover"))
+    if sharpe is None or turnover is None or sharpe < PAIR_MIN_SHARPE or turnover / math.sqrt(2) > TURNOVER_MAX:
+        return False
+    if not small_stocks_only(row) or is_blend(row.get("expression") or ""):
+        return False
+    if (as_float(row.get("sub_universe_sharpe")) or 0.0) <= 0:
+        return False  # it loses money among the biggest stocks: a partner can't carry that
+    failed = row.get("failed_checks")
+    if failed is not None:
+        if set(failed) - PAIR_FIXES:
+            return False
+    else:
+        passed, total = as_float(row.get("checks_passed")), as_float(row.get("checks_total"))
+        if passed is None or total is None or passed < total - 3:
+            return False
+    return not only_covered(row["expression"])
+
+
+def pair_partners(expression: str) -> list:
+    """(partner expression, its row) - your alphas on other data that hold up best among the biggest stocks, for an
+    alpha that only works in small ones: BRAIN's big-stocks Sharpe at least PAIR_PARTNER_MIN_BIG_RATIO times its limit,
+    Sharpe over BRAIN's bar with every check passed except similarity and the ones its own Sharpe and
+    fitness explain, none of the same data as `expression`, not blends themselves, not built on data your submitted
+    alphas already cover, on your field list, and short enough to add. Highest big-stocks Sharpe first (ones outside
+    your submitted pool before ones in it), one per kind of data."""
+    datasets, covered = listed_datasets(), set(saturated_ingredients())
+    room = MAX_OPERATORS - operator_count(expression) - 3
+    base_kind, base_ingredients = alpha_kind(expression), ingredients(expression)
+
+    def in_pool(r):
+        submitted = (r.get("submitted") or "").strip()
+        return submitted == "YES" or submitted.startswith(("VERDICT_PENDING", "TOO_CORRELATED"))
+
+    rows = sorted(completed_history(), key=lambda r: (in_pool(r), -(as_float(r.get("sub_universe_sharpe")) or 0.0)))
+    out, kinds_taken = [], []
+    for r in rows:
+        partner = strip_padding(r["expression"]).strip()
+        if is_blend(partner) or (r.get("rationale") or "").startswith(("Auto-blend", "Auto-pair")):
+            continue
+        sharpe, fitness = as_float(r.get("sharpe")), as_float(r.get("fitness"))
+        big, limit = as_float(r.get("sub_universe_sharpe")), as_float(r.get("sub_universe_limit"))
+        passed, total = as_float(r.get("checks_passed")), as_float(r.get("checks_total"))
+        if sharpe is None or fitness is None or sharpe < SUBMIT_MIN_SHARPE:
+            continue
+        if big is None or limit is None or limit <= 0 or big < PAIR_PARTNER_MIN_BIG_RATIO * limit:
+            continue
+        allowed = 1 + (sharpe < SUBMIT_MIN_SHARPE) + (fitness < SUBMIT_MIN_FITNESS)
+        if not passed_every_check(r) and (passed is None or total is None or passed < total - allowed):
+            continue
+        partner_kind, partner_ingredients = alpha_kind(partner), ingredients(partner)
+        if partner_kind & base_kind or partner_ingredients & base_ingredients:
+            continue  # the same data: nothing new for the big stocks
+        if any(partner_kind & taken for taken in kinds_taken):
+            continue
+        if partner_ingredients & covered or not on_listed_data(partner, datasets) or operator_count(partner) > room:
+            continue
+        kinds_taken.append(partner_kind)
+        out.append((partner, r))
+    return out
+
+
+def pair_candidates(expression: str, avoid=frozenset()) -> list:
+    """(blend, why) for `expression` with each of its pair_partners() not tried yet, up to MAX_PAIRS_PER_ALPHA."""
+    base, out = strip_padding(expression).strip(), []
+    for partner, r in pair_partners(base):
+        paired = f"rank({base}) + rank({partner})"
+        if paired in avoid or too_long(paired):
+            continue
+        out.append((paired, f"added to {partner}, which holds up among the biggest stocks (Sharpe {r.get('sharpe')}, "
+                            f"{r.get('sub_universe_sharpe')} there against BRAIN's limit of "
+                            f"{r.get('sub_universe_limit')}) - together they can pass the big-stocks check"))
+        if len(out) == MAX_PAIRS_PER_ALPHA:
+            break
+    return out
+
+
+def pair_rows() -> list:
+    """Earlier alphas worth pairing (pair_worthy), not submitted, best Sharpe first, one per idea."""
+    datasets, seen, out = listed_datasets(), set(), []
+    rows = [r for r in completed_history() if r.get("alpha_id") and (r.get("submitted") or "NO").strip() == "NO"
+            and pair_worthy(r) and on_listed_data(r["expression"], datasets)]
+    for r in sorted(rows, key=lambda r: as_float(r.get("sharpe")) or 0.0, reverse=True):
+        core = idea_core(r["expression"])
+        key = (skeleton(core), alpha_kind(core))
+        if key not in seen:
+            seen.add(key)
+            out.append(r)
     return out
 
 
@@ -2155,19 +2479,22 @@ RECIPES = (
     "raw level or the raw change.\n"
     "- Smooth slow data (analyst estimates, fundamentals) with ts_decay_linear(..., 15) or 20: it costs little Sharpe "
     "and lifts fitness.\n"
-    "- Fast plus slow: a fast price signal with a high Sharpe that trades a lot (for example "
-    "reverse(group_rank(close / vwap, sector)), the day's close against its average price), added to a slow signal "
-    "on other data as rank(fast) + rank(slow), trades about half as much and usually beats both on Sharpe and "
-    "fitness. Promising fast ideas are also blended with your best slow alphas automatically.\n"
+    "- Fast plus slow: a fast signal with a high Sharpe that trades a lot, added to a slow signal on other data as "
+    "rank(fast) + rank(slow), trades about half as much and usually beats both on Sharpe and fitness. Promising "
+    "ideas are also blended with your best slow alphas automatically.\n"
+    "- A signal that only works in small stocks fails the big-stocks check (LOW_SUB_UNIVERSE_SHARPE): added as "
+    "rank(a) + rank(b) to one on other data that holds up in large stocks, the blend often passes.\n"
+    "- New data adds the most: the IS Score rates your alphas combined, so an alpha that moves unlike the ones you've "
+    "submitted raises it far more than a stronger near-copy does.\n"
     f"- BRAIN refuses an expression with more than {MAX_OPERATORS} operators (every function call and every "
     "+ - * / counts) - keep each idea well under that."
 )
 
 
-def data_scorecard() -> str:
-    """For the generator: which BRAIN datasets on your field list have produced alphas that passed every check on your
-    account, out of how many tests, and which never have after DATA_SCORECARD_MIN_TESTS+ tests - with example field
-    names, since the generator knows data by its field names. '' when nothing has been tested enough."""
+def dataset_track_record() -> tuple:
+    """(tests per kind of data, alphas passing every check per kind, {kind: [Counter of the fields in passing ones,
+    Counter of the fields in the rest]}) over every completed simulation - kinds as alpha_kind gives them: a BRAIN
+    dataset id, or price/volume."""
     tests, passes, fields = Counter(), Counter(), {}
     for r in completed_history():
         names = [n for _, _, n in data_fields_in(r["expression"]) if n not in BASIC_FIELDS]
@@ -2176,10 +2503,27 @@ def data_scorecard() -> str:
             passed = passed_every_check(r)
             passes[kind] += passed
             fields.setdefault(kind, [Counter(), Counter()])[0 if passed else 1].update(names)
+    return tests, passes, fields
 
-    def examples(kind):
+
+def never_worked(min_tests=None) -> set:
+    """Datasets that have never produced an alpha passing every check, after DATA_SCORECARD_MIN_TESTS+ tests."""
+    tests, passes, _ = dataset_track_record()
+    floor = DATA_SCORECARD_MIN_TESTS if min_tests is None else min_tests
+    return {k for k in tests if k != PRICE_VOLUME and tests[k] >= floor and not passes[k]}
+
+
+def data_scorecard() -> str:
+    """For the generator: which BRAIN datasets on your field list have produced alphas that passed every check on your
+    account, out of how many tests, and which never have after DATA_SCORECARD_MIN_TESTS+ tests - with example field
+    names, since the generator knows data by its field names. '' when nothing has been tested enough."""
+    tests, passes, fields = dataset_track_record()
+    covered = set(saturated_ingredients())
+
+    def examples(kind):  # not fields your submitted alphas already cover: pointing there only invites near-copies
         good, tried = fields.get(kind, [Counter(), Counter()])
-        return ", ".join(n for n, _ in (good or tried).most_common(3))
+        fresh = lambda counter: [n for n, _ in counter.most_common() if field_family(n) not in covered]
+        return ", ".join((fresh(good) or fresh(tried))[:3])
 
     def label(kind):
         return "price/volume data only" if kind == PRICE_VOLUME else dataset_name(kind)
@@ -2428,10 +2772,115 @@ def distinct_kinds(kinds) -> int:
     return len(groups)
 
 
+# ---- Ingredients: what your submitted alphas are already built on ----
+
+# Words in data field names that only say which provider, version or summary of a number it is - the same quantity
+# whichever: anl4_ebit_value, anl4_fs_detail_estimates_advanced_af_nd_ebit_high and anl4_fs_detail_estimate_1qf_v4_nd_
+# ebit_low are all analysts' EBIT forecasts. (Counts and spreads of forecasts - _number, _std - are other quantities.)
+FIELD_NAME_NOISE = frozenset({"anl", "fs", "detail", "estimate", "estimates", "advanced", "basic", "af", "qf", "nd",
+                              "v", "delay", "afv", "qfv", "qfd"})
+FIELD_NAME_SUMMARIES = frozenset({"value", "median", "mean", "high", "low", "avg", "average", "max", "min", "maximum",
+                                  "minimum", "est", "amount", "quarterly", "qtr", "quarter", "annual"})
+
+
+def field_family(name: str) -> str:
+    """A data field without its numbers, provider and version words or trailing summary: every window of
+    unsystematic_risk_last_N_days is one family, and so is every summary of analysts' EBIT forecasts (anl4_ebit_value,
+    ..._ebit_high, ..._ebit_low) - an alpha on one comes back much like one on another."""
+    words = [w for w in re.sub(r"\d+", "", name).lower().split("_") if w]
+    core = [w for w in words if w not in FIELD_NAME_NOISE] or words
+    while len(core) > 1 and core[-1] in FIELD_NAME_SUMMARIES:
+        core.pop()
+    return "_".join(core) or name
+
+
+def signal_fields(expression: str) -> list:
+    """The data fields an expression's signal is built on - not ones only used to form the groups it's ranked or
+    neutralized in (group_rank(x, sector), group_neutralize(x, bucket(rank(sharesout), ...)))."""
+    masked = expression or ""
+    for start, end in sorted(_group_calls(masked), reverse=True):
+        masked = masked[:start] + " " * (end - start) + masked[end:]
+    return [name for _, _, name in data_fields_in(masked)]
+
+
+def ingredients(expression: str) -> frozenset:
+    """What an alpha is made of, signal by signal (signal_parts): the families of each one's data fields, or - for a
+    signal built on price and volume alone - which of those it uses ("price/volume: close+vwap" for an intraday
+    reversal, "price/volume: volume" for a volume signal)."""
+    out = set()
+    for part in signal_parts(strip_padding(expression or "")):
+        fields = signal_fields(part)
+        families = {field_family(name) for name in fields if name not in BASIC_FIELDS}
+        if not families:
+            basics = sorted({name for name in fields if name in BASIC_FIELDS})
+            families = {"price/volume: " + ("+".join(basics) or "none")}
+        out |= families
+    return frozenset(out)
+
+
+def submitted_rows() -> list:
+    """Your submitted alphas as the results file has them, one row each."""
+    if not Path(RESULTS_FILE).exists():
+        return []
+    with open(RESULTS_FILE, encoding="utf-8", newline="") as f:
+        rows = [r for r in csv.DictReader(f) if landed((r.get("submitted") or "").strip())]
+    return list({(r.get("alpha_id") or r.get("expression")): r for r in rows}.values())
+
+
+def ingredient_counts() -> tuple:
+    """(Counter of ingredient -> how many of your submitted alphas use it, {ingredient: up to 3 example fields - not
+    two that differ only in their numbers})."""
+    counts, examples = Counter(), {}
+    unnumbered = lambda name: re.sub(r"\d+", "", name)
+    for r in submitted_rows():
+        found = ingredients(r["expression"])
+        counts.update(found)
+        for name in signal_fields(r["expression"]):
+            seen = examples.setdefault(field_family(name), [])
+            if len(seen) < 3 and unnumbered(name) not in map(unnumbered, seen):
+                seen.append(name)
+    return counts, examples
+
+
+def saturated_ingredients() -> dict:
+    """{ingredient: submitted alphas using it} for the ones in SATURATED_AT or more of them - data you've covered."""
+    if SATURATED_AT <= 0:
+        return {}
+    counts, _ = ingredient_counts()
+    return {name: n for name, n in counts.items() if n >= SATURATED_AT}
+
+
+def only_covered(expression: str, covered=None) -> bool:
+    """Whether every ingredient of this alpha is one your submitted alphas already cover (saturated_ingredients)."""
+    covered = saturated_ingredients() if covered is None else covered
+    found = ingredients(expression)
+    return bool(covered) and bool(found) and found <= set(covered)
+
+
+def covered_rule() -> str:
+    """For the generator: the data your submitted alphas already lean on. '' when none is covered yet."""
+    covered = saturated_ingredients()
+    if not covered:
+        return ""
+    _, examples = ingredient_counts()
+    lines = []
+    for name, n in sorted(covered.items(), key=lambda kv: -kv[1]):
+        if name.startswith("price/volume: "):
+            label = f"signals built only on {name[len('price/volume: '):].replace('+', ' and ')} (price/volume data)"
+        else:
+            label = f"{', '.join(examples.get(name) or [name])} (and any other window, version or summary of it)"
+        lines.append(f"- {label}: in {n} of your submitted alphas")
+    return ("ALREADY COVERED - your submitted alphas already lean on this data. The leaderboard's IS Score rates your "
+            "alphas combined, so another alpha built only on it adds almost nothing, and ideas built only on it are "
+            "skipped. Build on other data; one of these may still be one part of a blend with something new:\n"
+            + "\n".join(lines))
+
+
 class Reserve:
     """Good alphas waiting for a coming day - ones BRAIN confirmed during this run (every check passed and
     its similarity check was under the limit) - and the kinds this run has submitted. Counts kinds, not
-    alphas: of two near-copies, only one can ever be submitted, because then the other is too similar."""
+    alphas: of two near-copies, only one can ever be submitted, because then the other is too similar. Once your
+    combined portfolio can be read, spare() counts your whole held queue instead (see spare)."""
 
     def __init__(self):
         self.waiting = {}   # alpha_id -> expression
@@ -2456,34 +2905,68 @@ class Reserve:
     def kinds(self, besides=None) -> int:
         return distinct_kinds(alpha_kind(e) for e in self.usable(besides))
 
+    def spare(self, besides=None) -> int:
+        """Good alphas left for the coming days if `besides` went in now: once your combined portfolio can be read,
+        every one waiting - confirmed this run or still in your held queue (not ones held for lowering the portfolio)
+        - since each extra must then add EXTRA_MIN_GAIN anyway; before that, kinds of alpha confirmed this run."""
+        if PORTFOLIO.state != "ready":
+            return self.kinds(besides)
+        queued = {r["expression"] for r in held_candidates() if r.get("submitted") != HELD_PORTFOLIO_LABEL}
+        return len((queued | set(self.waiting.values())) - {besides})
+
 
 RESERVE = Reserve()  # a fresh one for every run
 SETTLING = False      # True once this run has given up waiting for a strong alpha today (settle_for_today)
+REFUSED_ON = None     # the BRAIN day BRAIN turned a submission away without naming a failed check (try_submit)
+
+
+def portfolio_ready(session) -> bool:
+    """Read your submitted alphas' PnL if this run hasn't yet (PORTFOLIO.ready) - never raising: a problem only leaves
+    the usual rules to decide."""
+    if not PORTFOLIO_CHECK:
+        return False
+    try:
+        return PORTFOLIO.ready(session)
+    except Exception as exc:
+        logger.warning("Couldn't read your combined portfolio (%s: %s) - the usual rules decide.",
+                       type(exc).__name__, str(exc)[:100])
+        return False
+
+
+def gain_decides() -> bool:
+    """Whether a submission beyond the day's first is judged by what it adds to your combined portfolio
+    (EXTRA_MIN_GAIN) rather than by being strong: the portfolio check is on and your alphas' PnL was read this run."""
+    return PORTFOLIO_CHECK and PORTFOLIO.state == "ready"
 
 
 def may_submit(expression, strong=True) -> bool:
     """Today's first submission: a strong alpha straight away; one that only clears BRAIN's bar once the run
     settles (no strong one by the end of the usual rounds) - the leaderboard counts days. More, up to
     MAX_SUBMISSIONS_PER_DAY, only for strong alphas, and only while at least RESERVE_TARGET other kinds of
-    good alpha would still be waiting afterwards, so a day that finds nothing new can still submit."""
+    good alpha would still be waiting afterwards, so a day that finds nothing new can still submit. Once your combined
+    portfolio can be read, the reserve counts alphas instead of kinds - the portfolio check then also asks an extra
+    submission to raise the combined Sharpe by EXTRA_MIN_GAIN, which near-copies can't."""
     done = submissions_today()
-    if done >= MAX_SUBMISSIONS_PER_DAY:
+    if done >= MAX_SUBMISSIONS_PER_DAY or REFUSED_ON == brain_day():
         return False
     if done == 0:
         return strong or SETTLING
-    return strong and RESERVE.kinds(besides=expression) >= RESERVE_TARGET
+    return (strong or gain_decides()) and RESERVE.spare(besides=expression) >= RESERVE_TARGET
 
 
 def why_held(expression, strong=True) -> str:
     done = submissions_today()
     if done >= MAX_SUBMISSIONS_PER_DAY:
         return f"today's submission limit ({MAX_SUBMISSIONS_PER_DAY}) is used"
-    if not strong:
-        if done == 0:
-            return f"it isn't strong ({strong_note()})"
+    if REFUSED_ON == brain_day():
+        return "BRAIN turned a submission away earlier today without naming a failed check"
+    if not strong and done == 0:
+        return f"it isn't strong ({strong_note()})"
+    if not strong and not gain_decides():
         return f"today's submission is in, and only strong alphas ({strong_note()}) go in as an extra"
-    left = RESERVE.kinds(besides=expression)
-    return (f"today's submission is in, and another now would leave only {left} other kind(s) of good alpha "
+    left = RESERVE.spare(besides=expression)
+    what = "good alpha(s)" if PORTFOLIO.state == "ready" else "kind(s) of good alpha"
+    return (f"today's submission is in, and another now would leave only {left} other {what} "
             f"for the coming days (keeping {RESERVE_TARGET})")
 
 
@@ -2582,6 +3065,56 @@ def mark_held(alpha_id: str, outcome: str):
     append_result(dict(target, round="held", timestamp=time.strftime("%Y-%m-%d %H:%M:%S")))
 
 
+def scored(effects) -> bool:
+    return any(e is not None and e.after is not None and e.before is not None for e in (effects or {}).values())
+
+
+def best_gain_first(item, effects) -> tuple:
+    """Sort key for a (row, self-correlation, latest numbers) entry: strong alphas first while only they may go in
+    (today's first submission before the run settles; extras too, unless what they add decides - gain_decides), then
+    the one that would raise your combined Sharpe most; ones the check couldn't score last."""
+    effect = effects.get(item[0]["alpha_id"])
+    known = effect is not None and effect.after is not None and effect.before is not None
+    strong_first = (submissions_today() == 0 and not SETTLING) or not gain_decides()
+    return strong_first and not row_is_strong(item[2]), not known, -gain(effect) if known else 0.0
+
+
+def rank_by_portfolio(session, queue) -> list:
+    """Held alphas in the order worth checking: with the portfolio check on, by what each would add to your combined
+    Sharpe, biggest gain first (its PnL kept from an earlier read, or read now within PNL_PREFETCH_SECONDS); then
+    the ones it couldn't score, in their usual order. Re-checking stops after HELD_CHECK_BUDGET_SECONDS, so with a
+    long queue the ones that would add the most are the ones checked."""
+    if not PORTFOLIO_CHECK or not queue:
+        return queue
+    try:
+        if not PORTFOLIO.ready(session):
+            return queue
+    except Exception as exc:
+        logger.warning("Couldn't read your combined portfolio for the held queue (%s) - checking it in the usual "
+                       "order.", type(exc).__name__)
+        return queue
+    deadline = time.time() + PNL_PREFETCH_SECONDS
+    ranked, unscored = [], []
+    for row in queue:
+        alpha_id = row["alpha_id"]
+        if cached_pnl(alpha_id) is None and time.time() > deadline:
+            unscored.append(row)  # its PnL is read in a later run
+            continue
+        effect = portfolio_effect(session, alpha_id)
+        if effect is None or effect.after is None or effect.before is None:
+            unscored.append(row)
+            continue
+        ranked.append((gain(effect), row))
+    ranked.sort(key=lambda item: -item[0])
+    if ranked:
+        top = ", ".join(f"{row['alpha_id']} {change:+.1%}" for change, row in ranked[:5])
+        lower = sum(1 for change, _ in ranked if change < 0)
+        logger.info("Held queue ranked by what each alpha would add to your combined Sharpe: %s%s%s.", top,
+                    f"; {lower} would lower it" if lower else "",
+                    f"; {len(unscored)} not scored yet" if unscored else "")
+    return [row for _, row in ranked] + unscored
+
+
 def submit_held(session):
     """Start-of-run step: if today's slot is free, submit the best held alpha. Returns the first outcome
     BRAIN gave (YES, VERDICT_PENDING..., or REJECTED... if none went in), or None. Never stops the run."""
@@ -2596,9 +3129,10 @@ def submit_held(session):
 def _submit_held(session):
     """Re-check every held alpha with BRAIN - including its free similarity check, which grows stricter
     as you submit more - so the queue only keeps alphas that could still be submitted. The ones that pass
-    are counted in the reserve. Then, best first (strong ones, then by fitness, on BRAIN's latest numbers): if
-    nothing is in for today, a strong one under DAYTIME_MAX_SELF_CORRELATION is submitted - or, once the run
-    settles, the least similar one (the end-of-day pick); more only as may_submit() and that limit allow.
+    are counted in the reserve. Then, best first (strong ones, then the one that would raise your combined Sharpe
+    most - or, when that can't be read, the best fitness on BRAIN's latest numbers - ranked again after each one goes
+    in): if nothing is in for today, a strong one under DAYTIME_MAX_SELF_CORRELATION is submitted - or, once the run
+    settles, the end-of-day pick; more only as may_submit(), that limit and the portfolio check allow.
     Checking stops after HELD_CHECK_BUDGET_SECONDS; anything not checked yet waits for the next run."""
     queue = held_candidates()
     if not queue:
@@ -2612,9 +3146,14 @@ def _submit_held(session):
         plan = (f"Nothing is submitted for today yet - a strong one ({strong_note()}){daytime_note()} goes in now; "
                 f"the others wait until the usual rounds are done, in case a better one turns up.")
     else:
-        plan = (f"Today's submission is in - another goes in only if it's strong{daytime_note()} and "
-                f"{RESERVE_TARGET}+ other kinds of good alpha would still be waiting for the coming days.")
+        plan = ("Today's submission is in - another goes in only if it "
+                + (f"raises your combined Sharpe by {EXTRA_MIN_GAIN:.0%}+ (strong only, if that can't be read)"
+                   if PORTFOLIO_CHECK else "is strong")
+                + f"{daytime_note()} and {RESERVE_TARGET}+ other good alphas would still be waiting for the coming days.")
     logger.info("%d held alpha(s) - checking they're still worth submitting. %s", len(queue), plan)
+    queue = rank_by_portfolio(session, queue)
+    if not queue:
+        return None
 
     # 1. Check them all (best first), so the reserve is known before anything is submitted.
     deadline = time.time() + HELD_CHECK_BUDGET_SECONDS
@@ -2679,23 +3218,28 @@ def _submit_held(session):
     # 2. Submit, best first, as far as today allows. The end-of-day pick goes by what each alpha would do to your
     #    combined portfolio (best first), then least similar first.
     good.sort(key=lambda g: strength(g[2]), reverse=True)
+    effects = {row["alpha_id"]: portfolio_effect(session, row["alpha_id"]) for row, _, _ in good} \
+        if PORTFOLIO_CHECK and good else {}
     if end_of_day_pick():
         good.sort(key=end_of_day_order)
-        if PORTFOLIO_CHECK and good:
-            effects = {row["alpha_id"]: portfolio_effect(session, row["alpha_id"]) for row, _, _ in good}
+        if effects:
             good.sort(key=lambda g: end_of_day_portfolio_order(effects[g[0]["alpha_id"]]))
+    elif scored(effects):
+        good.sort(key=lambda g: best_gain_first(g, effects))  # strong ones first, the biggest gain first among them
     if good and submissions_today() == 0 and not SETTLING and not row_is_strong(good[0][2]):
         logger.info("None of the held alphas is strong (%s) - they wait until the usual rounds are done, in case "
                     "a stronger one turns up.", strong_note())
     first_outcome, submitted, landed_before = None, 0, len(RESERVE.landed)
-    for row, corr, latest in good:
+    pending = list(good)
+    while pending:
+        row, corr, latest = pending.pop(0)
         alpha_id, expression = row["alpha_id"], row["expression"]
         if not may_submit(expression, row_is_strong(latest)):
             waiting += 1  # still a good candidate - stays queued
             continue
         if len(RESERVE.landed) > landed_before:
             corr = self_correlation_max(session, alpha_id)  # checked before today's submission went in - ask again
-        if similar_for_now(corr):
+        if similar_for_now(corr) and not adds_despite_similarity(session, alpha_id, corr):
             reading = (f"its self-correlation is {corr:.2f}" if corr is not None
                        else "its self-correlation couldn't be read")
             logger.info("Held alpha %s could go in, but %s - only alphas%s go in before the end-of-day pick. It "
@@ -2705,7 +3249,8 @@ def _submit_held(session):
         if not too_similar(corr):
             allowed, note = portfolio_verdict(session, alpha_id)
             if not allowed:
-                logger.info("Held alpha %s stays queued: %s - it would lower your combined portfolio.", alpha_id, note)
+                logger.info("Held alpha %s stays queued: %s%s.", alpha_id, note,
+                            "" if submissions_today() > 0 else " - it would lower your combined portfolio")
                 waiting += 1
                 continue
             if note:
@@ -2721,6 +3266,10 @@ def _submit_held(session):
             PORTFOLIO.note_landed(alpha_id)
             submitted += 1
             first_outcome = outcome if first_outcome is None or not landed(first_outcome) else first_outcome
+            if effects and pending:  # what each would add has changed now that this one is in
+                effects = {r["alpha_id"]: portfolio_effect(session, r["alpha_id"]) for r, _, _ in pending}
+                if scored(effects):
+                    pending.sort(key=lambda g: best_gain_first(g, effects))
         else:  # rejected at submission, or too similar now - not counted toward today, so the next one goes
             RESERVE.forget(alpha_id)
             dropped += 1
@@ -2797,7 +3346,13 @@ def hold_similar(session, row, alpha_id, corr):
 
 def hold_for_portfolio(session, row, alpha_id, note):
     """An alpha that could go in now, but adding it would lower your submitted alphas' combined Sharpe: held (not
-    counted in the reserve), and checked again each run, since the portfolio changes as other alphas go in."""
+    counted in the reserve), and checked again each run, since the portfolio changes as other alphas go in. An extra
+    submission (today's first is in) that would raise it, only not by EXTRA_MIN_GAIN, waits for a coming day instead."""
+    if submissions_today() > 0 and gain(portfolio_effect(session, alpha_id)) > 0:
+        logger.info("Alpha %s qualifies, but %s - holding it for a coming day.", alpha_id, note)
+        row["submitted"] = HELD_LABEL
+        RESERVE.keep(alpha_id, row["expression"])
+        return
     logger.info("Alpha %s qualifies, but %s - it would lower your combined portfolio, which the leaderboard's IS Score "
                 "rates. Holding it in case that changes.", alpha_id, note)
     row["submitted"] = HELD_PORTFOLIO_LABEL
@@ -2826,6 +3381,8 @@ def finish_idea(session, row, alpha_id) -> dict:
 
     if qualifies(metrics, checks):
         strong = row_is_strong(row)
+        if not strong and submissions_today() > 0:
+            portfolio_ready(session)  # read once a run: what an extra would add decides whether it may go in
         if not may_submit(expression, strong):
             # Only hold it if it could actually be submitted later: BRAIN's similarity check is free.
             corr = self_correlation_max(session, alpha_id)
@@ -2847,7 +3404,7 @@ def finish_idea(session, row, alpha_id) -> dict:
                 record_before_after(session, alpha_id, "held for now" if for_today else "held for a coming day")
         else:
             corr = self_correlation_max(session, alpha_id)  # the same free check try_submit makes first
-            if similar_for_now(corr):
+            if similar_for_now(corr) and not adds_despite_similarity(session, alpha_id, corr):
                 hold_similar(session, row, alpha_id, corr)
             else:
                 # (one BRAIN would turn away as too similar skips the portfolio check: try_submit logs it as such)
@@ -2886,7 +3443,8 @@ def run_round(session, client, operators, fields, settings, email, password, rou
     rules = [r for r in (variety_rule(type_map, crowded, IDEAS_PER_ROUND, IDEAS_PER_ROUND + VARIETY_EXTRA_IDEAS),
                          shape_rule(overused, operators),
                          avoid_note(rejected, dead),
-                         small_stocks_rule()) if r]
+                         small_stocks_rule(),
+                         covered_rule()) if r]
     asked = IDEAS_PER_ROUND + (VARIETY_EXTRA_IDEAS if rules else 0)
     prompt_text = "\n\n".join([feedback_text, *rules, what_works_rule()])
     try:
@@ -2922,6 +3480,13 @@ def run_round(session, client, operators, fields, settings, email, password, rou
                     "remembers from past results.", len(ideas) - len(on_list),
                     ", ".join(name for name, _ in strays.most_common(4)))
     ideas = on_list
+    covered = saturated_ingredients()
+    if covered:
+        fresh = [(e, r) for e, r in ideas if not only_covered(e, covered)]
+        if len(fresh) < len(ideas):
+            logger.info("Skipped %d idea(s) built only on data your submitted alphas already cover.",
+                        len(ideas) - len(fresh))
+        ideas = fresh
     short = [(e, r) for e, r in ideas if not too_long(e)]
     if len(short) < len(ideas):
         logger.info("Skipped %d idea(s) with more than %d operators - BRAIN refuses them.", len(ideas) - len(short),
@@ -2947,7 +3512,7 @@ def process_queue(session, items, settings, email, password, round_num, avoid) -
     queue = deque(items)
     running = []  # each: {"row", "kind", "location", "started"}
     rows = []
-    counts = {"flips": 0, "smooths": 0, "blends": 0, "sharpens": 0, "network": 0}
+    counts = {"flips": 0, "smooths": 0, "blends": 0, "sharpens": 0, "pairs": 0, "network": 0}
     limit = PARALLEL_SIMULATIONS
     busy_since = None
     last_note = time.time()
@@ -3176,7 +3741,7 @@ def queue_followups(session, row, kind, queue, avoid, counts):
             logger.info("  Strong numbers but not every check passed (%s).", row["failing_checks"])
 
     # Auto-blend: Sharpe is there but the alpha isn't strong, and nothing else is known to be wrong - add a slow alpha.
-    if (kind != "blend" and counts["blends"] < MAX_BLENDS_PER_ROUND and blendable_outcome(row)
+    if (kind not in ("blend", "pair") and counts["blends"] < MAX_BLENDS_PER_ROUND and blendable_outcome(row)
             and row.get("alpha_id") and blend_worthy(row)):
         blends = blend_candidates(base, avoid)[:MAX_BLENDS_PER_ROUND - counts["blends"]]
         if blends and not too_similar_to_pool(session, row, "blending"):
@@ -3187,6 +3752,18 @@ def queue_followups(session, row, kind, queue, avoid, counts):
                         missing, len(blends), padding_note(expression))
             for new_expression, why in reversed(blends):  # reversed: appendleft keeps their order
                 queue.appendleft((new_expression, f"Auto-blend of {expression}: {why}.", "blend"))
+
+    # Auto-pair: the Sharpe is there, but only in small stocks - add an alpha on other data that holds up in big ones.
+    if (kind not in ("blend", "pair") and counts["pairs"] < MAX_PAIRS_PER_ROUND and row.get("alpha_id")
+            and pair_worthy(row)):
+        pairs = pair_candidates(base, avoid)[:MAX_PAIRS_PER_ROUND - counts["pairs"]]
+        if pairs:
+            counts["pairs"] += len(pairs)
+            logger.info("  Sharpe %.2f, but only in small stocks (%s among the biggest, limit %s) - testing it added to "
+                        "%d alpha(s) on other data that hold up there next%s.", sharpe, row.get("sub_universe_sharpe"),
+                        row.get("sub_universe_limit"), len(pairs), padding_note(expression))
+            for new_expression, why in reversed(pairs):
+                queue.appendleft((new_expression, f"Auto-pair of {expression}: {why}.", "pair"))
 
 
 def sharpen_reason(expression, sharpe, fitness, turnover) -> str:
@@ -3234,8 +3811,9 @@ def sharpen_candidates() -> list:
 def follow_up_past_near_misses(session, settings, email, password, avoid) -> list:
     """Start-of-run step: blend up to MAX_PAST_BLENDS earlier near-misses that missed only on fitness (best Sharpe
     first; one without BRAIN's big-stocks numbers on file gets them read and saved first, and isn't blended if it
-    failed that check), and test up to MAX_PAST_SHARPENS slow ones without their outer smoothing. Every near-miss
-    followed up gets a log line saying what's being tried."""
+    failed that check), pair up to MAX_PAST_PAIRS earlier ones that only work in small stocks (pair_rows), and test up
+    to MAX_PAST_SHARPENS slow ones without their outer smoothing. Every near-miss followed up gets a log line saying
+    what's being tried."""
     items, blended, asked = [], 0, 0
     for row in blend_rows():
         if blended >= MAX_PAST_BLENDS or asked >= 2 * MAX_PAST_BLENDS:
@@ -3270,6 +3848,20 @@ def follow_up_past_near_misses(session, settings, email, password, avoid) -> lis
                     "Only fitness is missing" if as_float(row.get("fitness")) < SUBMIT_MIN_FITNESS
                     else "It clears the bar but isn't strong", len(blends))
         items.extend((e, f"Auto-blend of {expression}: {why}.", "blend") for e, why in blends)
+
+    paired = 0
+    for row in pair_rows():
+        if paired >= MAX_PAST_PAIRS:
+            break
+        pairs = pair_candidates(row["expression"], avoid)
+        if not pairs:
+            continue  # its pairs were all tried, or there's no partner for it yet
+        paired += 1
+        logger.info("Earlier alpha %s (Sharpe %s, fitness %s) only works in small stocks (%s among the biggest, limit "
+                    "%s) - testing it added to %d alpha(s) on other data that hold up there.", row["expression"],
+                    row.get("sharpe"), row.get("fitness"), row.get("sub_universe_sharpe"), row.get("sub_universe_limit"),
+                    len(pairs))
+        items.extend((e, f"Auto-pair of {row['expression']}: {why}.", "pair") for e, why in pairs)
 
     sharpened = 0
     for row in sharpen_candidates():
@@ -3403,11 +3995,12 @@ def gemini_client() -> genai.Client:
 
 
 def run(args):
-    global RESERVE, BEFORE_AFTER_REFUSED, SETTLING, OUTAGE_SECONDS, PORTFOLIO
+    global RESERVE, BEFORE_AFTER_REFUSED, SETTLING, OUTAGE_SECONDS, PORTFOLIO, REFUSED_ON
     RESERVE = Reserve()  # the reserve only counts alphas BRAIN confirms during this run
     PORTFOLIO = Portfolio()  # your submitted alphas' PnL is read afresh each run
     BEFORE_AFTER_REFUSED = False
     SETTLING = False
+    REFUSED_ON = None
     OUTAGE_SECONDS = 0.0
     email, password = be.get_credentials()
     upgrade_results_file()
@@ -3478,8 +4071,11 @@ def run(args):
                     MAX_ROUNDS, end_of_day_rule())
         logger.info("Every day counts: with nothing submitted for today after %d rounds, up to %d more rounds "
                     "until something lands.%s", MAX_ROUNDS, MAX_EXTRA_ROUNDS,
-                    f" A submission beyond today's first must be strong, with {RESERVE_TARGET}+ other kinds of good "
-                    f"alpha left in reserve." if MAX_SUBMISSIONS_PER_DAY > 1 else "")
+                    " A submission beyond today's first must "
+                    + (f"raise your combined Sharpe by {EXTRA_MIN_GAIN:.0%}+ (or be strong, if that can't be read)"
+                       if PORTFOLIO_CHECK else "be strong")
+                    + f" and leave {RESERVE_TARGET}+ other good alphas waiting for the coming days."
+                    if MAX_SUBMISSIONS_PER_DAY > 1 else "")
     type_map = field_types(fields)
     if type_map:
         logger.info("Variety: your %d fields span %d data types (%s).", len(type_map),
@@ -3512,7 +4108,7 @@ def run(args):
                         "waiting for a strong alpha.", brain_day_ends_in().total_seconds() // 60)
             settle_for_today(session)
         if rounds_done >= MAX_ROUNDS:
-            if MAX_SUBMISSIONS_PER_DAY < 1 or submissions_today() > 0:
+            if MAX_SUBMISSIONS_PER_DAY < 1 or submissions_today() > 0 or REFUSED_ON == brain_day():
                 break
             if checked_at != rounds_done:  # once per round, not again after a failed generation
                 checked_at = rounds_done

@@ -17,6 +17,12 @@ Run from the alpha-miner folder (it uses the same .env and saved session as alph
     python fetch_fields.py --least-used --leave-out option8,option9,news18
                                          # leave whole datasets out (ids as the last line of each run lists them):
                                          # for data whose alphas keep failing BRAIN's big-stocks check
+    python fetch_fields.py --least-used --per-dataset 40 --learn
+                                         # learn from alpha_loop_results.csv: leave out data your submitted alphas
+                                         # already lean on (the same family in alpha_loop's SATURATED_AT of them,
+                                         # default 3 - new alphas on it would add little to your combined score),
+                                         # fields the bot found to be dead ends, and datasets that never produced an
+                                         # alpha passing every check after 10+ tests
     To go back, run it again without --least-used, or copy operators.json.bak over operators.json.
 
 It writes three files:
@@ -117,9 +123,9 @@ def describe(field):
     return f"{text} [{source}]" if source else text
 
 
-def usable_fields(matrix, min_coverage, min_users=0, leave_out=()):
+def usable_fields(matrix, min_coverage, min_users=0, leave_out=(), skip_fields=()):
     return [f for f in matrix if (f.get("coverage") or 0) >= min_coverage and popularity(f)[0] >= min_users
-            and dataset_of(f).lower() not in leave_out]
+            and dataset_of(f).lower() not in leave_out and f.get("id") not in skip_fields]
 
 
 def least_used_first(fields):
@@ -153,13 +159,14 @@ def spread_over_datasets(ordered, top, per_dataset):
 
 
 def select_fields(matrix, groups, top, min_coverage, skip=0, least_used=False, per_dataset=0, min_users=0,
-                  leave_out=()):
+                  leave_out=(), skip_fields=()):
     """Most-used fields first: popular fields are well understood and well covered. skip leaves out that
     many of the most-used ones first, so the selection is the fields ranked skip+1 to skip+top.
     least_used turns the order round: the fields fewest people use first (skip then leaves out that many of
     the least-used). per_dataset caps how many come from one dataset; min_users leaves out fields fewer
-    people than that have used; leave_out (lower-case dataset ids) leaves whole datasets out."""
-    usable = usable_fields(matrix, min_coverage, min_users, leave_out)
+    people than that have used; leave_out (lower-case dataset ids) leaves whole datasets out, skip_fields single
+    fields."""
+    usable = usable_fields(matrix, min_coverage, min_users, leave_out, skip_fields)
     ordered = least_used_first(usable) if least_used else sorted(usable, key=popularity, reverse=True)
     chosen = spread_over_datasets(ordered[skip:], top, per_dataset)
     names = {f["id"] for f in chosen}
@@ -175,7 +182,7 @@ def select_fields(matrix, groups, top, min_coverage, skip=0, least_used=False, p
     return entries
 
 
-def selection_note(top, skip=0, least_used=False, per_dataset=0, min_users=0, leave_out=()) -> str:
+def selection_note(top, skip=0, least_used=False, per_dataset=0, min_users=0, leave_out=(), learned="") -> str:
     """How the fields were picked, in words, for operators.json's _fields_note."""
     if least_used:
         which = f"the {top} least-used fields" + (f" after the {skip} least-used" if skip else "")
@@ -190,7 +197,32 @@ def selection_note(top, skip=0, least_used=False, per_dataset=0, min_users=0, le
         which += f", each used by at least {min_users} people"
     if leave_out:
         which += f", leaving out the datasets {', '.join(sorted(leave_out))}"
+    if learned:
+        which += f", and learning from your results: {learned}"
     return which
+
+
+def learned_exclusions(matrix):
+    """(field ids to leave out, dataset ids to leave out, a note in words) from alpha_loop_results.csv: fields in a
+    family your submitted alphas already lean on (alpha_loop.saturated_ingredients), dead-end fields
+    (alpha_loop.dead_end_fields), and datasets that never produced an alpha passing every check (alpha_loop.never_worked).
+    Nothing without the results file."""
+    if not Path(al.RESULTS_FILE).exists():
+        logger.warning("--learn: no %s here yet, so there's nothing to learn from - choosing as usual.",
+                       al.RESULTS_FILE)
+        return set(), set(), ""
+    covered = set(al.saturated_ingredients())
+    dead = set(al.dead_end_fields())
+    never = {d.lower() for d in al.never_worked()}
+    lean = {f["id"] for f in matrix if al.field_family(str(f.get("id") or "")) in covered}
+    parts = []
+    if lean:
+        parts.append(f"{len(lean)} field(s) in data your submitted alphas already lean on")
+    if dead & {f["id"] for f in matrix}:
+        parts.append(f"{len(dead & {f['id'] for f in matrix})} dead-end field(s)")
+    if never:
+        parts.append(f"the datasets that never produced a passing alpha ({', '.join(sorted(never))})")
+    return lean | dead, never, ("left out " + "; ".join(parts)) if parts else ""
 
 
 def write_operators(entries, top, min_coverage, path=None, skip=0, which=None):
@@ -256,6 +288,9 @@ def main(argv=None):
     parser.add_argument("--leave-out", default="", metavar="DATASETS",
                         help="dataset ids to leave out, comma-separated - e.g. option8,option9,news18 (each run's last "
                              "lines name the datasets it used)")
+    parser.add_argument("--learn", action="store_true",
+                        help="learn from alpha_loop_results.csv: leave out data your submitted alphas already lean on, "
+                             "dead-end fields, and datasets that never produced an alpha passing every check")
     args = parser.parse_args(argv)
     leave_out = {d.strip().lower() for d in args.leave_out.split(",") if d.strip()}
     per_dataset = args.per_dataset if args.per_dataset is not None else (MAX_PER_DATASET if args.least_used else 0)
@@ -279,10 +314,16 @@ def main(argv=None):
          "matrix_fields": matrix, "group_fields": groups}, ensure_ascii=False), encoding="utf-8")
 
     known = {dataset_of(f).lower() for f in matrix}
+    skip_fields, learned = set(), ""
+    if args.learn:
+        skip_fields, never, learned = learned_exclusions(matrix)
+        leave_out |= never
+        if learned:
+            logger.info("Learning from your results: %s.", learned)
     for name in sorted(leave_out - known):
         logger.warning("No dataset called %s among the fields BRAIN lists for you - check the spelling. Datasets: %s.",
                        name, ", ".join(sorted(known)))
-    usable = len(usable_fields(matrix, args.min_coverage, min_users, leave_out))
+    usable = len(usable_fields(matrix, args.min_coverage, min_users, leave_out, skip_fields))
     if args.skip > 0 and usable <= args.skip:
         logger.error("Only %d fields have coverage >= %s%s on this account, so --skip %d leaves none. "
                      "operators.json is unchanged - try a smaller --skip.", usable, args.min_coverage,
@@ -291,13 +332,15 @@ def main(argv=None):
     before = usage_summary(current_field_names(), matrix)
     entries = select_fields(matrix, groups, args.top, args.min_coverage, args.skip,
                             least_used=args.least_used, per_dataset=per_dataset, min_users=min_users,
-                            leave_out=leave_out)
+                            leave_out=leave_out, skip_fields=skip_fields)
     if not entries:
         logger.error("BRAIN returned no usable fields. operators.json is unchanged.")
         sys.exit(1)
     write_operators(entries, args.top, args.min_coverage, skip=args.skip,
                     which=selection_note(args.top, args.skip, args.least_used, per_dataset, min_users,
-                                         leave_out & known))
+                                         (leave_out & known) - ({d.lower() for d in al.never_worked()}
+                                                                if args.learn and learned else set()),
+                                         learned))
     if args.skip > 0 and args.least_used:
         logger.info("Left out the %d least-used fields.", args.skip)
     elif args.skip > 0:

@@ -7,14 +7,18 @@ submissions_log.json
 # Runtime-generated research output, not source
 alpha_loop_results.csv
 results.csv
+data_fields_cache.json
+pnl_cache/
+logs/
+alpha_loop.lock
+*.tmp
+operators.json.bak
+
+# Hand-made alpha batches hold your alpha ideas, and this repository is public
+run_batch*.ps1
 
 # Python
 __pycache__/
 *.pyc
 *.pyo
-.pytest_cache/data_fields_cache.json
-operators.json.bak
-
-logs/
-alpha_loop.lock
-*.tmp
+.pytest_cache/

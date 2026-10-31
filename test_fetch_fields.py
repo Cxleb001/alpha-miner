@@ -324,6 +324,66 @@ def test_main_leaves_operators_alone_when_brain_returns_nothing():
             os.chdir(cwd)
 
 
+def _result(expression, sharpe, fitness, submitted="NO"):
+    row = {k: "" for k in al.RESULTS_HEADER}
+    row.update(expression=expression, sharpe=str(sharpe), fitness=str(fitness), turnover="0.1", status="COMPLETE",
+               submitted=submitted)
+    al.append_result(row)
+
+
+def test_learn_leaves_out_covered_data_dead_ends_and_datasets_that_never_worked():
+    unsys = [f"unsystematic_risk_last_{d}_days" for d in (30, 60, 90, 360)]
+    fields = ([field(n, users=500 + i, dataset="model51") for i, n in enumerate(unsys)]
+              + [field("beta_last_60_days_spy", users=600, dataset="model51")]
+              + [field(f"a{i}", users=30 + i, dataset="analyst4") for i in range(5)]
+              + [field("dead1", users=20, dataset="analyst4")]
+              + [field(f"s{i}", users=10 + i, dataset="socialmedia12") for i in range(3)]
+              + [field("close", users=60000)])
+    with tempfile.TemporaryDirectory() as d:
+        shutil.copyfile(HERE / "operators.json", Path(d) / "operators.json")
+        cwd = os.getcwd()
+        os.chdir(d)
+        try:
+            for n in unsys[:3]:                                   # three submitted alphas on one family: covered
+                _result(f"rank(ts_zscore({n}, 60))", 1.8, 1.4, submitted="YES")
+            for i in range(8):                                    # a dead end
+                _result(f"rank(ts_delta(dead1, {i + 1}))", 0.2, 0.1)
+            for i in range(10):                                   # a dataset that never worked
+                _result(f"rank(ts_delta(s{i % 3}, {i + 1}))", 0.4, 0.2)
+            with patch.object(al, "get_authenticated_session", return_value=paged_session(fields)), \
+                 patch("time.sleep"), patch.object(ff.logger, "info") as info:
+                ff.main(["--top", "20", "--least-used", "--per-dataset", "0", "--learn"])
+            ref = json.loads(Path("operators.json").read_text(encoding="utf-8"))
+        finally:
+            os.chdir(cwd)
+    names = {f["name"] for f in ref["fields"]}
+    assert names >= {"beta_last_60_days_spy", "a0", "a4", "close"}
+    assert not names & {*unsys, "dead1", "s0", "s1", "s2"}       # the 4th window too: the family is covered
+    note = ref["_fields_note"]
+    assert ("learning from your results: left out 4 field(s) in data your submitted alphas already lean on; "
+            "1 dead-end field(s); the datasets that never produced a passing alpha (socialmedia12)") in note, note
+    assert "leaving out the datasets" not in note                       # named once, as learned
+    said = [c.args[0] % c.args[1:] for c in info.call_args_list]
+    assert any(line.startswith("Learning from your results: left out 4 field(s)") for line in said), said
+
+
+def test_learn_without_results_chooses_as_usual():
+    fields = [field(f"a{i}", users=30 + i, dataset="analyst4") for i in range(5)] + [field("close", users=60000)]
+    with tempfile.TemporaryDirectory() as d:
+        shutil.copyfile(HERE / "operators.json", Path(d) / "operators.json")
+        cwd = os.getcwd()
+        os.chdir(d)
+        try:
+            with patch.object(al, "get_authenticated_session", return_value=paged_session(fields)), \
+                 patch("time.sleep"), patch.object(ff.logger, "warning") as warn:
+                ff.main(["--top", "3", "--least-used", "--learn"])
+            ref = json.loads(Path("operators.json").read_text(encoding="utf-8"))
+        finally:
+            os.chdir(cwd)
+    assert [f["name"] for f in ref["fields"]][:3] == ["a0", "a1", "a2"] and "learning" not in ref["_fields_note"]
+    assert any("nothing to learn from" in c.args[0] for c in warn.call_args_list)
+
+
 if __name__ == "__main__":
     import inspect
     tests = [obj for name, obj in list(globals().items()) if name.startswith("test_") and inspect.isfunction(obj)]
