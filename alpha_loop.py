@@ -2494,15 +2494,28 @@ RECIPES = (
 def dataset_track_record() -> tuple:
     """(tests per kind of data, alphas passing every check per kind, {kind: [Counter of the fields in passing ones,
     Counter of the fields in the rest]}) over every completed simulation - kinds as alpha_kind gives them: a BRAIN
-    dataset id, or price/volume."""
+    dataset id, or price/volume. Each result counts for the data its signals build on that your submitted alphas
+    don't already cover (saturated_ingredients) - fields only used to form groups and buckets don't count - so a
+    dataset's record shows what's left to find in it: one whose passes all came from covered fields has none left.
+    A result built only on covered data counts for nothing."""
     tests, passes, fields = Counter(), Counter(), {}
+    covered = set(saturated_ingredients())
     for r in completed_history():
-        names = [n for _, _, n in data_fields_in(r["expression"]) if n not in BASIC_FIELDS]
-        for kind in alpha_kind(r["expression"]):
+        names = [n for n in dict.fromkeys(signal_fields(r["expression"]))
+                 if n not in BASIC_FIELDS and field_family(n) not in covered]
+        by_kind = {}
+        for name in names:
+            for kind in alpha_kind(name):
+                by_kind.setdefault(kind, []).append(name)
+        if not by_kind:
+            if only_covered(r["expression"], covered):
+                continue
+            by_kind = {PRICE_VOLUME: []}  # what's new in it is a price/volume signal
+        passed = passed_every_check(r)
+        for kind, kind_names in by_kind.items():
             tests[kind] += 1
-            passed = passed_every_check(r)
             passes[kind] += passed
-            fields.setdefault(kind, [Counter(), Counter()])[0 if passed else 1].update(names)
+            fields.setdefault(kind, [Counter(), Counter()])[0 if passed else 1].update(kind_names)
     return tests, passes, fields
 
 

@@ -4265,13 +4265,17 @@ def test_the_generator_is_shown_what_works_on_your_account(tmp_path):
         assert "SOCIALMEDIA12" not in al.data_scorecard() and "ANALYST4" in al.data_scorecard()
         assert "price/volume data only" in al.data_scorecard()
         assert "holds up in large stocks, the blend often passes" in prompt
-        # Once your submitted alphas cover a field's data, it isn't held up as an example any more.
+        # Once your submitted alphas cover a field's data, its passes no longer count for its dataset - here all of
+        # ANALYST4's came from anl4_ebit_value, so it drops off the list of data that works - and it isn't an example.
         for i in (1, 2):
             al.append_result(saved_row(f"rank(ts_zscore(anl4_ebit_value, {i * 30}))", 1.6, 0.1, submitted="YES"))
-        al.append_result(saved_row("rank(ts_delta(anl4_cfo_value, 9))", 1.6, 0.1))
         write_dataset_cache({"anl4_ebit_value": "analyst4", "anl4_cfo_value": "analyst4", "snt_buzz": "socialmedia12"})
+        assert "ANALYST4" not in al.data_scorecard() and "anl4_ebit_value" not in al.data_scorecard()
+        for i in range(10):                                                  # new analyst data that works
+            al.append_result(saved_row(f"rank(ts_delta(anl4_cfo_value, {i + 1}))", 1.6, 0.1,
+                                       submitted=al.HELD_LABEL if i < 4 else "NO"))
         line = next(l for l in al.data_scorecard().splitlines() if "ANALYST4" in l)
-        assert "anl4_ebit_value" not in line and "anl4_cfo_value" in line, line
+        assert line == "- ANALYST4 (analyst4): 4 of 10 (e.g. anl4_cfo_value)", line
     in_tmp(tmp_path, run)
 
 # ---- Raising the IS Score: rank by portfolio gain, extras that add, data already covered ----
@@ -4614,6 +4618,30 @@ def test_an_extra_needs_the_full_minimum_gain(tmp_path):
                 assert al.portfolio_verdict(None, "x")[0] is False
         assert al.gain(al.PortfolioEffect(-1.0, -0.5, 0.2, 300, 3)) == 0.5        # measured on the size of the Sharpe
         assert al.gain(None) == 0.0 and al.gain(al.PortfolioEffect(None, 1.0, None, 300, 0)) == 0.0
+    in_tmp(tmp_path, run)
+
+
+def test_a_datasets_record_counts_only_the_data_you_havent_covered(tmp_path):
+    def run():
+        write_dataset_cache({"unsystematic_risk_last_90_days": "model51", "beta_last_60_days_spy": "model51",
+                             "rel_ret_comp": "pv13", "sharesout": "pv1", "close": "pv1", "cap": "pv1"})
+        sizes = "bucket(rank(sharesout), range='0, 1, 0.1')"
+        held = lambda e: al.append_result(dict(_history_row(e, 1.8, 1.4, 0.1), submitted=al.HELD_LABEL))
+        for i in range(10):
+            held(f"group_neutralize(rank(ts_zscore(unsystematic_risk_last_90_days, {i + 5})), {sizes})")
+            al.append_result(_history_row(f"rank(ts_delta(beta_last_60_days_spy, {i + 1}))", 0.3, 0.1, 0.1))
+            held(f"rank(ts_zscore(rel_ret_comp, {i + 5})) + rank(ts_zscore(unsystematic_risk_last_90_days, 20))")
+        tests, passes, fields = al.dataset_track_record()
+        assert (passes["model51"], tests["model51"], passes["pv13"], tests["pv13"]) == (20, 30, 10, 10)
+        assert set(fields["pv13"][0]) == {"rel_ret_comp"}                   # the blend's model51 field isn't pv13's
+        assert "sharesout" not in al.data_scorecard()                       # a size bucket isn't the signal
+        save_submitted(*[f"rank(ts_zscore(unsystematic_risk_last_{d}_days, 60))" for d in (30, 90, 360)])
+        tests, passes, fields = al.dataset_track_record()
+        assert (passes["model51"], tests["model51"], passes["pv13"], tests["pv13"]) == (0, 10, 10, 10)
+        assert al.never_worked() == {"model51"}                             # nothing left to find there
+        card = al.data_scorecard()
+        assert "- PV13 (pv13): 10 of 10 (e.g. rel_ret_comp)" in card
+        assert "- MODEL51 (model51): 0 of 10 (e.g. beta_last_60_days_spy)" in card
     in_tmp(tmp_path, run)
 
 
