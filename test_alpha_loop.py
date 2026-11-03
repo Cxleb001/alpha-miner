@@ -4125,6 +4125,110 @@ def test_what_gets_paired_and_with_what(tmp_path):
     in_tmp(tmp_path, run)
 
 
+COMBINE_DATASETS = {"anl4_cfo_value": "analyst4", "anl4_fcf_value": "analyst4", "rel_ret_comp": "pv13",
+                    "implied_volatility_call_30": "option8", "unsystematic_risk_last_90_days": "model51",
+                    "unsystematic_risk_last_30_days": "model51", "unsystematic_risk_last_360_days": "model51",
+                    "close": "pv1", "volume": "pv1", "adv20": "pv1", "cap": "pv1"}
+CA, CB, CC = "rank(ts_delta(anl4_cfo_value, 90))", "rank(ts_zscore(rel_ret_comp, 60))", \
+    "rank(ts_delta(implied_volatility_call_30, 20))"
+CD, CE = "rank(ts_delta(anl4_fcf_value, 90))", "rank(volume / adv20)"
+
+
+def save_components():
+    """Single signals to combine (CA-CE), and ones that mustn't be."""
+    write_dataset_cache(COMBINE_DATASETS)
+    for row in [
+        saved_row(CA, 2.0, 0.1, big="1.0", limit="0.8"),                  # analyst4, holds up in big stocks
+        saved_row(CB, 1.9, 0.1, big="0.5", limit="0.8"),                  # pv13, small stocks only
+        saved_row(CC, 1.8, 0.1, big="0.6", limit="0.8"),                  # option8, small stocks only
+        saved_row(CD, 1.7, 0.1, big="1.0", limit="0.8"),                  # analyst4 again
+        saved_row(CE, 1.5, 0.1, big="1.0", limit="0.8"),                  # price/volume
+        saved_row("rank(ts_delta(anl4_cfo_value, 30))", 1.95, 0.1, big="1.0", limit="0.8"),   # CA's data again
+        saved_row("rank(ts_delta(anl4_gric_value, 9))", 1.3, 0.1, big="1.0", limit="0.8"),  # under COMBINE_MIN_SHARPE
+        saved_row(f"{CA} + {CB}", 3.0, 0.1),                               # a blend already
+        saved_row("rank(ts_mean(snt_buzz, 5))", 2.5, 0.1, submitted="YES"),                   # submitted
+        saved_row("rank(ts_delta(implied_volatility_call_30, 5))", 2.4, 0.1, big="-0.1"),     # loses in big stocks
+        saved_row("rank(ts_delta(implied_volatility_call_30, 9))", 2.3, 0.9),                 # trades too much
+        saved_row("rank(ts_delta(anl4_fcf_value, 9))", 2.2, 0.1, passed="4"),                 # four checks short
+    ]:
+        al.append_result(row)
+
+
+def test_your_good_signals_on_different_data_are_combined(tmp_path):
+    def run():
+        save_components()
+        assert [e for e, _ in al.combine_components()] == [CA, CB, CC, CD, CE]
+        found = al.combine_candidates()
+        assert [sorted(e.split(" + ")) for e, _ in found] == [
+            sorted(f"rank({x})" for x in (CA, CB, CC)),        # three datasets: (2.0 + 1.9 + 1.8) / sqrt(3) = 3.29
+            sorted(f"rank({x})" for x in (CD, CE))]            # then the best pair sharing no signal with it
+        assert found[0][1] == "3 of your signals on different data (Sharpe 2.0 + 1.9 + 1.8), each ranked and added"
+        assert len(al.combine_candidates(n=1)) == 1 and al.combine_candidates(n=0) == []
+        assert al.combine_candidates(avoid={found[0][0]})[0][0] != found[0][0]               # tried: the next best
+        # Data already in your portfolio costs a little: with cfo in two submitted alphas, B + C + D comes first.
+        save_submitted("rank(ts_delta(anl4_cfo_value, 5)) * 1", "rank(ts_delta(anl4_cfo_value, 7)) * 1")
+        assert sorted(al.combine_candidates()[0][0].split(" + ")) == sorted(f"rank({x})" for x in (CB, CC, CD))
+        for d in (10, 20):                                                 # cfo covered now (4 submitted)
+            al.append_result(dict(_history_row(f"rank(ts_zscore(anl4_cfo_value, {d}))", 1.8, 1.4, 0.1),
+                                  alpha_id=f"cfo{d}", submitted="YES"))
+        assert [e for e, _ in al.combine_components()] == [CB, CC, CD, CE]
+        with patch.object(al, "COMBINE_POOL_SIZE", 2):                    # CB and CC: neither holds up in big stocks
+            assert [e for e, _ in al.combine_components()] == [CB, CC] and al.combine_candidates() == []
+        same = [(CA, saved_row(CA, 2.0, 0.1, big="1.0", limit="0.8")), (CD, saved_row(CD, 1.7, 0.1, big="1.0", limit="0.8"))]
+        with patch.object(al, "combine_components", return_value=same):
+            assert al.combine_candidates() == []                           # both analyst4: not different data
+    in_tmp(tmp_path, run)
+
+
+def test_each_round_also_tests_combinations(tmp_path):
+    def run():
+        save_components()
+        blend = al.combine_candidates()[0][0]
+        client = MagicMock()
+        client.models.generate_content.return_value = fake_gemini_response(ONE_IDEA)
+        results = {"rank(close)": calm(), **{e: calm() for e, _ in al.combine_candidates()}}
+        brain = SlowBrain(results)
+        with patch("time.sleep"), captured_logs() as lines:
+            rows = al.run_round(brain.session, client, [], [], SETTINGS, "e@x.com", "pw", 1, "round 1", set())
+        assert brain.started[0] == "rank(close)" and blend in brain.started and len(brain.started) == 3
+        assert any("Also testing 2 combination(s) of your own good signals" in l for l in lines), lines
+        assert next(r for r in rows if r["expression"] == blend)["rationale"].startswith("Auto-combine: 3 of your")
+        Path(al.RESULTS_FILE).unlink()
+        save_components()
+        with patch.object(al, "COMBINES_PER_ROUND", 0), patch("time.sleep"):
+            brain = SlowBrain({"rank(close)": calm()})
+            al.run_round(brain.session, client, [], [], SETTINGS, "e@x.com", "pw", 1, "round 1", set())
+        assert brain.started == ["rank(close)"]
+    in_tmp(tmp_path, run)
+
+
+def test_a_combinations_result_is_not_blended_or_paired_again(tmp_path):
+    def run():
+        save_partners()
+        near = dict(status="COMPLETE", expression=IV_BASE, alpha_id="x", submitted="NO", sharpe=1.8, fitness=0.9,
+                    turnover=0.2, sub_universe_sharpe=0.9, sub_universe_limit=0.8, failed_checks=["LOW_FITNESS"],
+                    checks_passed="7", checks_total="8")
+        session = FakeBrain({}).session
+        for kind, expected in (("idea", True), ("combine", False)):
+            queue = collections.deque()
+            counts = {"flips": 0, "smooths": 0, "blends": 0, "sharpens": 0, "pairs": 0, "network": 0}
+            with patch("time.sleep"):
+                al.queue_followups(session, dict(near), kind, queue, set(), counts)
+            assert ("blend" in [k for _, _, k in queue]) is expected, kind
+    in_tmp(tmp_path, run)
+
+
+def test_the_generator_sees_the_most_recently_tried_expressions_first(tmp_path):
+    def run():
+        for i in range(5):
+            al.append_result(_history_row(f"rank(x{i})", 0.5, 0.2, 0.1))
+        assert al.recent_first({"rank(x0)", "rank(x3)", "rank(old)"}) == ["rank(x3)", "rank(x0)", "rank(old)"]
+        with patch.object(al, "AVOID_SHOWN", 2):
+            prompt = al.idea_prompt([], [], SETTINGS, "", {f"rank(x{i})" for i in range(5)}, 3)
+        assert "- rank(x4)\n- rank(x3)" in prompt and "rank(x2)" not in prompt
+    in_tmp(tmp_path, run)
+
+
 def test_earlier_alphas_that_only_work_in_small_stocks_are_paired_at_the_start_of_a_run(tmp_path):
     def run():
         save_partners()

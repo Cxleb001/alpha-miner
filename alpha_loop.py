@@ -103,6 +103,11 @@ READ BEFORE YOU RUN THIS:
   the biggest stocks (their Sharpe there at least PAIR_PARTNER_MIN_BIG_RATIO, 1.2, times BRAIN's limit; one per
   dataset). Up to MAX_PAIRS_PER_ROUND (4) a round, and MAX_PAST_PAIRS (3) earlier ones at the start of each run. Option
   and news signals often work only in small stocks; paired like this, many pass.
+- Auto-combine: every round also tests COMBINES_PER_ROUND (4) blends of two or three of your own good single signals
+  (Sharpe COMBINE_MIN_SHARPE, 1.4, or more; the best COMBINE_POOL_SIZE, 12), each on a different dataset and none on
+  data your submitted alphas cover, at least one passing the big-stocks check by itself - the hand-made batches that
+  passed best were built this way. Best expected Sharpe first, less a little for data already in your portfolio;
+  no two in a round share a signal.
 - Operator limit: BRAIN refuses an expression with more than 64 operators (every function call and every
   + - * / or comparison counts). Longer ideas are skipped before they're sent.
 - Never miss a day (the Gold leaderboard counts the days you submitted on): a normal run that still has
@@ -235,6 +240,7 @@ READ BEFORE YOU RUN THIS:
 """
 import argparse
 import csv
+import itertools
 import json
 import logging
 import math
@@ -299,7 +305,9 @@ MAX_SELF_CORRELATION = 0.7  # BRAIN rejects a submission this correlated with yo
 # under this. Near-copies of your own alphas add little to a combined score and keep your alphas looking alike.
 # One between this and 0.7 is held - it can still be an end-of-day pick, least similar first. 0.7 turns it off.
 DAYTIME_MAX_SELF_CORRELATION = float(os.environ.get("DAYTIME_MAX_SELF_CORRELATION", 0.5))
-CORR_POLL_MAX_SECONDS = int(os.environ.get("CORR_POLL_MAX_SECONDS", 300))
+# How long to wait for BRAIN's similarity check. A fresh alpha's can take BRAIN many minutes; one not read in time is
+# held and read again later (next run's held-queue check), rather than the whole run waiting on it.
+CORR_POLL_MAX_SECONDS = int(os.environ.get("CORR_POLL_MAX_SECONDS", 60))
 SUBMIT_POLL_MAX_SECONDS = int(os.environ.get("SUBMIT_POLL_MAX_SECONDS", 600))
 CORRELATION_URL = "https://api.worldquantbrain.com/alphas/{alpha_id}/correlations/self"
 SUBMIT_URL = "https://api.worldquantbrain.com/alphas/{alpha_id}/submit"
@@ -385,7 +393,14 @@ PAIR_PARTNER_MIN_BIG_RATIO = float(os.environ.get("PAIR_PARTNER_MIN_BIG_RATIO", 
 MAX_PAIRS_PER_ALPHA = int(os.environ.get("MAX_PAIRS_PER_ALPHA", 2))
 MAX_PAIRS_PER_ROUND = int(os.environ.get("MAX_PAIRS_PER_ROUND", 4))
 MAX_PAST_PAIRS = int(os.environ.get("MAX_PAST_PAIRS", 3))
-PAIR_FIXES = BLEND_FIXES | {"LOW_SUB_UNIVERSE_SHARPE"}  # what pairing can fix: the big-stocks check, and what a blend can
+PAIR_FIXES = BLEND_FIXES | {"LOW_SUB_UNIVERSE_SHARPE"}
+# Auto-combine: each round also tests COMBINES_PER_ROUND blends of two or three of your own good single signals, each on a
+# different dataset and none on data your submitted alphas cover - rank(a) + rank(b) [+ rank(c)]. Components need Sharpe
+# COMBINE_MIN_SHARPE+; the best COMBINE_POOL_SIZE are combined. COMBINES_PER_ROUND=0 turns it off.
+COMBINES_PER_ROUND = int(os.environ.get("COMBINES_PER_ROUND", 4))
+COMBINE_MIN_SHARPE = float(os.environ.get("COMBINE_MIN_SHARPE", 1.4))
+COMBINE_POOL_SIZE = int(os.environ.get("COMBINE_POOL_SIZE", 12))
+AVOID_SHOWN = 60  # already-tried expressions shown to the generator each round, most recent first  # what pairing can fix: the big-stocks check, and what a blend can
 # BRAIN refuses an expression with more operators than this: every function call and every + - * / or comparison.
 MAX_OPERATORS = 64
 SMALL_STOCKS_EXAMPLES = 8  # ideas that failed the big-stocks check, shown to the generator as ones not to rework
@@ -1179,11 +1194,19 @@ CHECKS_EXPLAINED = (
 )
 
 
+def recent_first(avoid) -> list:
+    """The already-tried expressions, the most recently tested first - the ones a generator is likeliest to come up
+    with again - then any others."""
+    recent = [r["expression"] for r in reversed(completed_history())]
+    shown = [e for e in dict.fromkeys(recent) if e in avoid]
+    return shown + sorted(set(avoid) - set(shown))
+
+
 def idea_prompt(operators, fields, settings, feedback_text, avoid: set, n: int) -> str:
     """What the idea writer (Gemini, or Nemotron as the backup) is asked each round."""
     op_list = "\n".join(f"- {o['name']}: {o['usage']}" for o in operators)
     field_list = "\n".join(f"- {f['name']}: {f['description']}" for f in fields)
-    avoid_list = "\n".join(f"- {e}" for e in list(avoid)[:50]) or "(none yet)"
+    avoid_list = "\n".join(f"- {e}" for e in recent_first(avoid)[:AVOID_SHOWN]) or "(none yet)"
 
     prompt = (
         f"You are proposing WorldQuant BRAIN FASTEXPR alpha expressions for "
@@ -2331,7 +2354,7 @@ def pair_partners(expression: str) -> list:
     out, kinds_taken = [], []
     for r in rows:
         partner = strip_padding(r["expression"]).strip()
-        if is_blend(partner) or (r.get("rationale") or "").startswith(("Auto-blend", "Auto-pair")):
+        if is_blend(partner) or (r.get("rationale") or "").startswith(("Auto-blend", "Auto-pair", "Auto-combine")):
             continue
         sharpe, fitness = as_float(r.get("sharpe")), as_float(r.get("fitness"))
         big, limit = as_float(r.get("sub_universe_sharpe")), as_float(r.get("sub_universe_limit"))
@@ -2381,6 +2404,79 @@ def pair_rows() -> list:
         if key not in seen:
             seen.add(key)
             out.append(r)
+    return out
+
+
+def combine_components() -> list:
+    """(expression, row) - your best single signals to combine (combine_candidates): Sharpe COMBINE_MIN_SHARPE+, still
+    above zero among the biggest stocks, turnover in BRAIN's range, at most three checks short, not blends or follow-up
+    blends themselves, not submitted (or too similar to what is), nothing on data your submitted alphas cover, on your
+    field list. Best Sharpe first, one per set of ingredients, up to COMBINE_POOL_SIZE."""
+    datasets, covered = listed_datasets(), set(saturated_ingredients())
+    seen, out = set(), []
+    for r in sorted(completed_history(), key=lambda r: as_float(r.get("sharpe")) or 0.0, reverse=True):
+        sharpe, turnover = as_float(r.get("sharpe")), as_float(r.get("turnover"))
+        if sharpe is None or sharpe < COMBINE_MIN_SHARPE or len(out) == COMBINE_POOL_SIZE:
+            break
+        expression = strip_padding(r["expression"]).strip()
+        submitted = (r.get("submitted") or "").strip()
+        passed, total = as_float(r.get("checks_passed")), as_float(r.get("checks_total"))
+        if (turnover is None or not TURNOVER_MIN <= turnover <= TURNOVER_MAX
+                or (as_float(r.get("sub_universe_sharpe")) or 0.0) <= 0
+                or passed is None or total is None or passed < total - 3
+                or submitted == "YES" or submitted.startswith(("VERDICT_PENDING", "TOO_CORRELATED"))
+                or is_blend(expression) or (r.get("rationale") or "").startswith(("Auto-blend", "Auto-pair",
+                                                                                   "Auto-combine"))):
+            continue
+        found = ingredients(expression)
+        if found in seen or found & covered or not on_listed_data(expression, datasets):
+            continue
+        seen.add(found)
+        out.append((expression, r))
+    return out
+
+
+def holds_up_in_big_stocks(row) -> bool:
+    big, limit = as_float(row.get("sub_universe_sharpe")), as_float(row.get("sub_universe_limit"))
+    return big is not None and limit is not None and big >= limit
+
+
+def combine_candidates(avoid=frozenset(), n=None) -> list:
+    """(blend, why) - up to n (COMBINES_PER_ROUND) untried blends of two or three combine_components(), each on a
+    different dataset and different data, at least one of them passing the big-stocks check by itself. Ranked by the
+    Sharpe they'd have if they didn't move together (their Sharpes added, over the square root of how many), less a
+    little for every submitted alpha already using their data; no two picked share a component."""
+    n = COMBINES_PER_ROUND if n is None else n
+    if n <= 0:
+        return []
+    parts = combine_components()
+    counts, _ = ingredient_counts()
+    scored = []
+    for size in (2, 3):
+        for combo in itertools.combinations(parts, size):
+            kinds = [alpha_kind(e) for e, _ in combo]
+            found = [ingredients(e) for e, _ in combo]
+            if any(a & b for a, b in itertools.combinations(kinds, 2)) or \
+                    any(a & b for a, b in itertools.combinations(found, 2)):
+                continue
+            if not any(holds_up_in_big_stocks(r) for _, r in combo):
+                continue
+            ordered = sorted(e for e, _ in combo)
+            blend = " + ".join(f"rank({e})" for e in ordered)
+            if blend in avoid or too_long(blend):
+                continue
+            used = sum(counts[i] for f in found for i in f)
+            score = sum(as_float(r.get("sharpe")) for _, r in combo) / math.sqrt(size) - 0.3 * used
+            scored.append((score, blend, combo))
+    out, taken = [], set()
+    for score, blend, combo in sorted(scored, key=lambda t: (-t[0], t[1])):
+        if any(e in taken for e, _ in combo):
+            continue
+        taken.update(e for e, _ in combo)
+        sharpes = " + ".join(str(r.get("sharpe")) for _, r in combo)
+        out.append((blend, f"{len(combo)} of your signals on different data (Sharpe {sharpes}), each ranked and added"))
+        if len(out) == n:
+            break
     return out
 
 
@@ -3514,7 +3610,12 @@ def run_round(session, client, operators, fields, settings, email, password, rou
                 fresh_ideas.append((expression, rationale))
         ideas = pick_varied(fresh_ideas, type_map, crowded, IDEAS_PER_ROUND, overused)
 
-    return process_queue(session, [(e, r, "idea") for e, r in ideas], settings, email, password, round_num, avoid)
+    items = [(e, r, "idea") for e, r in ideas]
+    combos = combine_candidates(avoid | {e for e, _ in ideas})
+    if combos:
+        logger.info("Also testing %d combination(s) of your own good signals on different data.", len(combos))
+        items += [(e, f"Auto-combine: {why}.", "combine") for e, why in combos]
+    return process_queue(session, items, settings, email, password, round_num, avoid)
 
 
 def process_queue(session, items, settings, email, password, round_num, avoid) -> list:
@@ -3736,7 +3837,7 @@ def queue_followups(session, row, kind, queue, avoid, counts):
                                         f"{SMOOTH_DECAY_DAYS} days should cut turnover.", "smooth"))
 
     # Auto-sharpen: Sharpe is there, fitness isn't, and turnover is already under the 12.5% floor.
-    if (kind not in ("smooth", "sharpen", "blend") and counts["sharpens"] < MAX_SHARPENS_PER_ROUND
+    if (kind not in ("smooth", "sharpen", "blend", "combine") and counts["sharpens"] < MAX_SHARPENS_PER_ROUND
             and row.get("submitted", "NO") == "NO" and needs_sharpening(row)):
         sharper = (_less_smoothing(base) or (None,))[0]
         if sharper and sharper not in avoid and not too_similar_to_pool(session, row, "sharpening"):
@@ -3754,7 +3855,7 @@ def queue_followups(session, row, kind, queue, avoid, counts):
             logger.info("  Strong numbers but not every check passed (%s).", row["failing_checks"])
 
     # Auto-blend: Sharpe is there but the alpha isn't strong, and nothing else is known to be wrong - add a slow alpha.
-    if (kind not in ("blend", "pair") and counts["blends"] < MAX_BLENDS_PER_ROUND and blendable_outcome(row)
+    if (kind not in ("blend", "pair", "combine") and counts["blends"] < MAX_BLENDS_PER_ROUND and blendable_outcome(row)
             and row.get("alpha_id") and blend_worthy(row)):
         blends = blend_candidates(base, avoid)[:MAX_BLENDS_PER_ROUND - counts["blends"]]
         if blends and not too_similar_to_pool(session, row, "blending"):
@@ -3767,7 +3868,7 @@ def queue_followups(session, row, kind, queue, avoid, counts):
                 queue.appendleft((new_expression, f"Auto-blend of {expression}: {why}.", "blend"))
 
     # Auto-pair: the Sharpe is there, but only in small stocks - add an alpha on other data that holds up in big ones.
-    if (kind not in ("blend", "pair") and counts["pairs"] < MAX_PAIRS_PER_ROUND and row.get("alpha_id")
+    if (kind not in ("blend", "pair", "combine") and counts["pairs"] < MAX_PAIRS_PER_ROUND and row.get("alpha_id")
             and pair_worthy(row)):
         pairs = pair_candidates(base, avoid)[:MAX_PAIRS_PER_ROUND - counts["pairs"]]
         if pairs:
